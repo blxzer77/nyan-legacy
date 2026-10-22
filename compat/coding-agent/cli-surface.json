@@ -1,0 +1,529 @@
+{
+  "schemaVersion": 1,
+  "product": "coding-agent",
+  "status": "frozen-parity-contract",
+  "rustStatus": "runtime_partial",
+  "lastVerified": "2026-10-23",
+  "verifiedCommit": "24424b1298434ec7194444f41d51386b8496b12e",
+  "source": {
+    "entry": "packages/coding-agent/src/cli.ts",
+    "dispatcher": "packages/coding-agent/src/main.ts",
+    "arguments": "packages/coding-agent/src/cli/args.ts",
+    "cliDocs": "packages/coding-agent/docs/cli.md",
+    "usageDocs": "packages/coding-agent/docs/usage.md",
+    "sessionDocs": "packages/coding-agent/docs/sessions.md",
+    "jsonDocs": "packages/coding-agent/docs/json.md",
+    "rpcDocs": "packages/coding-agent/docs/rpc.md",
+    "rpcCommands": "packages/coding-agent/docs/rpc-commands.md",
+    "configDocs": "packages/coding-agent/docs/configuration.md"
+  },
+  "compatibilityPolicy": {
+    "typescriptReference": true,
+    "rustOwnsNormalRuntime": true,
+    "nodeRequiredForNormalPath": false,
+    "previewExecutableMustBeDistinct": true,
+    "cutoverRequiresOwnerAcceptance": true
+  },
+  "entrypoints": [
+    {
+      "id": "cli",
+      "invocation": "nyan",
+      "source": "packages/coding-agent/src/cli.ts",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "source-cli",
+      "invocation": "node scripts/nyan-source.mjs",
+      "source": "scripts/nyan-source.mjs",
+      "currentStatus": "supported-development-entry",
+      "rustStatus": "not_started"
+    }
+  ],
+  "modes": [
+    {
+      "id": "interactive",
+      "invocation": "nyan",
+      "selection": "stdin and stdout are TTYs, unless another mode is explicit",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "print",
+      "invocation": "nyan --print <message>",
+      "selection": "--print or either standard stream is redirected without JSON/RPC",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "json",
+      "invocation": "nyan --mode json <message>",
+      "framing": "strict JSONL on stdout; diagnostics on stderr",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "rpc",
+      "invocation": "nyan --mode rpc",
+      "framing": "bidirectional strict JSONL; stdout is protocol-only",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    }
+  ],
+  "commands": [
+    {
+      "id": "prompt",
+      "syntax": "nyan [options] [--] [@files...] [messages...]",
+      "surface": "default",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "install",
+      "syntax": "nyan install <source> [--local]",
+      "surface": "package-management",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "remove",
+      "syntax": "nyan remove <source> [--local]",
+      "surface": "package-management",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "uninstall",
+      "syntax": "nyan uninstall <source> [--local]",
+      "aliasOf": "remove",
+      "surface": "package-management",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "update",
+      "syntax": "nyan update [target] [--all] [--extensions] [--models] [--force]",
+      "surface": "package-management",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "list",
+      "syntax": "nyan list",
+      "surface": "package-management",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "config",
+      "syntax": "nyan config [--local]",
+      "surface": "package-management",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "auth",
+      "syntax": "nyan auth <check|print-api-key|print-bearer-token|login>",
+      "surface": "credentials",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "login",
+      "syntax": "nyan login [provider]",
+      "surface": "credentials",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "mcp",
+      "syntax": "nyan mcp <add|remove|list|login|logout>",
+      "surface": "mcp",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "export",
+      "syntax": "nyan --export <input> [output]",
+      "surface": "session",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "metadata",
+      "syntax": "nyan --help | nyan --version | nyan --list-models [search]",
+      "surface": "metadata",
+      "currentStatus": "published",
+      "rustStatus": "not_started"
+    },
+    {
+      "id": "experimental",
+      "syntax": "nyan experimental <server|client> [options]",
+      "surface": "experimental-transport",
+      "source": "packages/coding-agent/src/cli/experimental/cli.ts",
+      "currentStatus": "source-experimental",
+      "rustStatus": "not_started"
+    }
+  ],
+  "options": [
+    { "name": "--help", "aliases": ["-h"], "category": "metadata" },
+    { "name": "--version", "aliases": ["-v"], "category": "metadata" },
+    { "name": "--mode", "values": ["text", "json", "rpc"], "category": "mode" },
+    { "name": "--print", "aliases": ["-p"], "category": "mode" },
+    { "name": "--provider", "category": "model" },
+    { "name": "--model", "category": "model" },
+    { "name": "--api-key", "category": "model" },
+    { "name": "--models", "category": "model" },
+    { "name": "--thinking", "category": "model" },
+    { "name": "--list-models", "category": "model" },
+    { "name": "--continue", "aliases": ["-c"], "category": "session" },
+    { "name": "--resume", "aliases": ["-r"], "category": "session" },
+    { "name": "--session", "category": "session" },
+    { "name": "--session-id", "category": "session" },
+    { "name": "--fork", "category": "session" },
+    { "name": "--session-dir", "category": "session" },
+    { "name": "--no-session", "category": "session" },
+    { "name": "--name", "aliases": ["-n"], "category": "session" },
+    { "name": "--tools", "aliases": ["-t"], "category": "tools" },
+    { "name": "--exclude-tools", "aliases": ["-xt"], "category": "tools" },
+    { "name": "--no-tools", "aliases": ["-nt"], "category": "tools" },
+    { "name": "--no-builtin-tools", "aliases": ["-nbt"], "category": "tools" },
+    { "name": "--extension", "aliases": ["-e"], "repeatable": true, "category": "resources" },
+    { "name": "--no-extensions", "aliases": ["-ne"], "category": "resources" },
+    { "name": "--no-mcp", "category": "resources" },
+    { "name": "--skill", "repeatable": true, "category": "resources" },
+    { "name": "--no-skills", "aliases": ["-ns"], "category": "resources" },
+    { "name": "--prompt-template", "repeatable": true, "category": "resources" },
+    { "name": "--no-prompt-templates", "aliases": ["-np"], "category": "resources" },
+    { "name": "--theme", "repeatable": true, "category": "resources" },
+    { "name": "--use-theme", "category": "resources" },
+    { "name": "--no-themes", "category": "resources" },
+    { "name": "--no-context-files", "aliases": ["-nc"], "category": "resources" },
+    { "name": "--system-prompt", "category": "prompt" },
+    { "name": "--append-system-prompt", "repeatable": true, "category": "prompt" },
+    { "name": "--export", "category": "session" },
+    { "name": "--tui-mode", "values": ["fullscreen", "regular"], "category": "interactive" },
+    { "name": "--verbose", "category": "startup" },
+    { "name": "--approve", "aliases": ["-a"], "category": "trust" },
+    { "name": "--no-approve", "aliases": ["-na"], "category": "trust" },
+    { "name": "--offline", "category": "network" },
+    { "name": "--", "category": "parsing" },
+    { "name": "@path", "repeatable": true, "category": "input" },
+    { "name": "stdin", "category": "input" }
+  ],
+  "commandOptions": {
+    "auth": {
+      "common": ["--provider", "--model"],
+      "check": ["--json", "--credentials", "--no-refresh"],
+      "print-bearer-token": ["--min-expiry <duration>"],
+      "login": ["--method <oauth|api_key>", "--auth-type <oauth|api_key>"],
+      "aliases": ["nyan login [provider]"]
+    },
+    "package": {
+      "install": ["--local", "--approve", "--no-approve"],
+      "remove": ["--local", "--approve", "--no-approve"],
+      "uninstall": ["--local", "--approve", "--no-approve"],
+      "update": ["--self", "--extensions", "--models", "--all", "--extension <source>", "--approve", "--no-approve", "--force"],
+      "list": ["--approve", "--no-approve"],
+      "config": ["--local", "--approve", "--no-approve"]
+    },
+    "mcp": {
+      "add": ["--local", "--url <url>", "--env <KEY=VALUE>", "--cwd <dir>", "--header <KEY=VALUE>", "--bearer-token-env-var <NAME>", "--oauth-client-id <id>", "--oauth-client-secret <secret>", "--oauth-callback-port <port>", "--oauth-client-name <name>", "--exposure <mode>", "--description <text>"],
+      "remove": ["--local"],
+      "list": ["--json"],
+      "login": ["--timeout <seconds>"],
+      "logout": []
+    },
+    "experimental": {
+      "client": ["--connect unix:///path", "--session-id <id>", "--continue", "--resume", "--provider <name>", "--model <pattern>", "-e <package>"],
+      "server": ["--server-id <uuid>", "--session-dir <dir>", "--provider <name>", "--model <pattern>", "-e <package>"]
+    }
+  },
+  "dynamicOptions": {
+    "extensionFlags": true,
+    "source": "packages/coding-agent/src/core/extensions/types.ts",
+    "unknownLongFlagsAreForwarded": true,
+    "unknownShortFlagsAreRejected": true
+  },
+  "extensionSurface": {
+    "eventSubscriptions": 41,
+    "extensionApiMembers": 31,
+    "inventory": ".agents/notes/proposed/architecture/extension-surface.json",
+    "durableMigrationReview": ".agents/notes/implemented/architecture/2026-10-16-durable-n2-capability-hooks.md",
+    "publicCapabilityGroups": [
+      "on lifecycle and provider/tool events",
+      "registerTool",
+      "registerCommand",
+      "registerShortcut",
+      "registerFlag",
+      "sendUserMessage and sendMessage",
+      "appendEntry",
+      "registerProvider and registerVirtualModel",
+      "registerMcpServer",
+      "session controls and settings",
+      "terminal UI and renderers",
+      "extension event bus"
+    ],
+    "modeSupport": {
+      "tui": "full legacy terminal UI surface",
+      "rpc": "dialog and fire-and-forget UI subprotocol; custom terminal components unavailable",
+      "json": "no UI; handlers still load",
+      "print": "no UI; handlers still load"
+    },
+    "durableKnownReductions": [
+      "tree navigation events are not emitted",
+      "remaining TUI component/editor/autocomplete surface is deferred",
+      "some legacy product/session mutation members throw named unavailable errors rather than pretending to work"
+    ],
+    "errorSemantics": {
+      "toolCallHandlerFailure": "blocks the tool as fail-safe",
+      "toolExecutionFailure": "becomes an error result for the model",
+      "extensionHandlerFailure": "reported and continues where possible; RPC also emits extension_error",
+      "boundaryProposals": "validated and committed durably; invalid proposals are diagnosed, not silently dropped"
+    },
+    "rustStatus": "requires an explicit native boundary or an isolated compatibility protocol; no silent drops",
+    "source": "packages/coding-agent/docs/extensions.md and packages/coding-agent/docs/rpc-extension-ui.md"
+  },
+  "constraints": {
+    "normalProviderRequiresModel": true,
+    "apiKeyRequiresModelOrModels": true,
+    "rpcRejectsFileArguments": true,
+    "sessionFlagsAreMutuallyValidated": true,
+    "noSessionCannotNameOrResumeSession": true,
+    "forkCannotCombineWithSessionContinueResumeOrNoSession": true,
+    "stdoutReservedForProtocolInJsonAndRpc": true,
+    "source": "packages/coding-agent/src/main.ts and packages/coding-agent/src/cli/args.ts"
+  },
+  "exitCodes": {
+    "success": 0,
+    "generalFailure": 1,
+    "authCheck": {"ready": 0, "not_ready": 1, "invalid": 2},
+    "authOtherFailure": 1,
+    "mcpCommandFailure": 1,
+    "source": "packages/coding-agent/src/main.ts, packages/coding-agent/src/modes/durable/print.ts, packages/coding-agent/src/modes/durable/json.ts, packages/coding-agent/src/extensions/mcp/cli.ts"
+  },
+  "errorContracts": {
+    "rpcCommandFailure": "success:false with command and error; malformed JSON uses command=parse and no request id",
+    "durableSessionCodes": ["DURABLE_SESSION_DIRECTORY_REQUIRED", "DURABLE_SESSION_NOT_FOUND", "DURABLE_SESSION_AMBIGUOUS", "DURABLE_SESSION_LOCKED", "DURABLE_SESSION_CWD_MISSING", "DURABLE_SESSION_CWD_NOT_FOUND"],
+    "modelErrorCodes": ["model_source", "model_validation", "provider", "stream", "auth", "oauth"],
+    "toolFailureShape": "tool result with isError:true or a command-specific structured error; never infer failure from display text",
+    "source": "packages/coding-agent/src/modes/rpc/rpc-types.ts, packages/coding-agent/src/core/durable/sessions.ts, packages/ai/src/utils/models-error.ts, packages/coding-agent/docs/rpc.md"
+  },
+  "interactiveCommands": {
+    "builtIn": [
+      "settings",
+      "model",
+      "tree",
+      "thinking",
+      "scoped-models",
+      "export",
+      "import",
+      "share",
+      "bug",
+      "copy",
+      "name",
+      "session",
+      "changelog",
+      "hotkeys",
+      "fork",
+      "clone",
+      "trust",
+      "login",
+      "logout",
+      "new",
+      "compact",
+      "resume",
+      "reload",
+      "quit"
+    ],
+    "durableOnly": ["tasks", "agents"],
+    "shellPrefixes": ["!", "!!"],
+    "extensionCommands": true,
+    "promptTemplates": true
+  },
+  "tools": {
+    "builtIn": ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"],
+    "builtInExtensions": ["codemode", "tool_search"],
+    "mcp": true,
+    "selection": ["--tools", "--exclude-tools", "--no-tools", "--no-builtin-tools"]
+  },
+  "jsonEvents": {
+    "framing": "LF-delimited JSONL",
+    "sessionHeader": true,
+    "sessionEventTypes": [
+      "agent_start",
+      "agent_end",
+      "agent_settled",
+      "turn_start",
+      "turn_end",
+      "message_start",
+      "message_update",
+      "message_end",
+      "tool_execution_start",
+      "tool_execution_update",
+      "tool_execution_end",
+      "queue_update",
+      "entry_appended",
+      "session_info_changed",
+      "thinking_level_changed",
+      "compaction_start",
+      "compaction_end",
+      "auto_retry_start",
+      "auto_retry_end",
+      "summarization_retry_scheduled",
+      "summarization_retry_attempt_start",
+      "summarization_retry_finished",
+      "bash_execution_update"
+    ],
+    "rpcOnlyEventTypes": ["extension_error"],
+    "stdoutProtocolOnly": true,
+    "diagnosticsOn": "stderr"
+  },
+  "rpcCommands": {
+    "framing": "bidirectional LF-delimited JSONL",
+    "commands": [
+      "prompt",
+      "steer",
+      "follow_up",
+      "abort",
+      "clear_queue",
+      "new_session",
+      "get_state",
+      "set_model",
+      "cycle_model",
+      "get_available_models",
+      "set_thinking_level",
+      "cycle_thinking_level",
+      "get_available_thinking_levels",
+      "set_steering_mode",
+      "set_follow_up_mode",
+      "compact",
+      "set_auto_compaction",
+      "set_auto_retry",
+      "abort_retry",
+      "bash",
+      "abort_bash",
+      "get_session_stats",
+      "export_html",
+      "switch_session",
+      "fork",
+      "clone",
+      "get_fork_messages",
+      "get_entries",
+      "get_tree",
+      "get_last_assistant_text",
+      "set_session_name",
+      "get_commands",
+      "get_messages"
+    ],
+    "responseCorrelation": "optional command id",
+    "clientMustConsumeStdout": true,
+    "shutdown": "close stdin or process signal"
+  },
+  "rpcExtensionUi": {
+    "requestMethods": ["select", "confirm", "input", "editor", "notify", "setStatus", "setWidget", "setTitle", "set_editor_text"],
+    "responseShapes": ["value", "confirmed", "cancelled"],
+    "source": "packages/coding-agent/src/modes/rpc/rpc-types.ts and packages/coding-agent/docs/rpc-extension-ui.md"
+  },
+  "lifecycle": {
+    "interactive": "owns one open session until quit or interrupt",
+    "print": "runs supplied prompts, prints final assistant text, then exits",
+    "json": "runs supplied prompts, emits session header/events, then exits",
+    "rpc": "long-lived child process; closing stdin requests orderly shutdown",
+    "stdout": "protocol-only in JSON and RPC modes",
+    "stderr": "diagnostics and application logging",
+    "signals": ["Ctrl-C/abort", "process termination", "unexpected child exit"],
+    "rustRequirement": "closing the process owns cancellation of active work; forced termination must not be reported as successful completion"
+  },
+  "environment": {
+    "processMarkers": ["AI_AGENT=nyan", "NYAN_CODING_AGENT=true"],
+    "toolSessionVariables": [
+      "NYAN_SESSION_ID",
+      "NYAN_SESSION_FILE",
+      "NYAN_PROVIDER",
+      "NYAN_MODEL",
+      "NYAN_REASONING_LEVEL"
+    ],
+    "processConfiguration": [
+      "NYAN_CODING_AGENT_DIR",
+      "NYAN_CODING_AGENT_SESSION_DIR",
+      "NYAN_PACKAGE_DIR",
+      "NYAN_OFFLINE",
+      "NYAN_SKIP_VERSION_CHECK",
+      "NYAN_LATEST_VERSION_URL",
+      "NYAN_NPM_REGISTRY",
+      "NYAN_RELEASE_BASE_URL",
+      "NYAN_TELEMETRY",
+      "NYAN_CACHE_RETENTION",
+      "NYAN_SHARE_VIEWER_URL",
+      "NYAN_HARDWARE_CURSOR",
+      "NYAN_HYPERLINKS",
+      "NYAN_PROGRAM_STATUS",
+      "NYAN_IMAGE_PROTOCOL",
+      "NYAN_TRUE_COLOR",
+      "NYAN_TUI_ESC_TIMEOUT",
+      "VISUAL",
+      "EDITOR",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "NODE_EXTRA_CA_CERTS",
+      "NODE_OPTIONS=--use-system-ca"
+    ],
+    "configuredServiceVariables": [
+      "NYAN_INSTALLER_API_BASE",
+      "NYAN_CATALOG_BASE_URL",
+      "NYAN_MCP_CLIENT_METADATA_URL",
+      "NYAN_MANAGED_INSTALL_ROOT",
+      "NYAN_NPM_REGISTRY"
+    ],
+    "providerCredentials": "Provider-specific environment variables are resolved by @ny4n/ai; the Rust parity matrix must preserve documented credential precedence without storing secrets in the repository.",
+    "providerCredentialSource": "packages/ai/src/env-api-keys.ts",
+    "providerCredentialEnv": {
+      "anthropic": ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+      "github-copilot": ["COPILOT_GITHUB_TOKEN"],
+      "openai": ["OPENAI_API_KEY"],
+      "azure": ["AZURE_OPENAI_API_KEY"],
+      "google": ["GEMINI_API_KEY"],
+      "google-vertex": ["GOOGLE_CLOUD_API_KEY"],
+      "amazon-bedrock": ["AWS_PROFILE", "AWS_ACCESS_KEY_ID+AWS_SECRET_ACCESS_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_WEB_IDENTITY_TOKEN_FILE"],
+      "cloudflare-workers-ai": ["CLOUDFLARE_API_KEY"],
+      "cloudflare-ai-gateway": ["CLOUDFLARE_API_KEY"],
+      "configuredApiKeyProviders": "See env-api-keys.ts envMap; the mapping is part of the parity surface and is intentionally not duplicated here as a second provider registry."
+    },
+    "source": "packages/coding-agent/docs/cli.md, packages/coding-agent/docs/environment-variables.md, packages/coding-agent/docs/providers.md"
+  },
+  "persistence": {
+    "agentDirectoryDefault": "~/.nyan/agent",
+    "durableStore": "~/.nyan/agent/sessions-durable/<cwd-hash>/<session>/session.sqlite",
+    "durableMetadata": "session.json",
+    "legacyStore": "~/.nyan/agent/sessions/",
+    "legacyMode": "read-only compatibility",
+    "projectConfig": ".nyan/",
+    "lock": "one process owns an open durable session",
+    "rustRequirement": "versioned format plus an explicit legacy read or migration path"
+  },
+  "resourceSurfaces": [
+    "user settings",
+    "project settings",
+    "keybindings",
+    "auth.json",
+    "models.json",
+    "AGENTS.md and CLAUDE.md context files",
+    "SYSTEM.md and APPEND_SYSTEM.md",
+    "extensions",
+    "skills",
+    "prompt templates",
+    "themes",
+    "MCP configuration",
+    "project trust"
+  ],
+  "parityGates": [
+    "same normalized final outcomes for fixed provider/tool fixtures",
+    "same mode selection, exit codes, stdout/stderr ownership, and signal behavior",
+    "same JSON event discriminants and RPC command/response contracts",
+    "session continuation, lock, fork/clone, export, and restart recovery evidence",
+    "provider/auth/tool/resource compatibility or an owner-approved explicit reduction",
+    "no Node dependency on the ordinary Rust runtime path",
+    "separately published Rust preview before default executable cutover"
+  ]
+}

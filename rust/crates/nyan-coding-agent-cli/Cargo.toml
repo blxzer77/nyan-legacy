@@ -1,0 +1,18 @@
+[package]
+name = "nyan-coding-agent-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nyan-coding-agent"
+path = "src/main.rs"
+
+[dependencies]
+nyan-coding-agent-core = { path = "../nyan-coding-agent-core" }
+nyan-coding-agent-protocol = { path = "../nyan-coding-agent-protocol" }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "nyan-coding-agent-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+command-group = "=5.0.1"
+nyan-coding-agent-core = { path = "../nyan-coding-agent-core" }
+
+[lints]
+workspace = true

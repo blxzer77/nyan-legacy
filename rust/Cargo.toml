@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nyan-coding-agent-core",
+    "crates/nyan-coding-agent-session",
+    "crates/nyan-coding-agent-provider",
+    "crates/nyan-coding-agent-tools",
+    "crates/nyan-coding-agent-runtime",
+    "crates/nyan-coding-agent-protocol",
+    "crates/nyan-coding-agent-cli",
+]
+default-members = [
+    "crates/nyan-coding-agent-core",
+    "crates/nyan-coding-agent-session",
+    "crates/nyan-coding-agent-provider",
+    "crates/nyan-coding-agent-tools",
+    "crates/nyan-coding-agent-runtime",
+    "crates/nyan-coding-agent-protocol",
+    "crates/nyan-coding-agent-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/blxzer77/nyan"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
