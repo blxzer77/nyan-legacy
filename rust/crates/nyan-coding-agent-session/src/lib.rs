@@ -90,6 +90,71 @@ pub struct SessionOpenRequest {
     pub storage_root: Option<PathBuf>,
 }
 
+/// A persisted journal record category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionRecordKind {
+    /// Session metadata or configuration.
+    Metadata,
+    /// User input.
+    UserMessage,
+    /// Assistant output.
+    AssistantMessage,
+    /// Tool output.
+    ToolResult,
+    /// Run admission marker.
+    RunStarted,
+    /// Run terminal marker.
+    RunFinished,
+}
+
+impl SessionRecordKind {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Metadata => 1,
+            Self::UserMessage => 2,
+            Self::AssistantMessage => 3,
+            Self::ToolResult => 4,
+            Self::RunStarted => 5,
+            Self::RunFinished => 6,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Metadata,
+            2 => Self::UserMessage,
+            3 => Self::AssistantMessage,
+            4 => Self::ToolResult,
+            5 => Self::RunStarted,
+            6 => Self::RunFinished,
+            _ => return None,
+        })
+    }
+}
+
+/// One append-only session journal record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRecord {
+    /// Monotonic record sequence within the session.
+    pub sequence: u64,
+    /// Record category.
+    pub kind: SessionRecordKind,
+    /// Opaque payload owned by the higher-level session/runtime codec.
+    pub payload: Vec<u8>,
+}
+
+impl SessionRecord {
+    /// Creates a record before it is appended to a journal.
+    #[must_use]
+    pub fn new(kind: SessionRecordKind, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            sequence: 0,
+            kind,
+            payload: payload.into(),
+        }
+    }
+}
+
 /// Errors produced by a native session store.
 #[derive(Debug)]
 pub enum SessionStoreError {
@@ -107,6 +172,11 @@ pub enum SessionStoreError {
     },
     /// The existing file uses a version this runtime cannot read.
     UnsupportedVersion {
+        /// Session file path.
+        path: PathBuf,
+    },
+    /// The journal contains a truncated or invalid record.
+    CorruptRecord {
         /// Session file path.
         path: PathBuf,
     },
@@ -128,6 +198,7 @@ impl SessionStoreError {
             Self::Locked { .. } => "session_locked",
             Self::InvalidHeader { .. } => "session_invalid_header",
             Self::UnsupportedVersion { .. } => "session_unsupported_version",
+            Self::CorruptRecord { .. } => "session_corrupt_record",
             Self::Io { .. } => "session_io",
         }
     }
@@ -151,6 +222,9 @@ impl std::fmt::Display for SessionStoreError {
                     "session file version is unsupported: {}",
                     path.display()
                 )
+            }
+            Self::CorruptRecord { path } => {
+                write!(formatter, "session journal is corrupt: {}", path.display())
             }
             Self::Io { operation, message } => {
                 write!(formatter, "session {operation} failed: {message}")
@@ -225,7 +299,7 @@ impl SessionStore for FileSessionStore {
                 descriptor: request.descriptor,
                 format: SessionFormat::RustNative,
                 path: None,
-                _lease: None,
+                lease: None,
             });
         }
 
@@ -300,7 +374,7 @@ impl SessionStore for FileSessionStore {
             descriptor: request.descriptor,
             format: SessionFormat::RustNative,
             path: Some(session_path),
-            _lease: Some(lease),
+            lease: Some(lease),
         })
     }
 }
@@ -326,7 +400,7 @@ pub struct OpenedSession {
     pub format: SessionFormat,
     /// Database or file path when persisted.
     pub path: Option<PathBuf>,
-    _lease: Option<Arc<SessionLease>>,
+    lease: Option<Arc<SessionLease>>,
 }
 
 impl OpenedSession {
@@ -335,16 +409,179 @@ impl OpenedSession {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+
+    /// Opens the append-only journal while retaining this session's lock lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionStoreError::StorageRootRequired`] for an ephemeral
+    /// session or a filesystem/corruption error for a persistent session.
+    pub fn journal(&self) -> Result<SessionJournal, SessionStoreError> {
+        SessionJournal::open(self)
+    }
+}
+
+const MAX_RECORD_BYTES: u32 = 64 * 1024 * 1024;
+
+/// An append-only journal owned by one opened session lease.
+#[derive(Debug)]
+pub struct SessionJournal {
+    file: File,
+    path: PathBuf,
+    _lease: Arc<SessionLease>,
+    next_sequence: u64,
+}
+
+impl SessionJournal {
+    fn open(session: &OpenedSession) -> Result<Self, SessionStoreError> {
+        let path = session
+            .path
+            .clone()
+            .ok_or(SessionStoreError::StorageRootRequired)?;
+        let lease = session
+            .lease
+            .clone()
+            .ok_or(SessionStoreError::StorageRootRequired)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| SessionStoreError::Io {
+                operation: "open journal".to_owned(),
+                message: error.to_string(),
+            })?;
+        let records = read_records(&mut file, &path)?;
+        let next_sequence = records
+            .last()
+            .map_or(0, |record| record.sequence.saturating_add(1));
+        file.seek(SeekFrom::End(0))
+            .map_err(|error| SessionStoreError::Io {
+                operation: "position journal".to_owned(),
+                message: error.to_string(),
+            })?;
+        Ok(Self {
+            file,
+            path,
+            _lease: lease,
+            next_sequence,
+        })
+    }
+
+    /// Appends one record and synchronizes it before returning its sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the frame cannot be written or synced.
+    pub fn append(&mut self, mut record: SessionRecord) -> Result<u64, SessionStoreError> {
+        let payload_length =
+            record
+                .payload
+                .len()
+                .checked_add(9)
+                .ok_or_else(|| SessionStoreError::Io {
+                    operation: "append journal record".to_owned(),
+                    message: "record length overflow".to_owned(),
+                })?;
+        let frame_length = u32::try_from(payload_length).map_err(|_| SessionStoreError::Io {
+            operation: "append journal record".to_owned(),
+            message: "record exceeds the maximum frame size".to_owned(),
+        })?;
+        if frame_length > MAX_RECORD_BYTES {
+            return Err(SessionStoreError::Io {
+                operation: "append journal record".to_owned(),
+                message: "record exceeds the maximum frame size".to_owned(),
+            });
+        }
+        let sequence = self.next_sequence;
+        record.sequence = sequence;
+        self.file
+            .seek(SeekFrom::End(0))
+            .and_then(|_| self.file.write_all(&frame_length.to_le_bytes()))
+            .and_then(|()| self.file.write_all(&sequence.to_le_bytes()))
+            .and_then(|()| self.file.write_all(&[record.kind.code()]))
+            .and_then(|()| self.file.write_all(&record.payload))
+            .and_then(|()| self.file.sync_all())
+            .map_err(|error| SessionStoreError::Io {
+                operation: "append journal record".to_owned(),
+                message: error.to_string(),
+            })?;
+        self.next_sequence = sequence.saturating_add(1);
+        Ok(sequence)
+    }
+
+    /// Replays all records currently committed in the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionStoreError::CorruptRecord`] if a frame is truncated or
+    /// has an unknown record kind.
+    pub fn records(&mut self) -> Result<Vec<SessionRecord>, SessionStoreError> {
+        read_records(&mut self.file, &self.path)
+    }
+}
+
+fn read_records(file: &mut File, path: &Path) -> Result<Vec<SessionRecord>, SessionStoreError> {
+    file.seek(SeekFrom::Start(RUST_SESSION_HEADER.len() as u64))
+        .map_err(|error| SessionStoreError::Io {
+            operation: "seek journal".to_owned(),
+            message: error.to_string(),
+        })?;
+    let mut records = Vec::new();
+    loop {
+        let mut length_bytes = [0_u8; 4];
+        let read = file
+            .read(&mut length_bytes)
+            .map_err(|error| SessionStoreError::Io {
+                operation: "read journal frame".to_owned(),
+                message: error.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        if read != length_bytes.len() {
+            return Err(SessionStoreError::CorruptRecord {
+                path: path.to_owned(),
+            });
+        }
+        let frame_length = u32::from_le_bytes(length_bytes);
+        if !(9..=MAX_RECORD_BYTES).contains(&frame_length) {
+            return Err(SessionStoreError::CorruptRecord {
+                path: path.to_owned(),
+            });
+        }
+        let mut frame = vec![0_u8; frame_length as usize];
+        file.read_exact(&mut frame)
+            .map_err(|_| SessionStoreError::CorruptRecord {
+                path: path.to_owned(),
+            })?;
+        let sequence = u64::from_le_bytes(
+            frame[0..8]
+                .try_into()
+                .expect("validated journal frame has a sequence"),
+        );
+        let kind = SessionRecordKind::from_code(frame[8]).ok_or_else(|| {
+            SessionStoreError::CorruptRecord {
+                path: path.to_owned(),
+            }
+        })?;
+        records.push(SessionRecord {
+            sequence,
+            kind,
+            payload: frame[9..].to_vec(),
+        });
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        FileSessionStore, SessionDescriptor, SessionFormat, SessionOpenRequest, SessionStore,
-        SessionStoreError,
+        FileSessionStore, SessionDescriptor, SessionFormat, SessionOpenRequest, SessionRecord,
+        SessionRecordKind, SessionStore, SessionStoreError,
     };
     use nyan_coding_agent_core::{AgentMode, SessionId};
 
@@ -400,6 +637,60 @@ mod tests {
         let reopened = store.open(request(&root)).expect("reopen session");
         assert_eq!(reopened.path(), Some(path.as_path()));
         drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn journal_appends_and_replays_in_sequence_order() {
+        let root = test_root("journal");
+        let store = FileSessionStore::new(&root);
+        let opened = store.open(request(&root)).expect("open session");
+        let mut journal = opened.journal().expect("open journal");
+        assert_eq!(
+            journal
+                .append(SessionRecord::new(
+                    SessionRecordKind::UserMessage,
+                    b"hello".to_vec(),
+                ))
+                .expect("append user"),
+            0
+        );
+        assert_eq!(
+            journal
+                .append(SessionRecord::new(
+                    SessionRecordKind::AssistantMessage,
+                    b"world".to_vec(),
+                ))
+                .expect("append assistant"),
+            1
+        );
+        let records = journal.records().expect("replay journal");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind, SessionRecordKind::UserMessage);
+        assert_eq!(records[0].payload, b"hello");
+        assert_eq!(records[1].sequence, 1);
+        drop(journal);
+        drop(opened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn corrupt_journal_frame_is_reported() {
+        let root = test_root("corrupt-journal");
+        let store = FileSessionStore::new(&root);
+        let opened = store.open(request(&root)).expect("open session");
+        let path = opened.path().expect("session path").to_owned();
+        drop(opened);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open session file");
+        file.write_all(&[20, 0]).expect("write partial frame");
+        drop(file);
+        let opened = store.open(request(&root)).expect("reopen session");
+        let error = opened.journal().expect_err("corrupt journal");
+        assert_eq!(error.code(), "session_corrupt_record");
+        drop(opened);
         fs::remove_dir_all(root).expect("remove test root");
     }
 
