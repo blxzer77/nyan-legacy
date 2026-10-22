@@ -6,7 +6,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nyan_coding_agent_core::{AgentMode, CoreError, SessionId};
+use nyan_coding_agent_core::{
+    AgentMode, CoreError, Message, MessageRole, SessionId, ToolCall, ToolCallId,
+};
 
 const RUST_SESSION_HEADER: &[u8] = b"NYANRS01\n1\n";
 
@@ -151,6 +153,218 @@ impl SessionRecord {
             sequence: 0,
             kind,
             payload: payload.into(),
+        }
+    }
+}
+
+/// Errors raised while encoding or decoding a provider-neutral message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionMessageError {
+    /// The byte stream ended before a complete value was read.
+    Truncated,
+    /// The byte stream uses an unsupported codec version.
+    UnsupportedVersion {
+        /// Version discriminant found in the payload.
+        version: u8,
+    },
+    /// A string was not valid UTF-8.
+    InvalidUtf8,
+    /// A role discriminant was not recognized.
+    InvalidRole {
+        /// Role discriminant found in the payload.
+        value: u8,
+    },
+    /// An optional boolean field contained an invalid value.
+    InvalidFlag {
+        /// Flag value found in the payload.
+        value: u8,
+    },
+    /// A tool-call identifier was rejected by the core identity type.
+    InvalidToolCallId,
+    /// A length would exceed the supported codec limit.
+    LengthOverflow,
+}
+
+impl std::fmt::Display for SessionMessageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("session message payload is truncated"),
+            Self::UnsupportedVersion { version } => {
+                write!(
+                    formatter,
+                    "session message codec version is unsupported: {version}"
+                )
+            }
+            Self::InvalidUtf8 => formatter.write_str("session message contains invalid UTF-8"),
+            Self::InvalidRole { value } => {
+                write!(formatter, "invalid session message role: {value}")
+            }
+            Self::InvalidFlag { value } => {
+                write!(formatter, "invalid session message flag: {value}")
+            }
+            Self::InvalidToolCallId => formatter.write_str("invalid session message tool-call id"),
+            Self::LengthOverflow => formatter.write_str("session message field is too large"),
+        }
+    }
+}
+
+impl std::error::Error for SessionMessageError {}
+
+const MESSAGE_CODEC_VERSION: u8 = 1;
+
+/// Encodes one provider-neutral message into a stable Rust-native payload.
+///
+/// # Errors
+///
+/// Returns [`SessionMessageError::LengthOverflow`] when a field exceeds the
+/// codec's 32-bit length limit.
+pub fn encode_message(message: &Message) -> Result<Vec<u8>, SessionMessageError> {
+    let mut bytes = Vec::new();
+    bytes.push(MESSAGE_CODEC_VERSION);
+    bytes.push(match message.role {
+        MessageRole::System => 0,
+        MessageRole::User => 1,
+        MessageRole::Assistant => 2,
+        MessageRole::Tool => 3,
+    });
+    bytes.push(u8::from(message.is_error));
+    put_string(&mut bytes, &message.text)?;
+    put_optional_string(
+        &mut bytes,
+        message.tool_call_id.as_ref().map(ToolCallId::as_str),
+    )?;
+    put_optional_string(&mut bytes, message.tool_name.as_deref())?;
+    let count =
+        u32::try_from(message.tool_calls.len()).map_err(|_| SessionMessageError::LengthOverflow)?;
+    bytes.extend_from_slice(&count.to_le_bytes());
+    for call in &message.tool_calls {
+        put_string(&mut bytes, call.id.as_str())?;
+        put_string(&mut bytes, &call.name)?;
+        put_string(&mut bytes, &call.arguments)?;
+    }
+    Ok(bytes)
+}
+
+/// Decodes a Rust-native message payload.
+///
+/// # Errors
+///
+/// Returns a precise codec error when the payload is truncated or invalid.
+pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
+    let mut cursor = Cursor { bytes, position: 0 };
+    let version = cursor.u8()?;
+    if version != MESSAGE_CODEC_VERSION {
+        return Err(SessionMessageError::UnsupportedVersion { version });
+    }
+    let role = match cursor.u8()? {
+        0 => MessageRole::System,
+        1 => MessageRole::User,
+        2 => MessageRole::Assistant,
+        3 => MessageRole::Tool,
+        value => return Err(SessionMessageError::InvalidRole { value }),
+    };
+    let is_error = match cursor.u8()? {
+        0 => false,
+        1 => true,
+        value => return Err(SessionMessageError::InvalidFlag { value }),
+    };
+    let text = cursor.string()?;
+    let tool_call_id = cursor
+        .optional_string()?
+        .map(|value| ToolCallId::new(value).map_err(|_| SessionMessageError::InvalidToolCallId))
+        .transpose()?;
+    let tool_name = cursor.optional_string()?;
+    let count = cursor.u32()? as usize;
+    let mut tool_calls = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = ToolCallId::new(cursor.string()?)
+            .map_err(|_| SessionMessageError::InvalidToolCallId)?;
+        tool_calls.push(ToolCall {
+            id,
+            name: cursor.string()?,
+            arguments: cursor.string()?,
+        });
+    }
+    Ok(Message {
+        role,
+        text,
+        tool_call_id,
+        tool_name,
+        is_error,
+        tool_calls,
+    })
+}
+
+fn put_string(bytes: &mut Vec<u8>, value: &str) -> Result<(), SessionMessageError> {
+    let length = u32::try_from(value.len()).map_err(|_| SessionMessageError::LengthOverflow)?;
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn put_optional_string(
+    bytes: &mut Vec<u8>,
+    value: Option<&str>,
+) -> Result<(), SessionMessageError> {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            put_string(bytes, value)?;
+        }
+        None => bytes.push(0),
+    }
+    Ok(())
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl Cursor<'_> {
+    fn u8(&mut self) -> Result<u8, SessionMessageError> {
+        let value = *self
+            .bytes
+            .get(self.position)
+            .ok_or(SessionMessageError::Truncated)?;
+        self.position += 1;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> Result<u32, SessionMessageError> {
+        let end = self
+            .position
+            .checked_add(4)
+            .ok_or(SessionMessageError::Truncated)?;
+        let bytes = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(SessionMessageError::Truncated)?;
+        self.position = end;
+        Ok(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte slice"),
+        ))
+    }
+
+    fn string(&mut self) -> Result<String, SessionMessageError> {
+        let length = self.u32()? as usize;
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or(SessionMessageError::Truncated)?;
+        let bytes = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(SessionMessageError::Truncated)?;
+        self.position = end;
+        String::from_utf8(bytes.to_vec()).map_err(|_| SessionMessageError::InvalidUtf8)
+    }
+
+    fn optional_string(&mut self) -> Result<Option<String>, SessionMessageError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.string().map(Some),
+            value => Err(SessionMessageError::InvalidFlag { value }),
         }
     }
 }
@@ -509,6 +723,24 @@ impl SessionJournal {
         Ok(sequence)
     }
 
+    /// Encodes and appends one message record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a codec or filesystem error when the message cannot be encoded
+    /// or the record cannot be committed.
+    pub fn append_message(
+        &mut self,
+        kind: SessionRecordKind,
+        message: &Message,
+    ) -> Result<u64, SessionStoreError> {
+        let payload = encode_message(message).map_err(|error| SessionStoreError::Io {
+            operation: "encode session message".to_owned(),
+            message: error.to_string(),
+        })?;
+        self.append(SessionRecord::new(kind, payload))
+    }
+
     /// Replays all records currently committed in the journal.
     ///
     /// # Errors
@@ -517,6 +749,16 @@ impl SessionJournal {
     /// has an unknown record kind.
     pub fn records(&mut self) -> Result<Vec<SessionRecord>, SessionStoreError> {
         read_records(&mut self.file, &self.path)
+    }
+
+    /// Decodes a message record returned by [`Self::records`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionMessageError`] when the record payload is not a valid
+    /// Rust-native message.
+    pub fn decode_message_record(record: &SessionRecord) -> Result<Message, SessionMessageError> {
+        decode_message(&record.payload)
     }
 }
 
@@ -580,10 +822,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        FileSessionStore, SessionDescriptor, SessionFormat, SessionOpenRequest, SessionRecord,
-        SessionRecordKind, SessionStore, SessionStoreError,
+        FileSessionStore, SessionDescriptor, SessionFormat, SessionJournal, SessionOpenRequest,
+        SessionRecord, SessionRecordKind, SessionStore, SessionStoreError, decode_message,
+        encode_message,
     };
-    use nyan_coding_agent_core::{AgentMode, SessionId};
+    use nyan_coding_agent_core::{
+        AgentMode, Message, MessageRole, SessionId, ToolCall, ToolCallId,
+    };
 
     fn test_root(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -669,6 +914,47 @@ mod tests {
         assert_eq!(records[0].kind, SessionRecordKind::UserMessage);
         assert_eq!(records[0].payload, b"hello");
         assert_eq!(records[1].sequence, 1);
+        drop(journal);
+        drop(opened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn message_codec_roundtrips_tool_calls_and_results() {
+        let message = Message {
+            role: MessageRole::Assistant,
+            text: "use tool".to_owned(),
+            tool_call_id: Some(ToolCallId::new("result-1").expect("tool result id")),
+            tool_name: Some("echo".to_owned()),
+            is_error: true,
+            tool_calls: vec![ToolCall {
+                id: ToolCallId::new("call-1").expect("tool call id"),
+                name: "echo".to_owned(),
+                arguments: "hello".to_owned(),
+            }],
+        };
+        let encoded = encode_message(&message).expect("encode message");
+        assert_eq!(decode_message(&encoded).expect("decode message"), message);
+    }
+
+    #[test]
+    fn journal_message_helper_uses_the_codec() {
+        let root = test_root("journal-message");
+        let store = FileSessionStore::new(&root);
+        let opened = store.open(request(&root)).expect("open session");
+        let mut journal = opened.journal().expect("open journal");
+        let message = Message::text(MessageRole::User, "hello");
+        assert_eq!(
+            journal
+                .append_message(SessionRecordKind::UserMessage, &message)
+                .expect("append message"),
+            0
+        );
+        let records = journal.records().expect("read records");
+        assert_eq!(
+            SessionJournal::decode_message_record(&records[0]).expect("decode record"),
+            message
+        );
         drop(journal);
         drop(opened);
         fs::remove_dir_all(root).expect("remove test root");
