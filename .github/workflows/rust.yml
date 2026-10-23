@@ -24,7 +24,7 @@ jobs:
   check:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -35,6 +35,15 @@ jobs:
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Install NASM for the rustls crypto provider
+        # aws-lc-sys assembles with NASM on Windows MSVC. This step was added without a
+        # Windows run to confirm it is needed; remove it if the first run shows it is not.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Check formatting
         working-directory: rust

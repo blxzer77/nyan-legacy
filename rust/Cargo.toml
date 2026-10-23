@@ -6,6 +6,7 @@ members = [
     "crates/nyan-coding-agent-provider",
     "crates/nyan-coding-agent-tools",
     "crates/nyan-coding-agent-runtime",
+    "crates/nyan-coding-agent-provider-http",
     "crates/nyan-coding-agent-protocol",
     "crates/nyan-coding-agent-cli",
 ]
@@ -15,6 +16,7 @@ default-members = [
     "crates/nyan-coding-agent-provider",
     "crates/nyan-coding-agent-tools",
     "crates/nyan-coding-agent-runtime",
+    "crates/nyan-coding-agent-provider-http",
     "crates/nyan-coding-agent-protocol",
     "crates/nyan-coding-agent-cli",
 ]

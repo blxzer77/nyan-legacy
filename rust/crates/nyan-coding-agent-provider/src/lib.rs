@@ -20,6 +20,19 @@ impl From<ProviderModel> for ModelRef {
     }
 }
 
+/// A tool the model may call.
+///
+/// Parity gap: only the name and description are declared. The JSON schema of
+/// the arguments is not carried yet, which providers treat as an object with no
+/// declared properties.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolSpec {
+    /// Stable tool name.
+    pub name: String,
+    /// Model-facing description.
+    pub description: String,
+}
+
 /// A provider-neutral request.
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
@@ -27,6 +40,8 @@ pub struct ProviderRequest {
     pub model: ProviderModel,
     /// Context messages in order.
     pub messages: Vec<Message>,
+    /// Tools the model may call in this request.
+    pub tools: Vec<ToolSpec>,
     /// Cancellation owned by the current agent run.
     pub cancellation: CancellationToken,
 }
@@ -172,6 +187,7 @@ mod tests {
                 model: "model".to_owned(),
             },
             messages: vec![Message::text(MessageRole::User, "hello")],
+            tools: Vec::new(),
             cancellation: nyan_coding_agent_core::CancellationToken::new(),
         };
         assert_eq!(request.messages[0].text, "hello");

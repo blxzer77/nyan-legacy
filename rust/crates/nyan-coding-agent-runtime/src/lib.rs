@@ -18,7 +18,7 @@ use nyan_coding_agent_core::{
 };
 use nyan_coding_agent_provider::{
     ProviderError, ProviderModel, ProviderRegistry, ProviderRequest, ProviderStopReason,
-    ProviderStreamEvent,
+    ProviderStreamEvent, ToolSpec,
 };
 use nyan_coding_agent_session::{NativeSession, SessionRecordKind, SessionStoreError};
 use nyan_coding_agent_tools::{ToolError, ToolRegistry};
@@ -614,6 +614,15 @@ impl<'a> AgentRuntime<'a> {
             let request = ProviderRequest {
                 model: self.config.model.clone(),
                 messages: self.context.messages.clone(),
+                tools: self
+                    .tools
+                    .definitions()
+                    .into_iter()
+                    .map(|definition| ToolSpec {
+                        name: definition.name,
+                        description: definition.description,
+                    })
+                    .collect(),
                 cancellation: self.cancellation.clone(),
             };
             match provider.stream(request).await {
