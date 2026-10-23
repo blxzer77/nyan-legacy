@@ -1,6 +1,6 @@
 //! Model-provider boundary for the Rust Coding Agent.
 
-use nyan_coding_agent_core::{BoxFuture, CancellationToken, CoreError, Message, ModelRef};
+use nyan_coding_agent_core::{BoxFuture, CancellationToken, CoreError, Message, ModelRef, Usage};
 
 /// A model selected for one request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +54,8 @@ pub enum ProviderStreamEvent {
         /// Text content in this update.
         text: String,
     },
+    /// Token accounting for the response, which may arrive before the terminal event.
+    Usage(Usage),
     /// A complete provider tool call.
     ToolCall(ToolCallRequest),
     /// The provider has reached a terminal response state.

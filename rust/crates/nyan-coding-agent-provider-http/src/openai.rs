@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, CancellationToken, Message, MessageRole};
+use nyan_coding_agent_core::{BoxFuture, CancellationToken, Message, MessageRole, Usage};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ProviderStreamEvent, ToolCallRequest, ToolSpec,
@@ -178,6 +178,7 @@ pub fn build_request_body(request: &ProviderRequest) -> Value {
         "model": request.model.model,
         "messages": request.messages.iter().map(wire_message).collect::<Vec<_>>(),
         "stream": true,
+        "stream_options": {"include_usage": true},
     });
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(request.tools.iter().map(wire_tool).collect());
@@ -241,6 +242,25 @@ struct PendingToolCall {
 struct Accumulator {
     tool_calls: BTreeMap<u64, PendingToolCall>,
     finish_reason: Option<String>,
+    usage: Option<Usage>,
+}
+
+fn parse_usage(value: &Value) -> Usage {
+    let count = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+    let input = count("/prompt_tokens");
+    let output = count("/completion_tokens");
+    let reported_total = count("/total_tokens");
+    Usage {
+        input,
+        output,
+        cache_read: count("/prompt_tokens_details/cached_tokens"),
+        cache_write: 0,
+        total_tokens: if reported_total > 0 {
+            reported_total
+        } else {
+            input.saturating_add(output)
+        },
+    }
 }
 
 impl Accumulator {
@@ -255,6 +275,9 @@ impl Accumulator {
                 message: message.to_owned(),
                 retryable: false,
             });
+        }
+        if let Some(usage) = chunk.get("usage").filter(|usage| usage.is_object()) {
+            self.usage = Some(parse_usage(usage));
         }
         let Some(choice) = chunk.pointer("/choices/0") else {
             return Ok(None);
@@ -288,8 +311,9 @@ impl Accumulator {
             .map(str::to_owned))
     }
 
-    /// Returns the tool-call events and terminal reason once the stream is complete.
-    fn finish(self) -> (Vec<ToolCallRequest>, ProviderStopReason) {
+    /// Returns the usage, tool-call events, and terminal reason once the stream is complete.
+    fn finish(self) -> (Option<Usage>, Vec<ToolCallRequest>, ProviderStopReason) {
+        let usage = self.usage;
         let has_calls = !self.tool_calls.is_empty();
         let calls = self
             .tool_calls
@@ -314,7 +338,7 @@ impl Accumulator {
             _ if has_calls => ProviderStopReason::ToolUse,
             _ => ProviderStopReason::Stop,
         };
-        (calls, reason)
+        (usage, calls, reason)
     }
 }
 
@@ -401,7 +425,15 @@ async fn pump(
             .await;
         return;
     }
-    let (calls, reason) = accumulator.finish();
+    let (usage, calls, reason) = accumulator.finish();
+    if let Some(usage) = usage
+        && sender
+            .send(Ok(ProviderStreamEvent::Usage(usage)))
+            .await
+            .is_err()
+    {
+        return;
+    }
     for call in calls {
         if sender
             .send(Ok(ProviderStreamEvent::ToolCall(call)))

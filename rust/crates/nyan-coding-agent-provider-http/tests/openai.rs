@@ -180,6 +180,51 @@ fn text_arrives_incrementally_and_the_request_is_well_formed() {
 }
 
 #[test]
+fn usage_is_reported_before_the_terminal_event() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve(
+        &runtime,
+        "200 OK",
+        vec![
+            (
+                0,
+                sse(r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#),
+            ),
+            (
+                0,
+                sse(
+                    r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":4}}}"#,
+                ),
+            ),
+            (0, sse("[DONE]")),
+        ],
+        false,
+    );
+    let stream = open(&runtime, &provider(&runtime, &server)).expect("open stream");
+    let events = drain(&runtime, stream).expect("drain");
+    assert_eq!(
+        events,
+        [
+            ProviderStreamEvent::TextDelta {
+                text: "ok".to_owned()
+            },
+            ProviderStreamEvent::Usage(nyan_coding_agent_core::Usage {
+                input: 12,
+                output: 3,
+                cache_read: 4,
+                cache_write: 0,
+                total_tokens: 15,
+            }),
+            ProviderStreamEvent::Finished {
+                reason: ProviderStopReason::Stop
+            },
+        ]
+    );
+    let captured = server.captured.lock().expect("captured lock").clone();
+    assert!(captured.contains("\"include_usage\":true"), "{captured}");
+}
+
+#[test]
 fn tool_calls_are_assembled_across_deltas() {
     let runtime = Runtime::new().expect("runtime");
     let server = serve(

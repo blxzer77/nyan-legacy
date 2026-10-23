@@ -116,7 +116,50 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// A minimal provider-neutral message used by the initial crate boundary.
+/// Token accounting reported by a provider for one assistant response.
+///
+/// Cost is not carried: it needs per-model pricing, which the Rust model
+/// registry does not have yet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Usage {
+    /// Input tokens.
+    pub input: u64,
+    /// Output tokens.
+    pub output: u64,
+    /// Input tokens served from the provider cache.
+    pub cache_read: u64,
+    /// Input tokens written to the provider cache.
+    pub cache_write: u64,
+    /// Total tokens as reported, or the sum when the provider reports none.
+    pub total_tokens: u64,
+}
+
+/// Why an assistant response ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopReason {
+    /// The model finished its answer.
+    Stop,
+    /// The response hit the output token limit.
+    Length,
+    /// The model requested tool calls.
+    ToolUse,
+    /// The response ended with an error.
+    Error,
+    /// The run was cancelled.
+    Aborted,
+}
+
+/// Milliseconds since the Unix epoch, or 0 if the clock is before it.
+#[must_use]
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// A provider-neutral conversation message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Message {
     /// The message role.
@@ -131,6 +174,18 @@ pub struct Message {
     pub is_error: bool,
     /// Tool calls requested by an assistant message.
     pub tool_calls: Vec<ToolCall>,
+    /// Creation time in Unix milliseconds, stamped by the constructors.
+    pub timestamp_ms: u64,
+    /// Provider id that produced an assistant message.
+    pub provider: Option<String>,
+    /// Model id that produced an assistant message.
+    pub model: Option<String>,
+    /// Token accounting for an assistant message, when the provider reported it.
+    pub usage: Option<Usage>,
+    /// Why an assistant message ended.
+    pub stop_reason: Option<StopReason>,
+    /// Diagnostic for an assistant message that ended in error.
+    pub error_message: Option<String>,
 }
 
 impl Message {
@@ -144,6 +199,12 @@ impl Message {
             tool_name: None,
             is_error: false,
             tool_calls: Vec::new(),
+            timestamp_ms: now_ms(),
+            provider: None,
+            model: None,
+            usage: None,
+            stop_reason: None,
+            error_message: None,
         }
     }
 
@@ -161,7 +222,7 @@ impl Message {
             tool_call_id: Some(call_id),
             tool_name: Some(tool_name.into()),
             is_error,
-            tool_calls: Vec::new(),
+            ..Self::text(MessageRole::Tool, String::new())
         }
     }
 }

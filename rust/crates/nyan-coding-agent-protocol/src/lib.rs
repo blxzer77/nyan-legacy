@@ -2,8 +2,8 @@
 
 use std::fmt::Write as _;
 
-use nyan_coding_agent_core::{AgentMode, Message, MessageRole, ToolCallId};
-use nyan_coding_agent_runtime::{AgentEvent, AgentOutcome};
+use nyan_coding_agent_core::{AgentMode, Message, MessageRole, StopReason, ToolCallId, Usage};
+use nyan_coding_agent_runtime::{AgentEvent, AgentOutcome, AssistantEvent};
 
 /// The JSONL-facing runtime mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,14 +376,49 @@ impl JsonlRecord {
     }
 }
 
-/// Encodes a message with the fields the Rust runtime currently carries.
+/// Renders tool-call arguments as the JSON object the wire format documents.
 ///
-/// Parity gap: the documented wire message also carries `usage`, `api`,
-/// `provider`, `model`, and `stopReason` on assistant messages. The Rust
-/// `Message` does not hold those yet, so they are omitted rather than invented.
-/// `timestamp` is supplied by the caller in Unix milliseconds.
+/// The runtime keeps arguments as the text the provider sent. A valid JSON
+/// object is embedded as-is; empty arguments become `{}`; anything else is kept
+/// as a string so malformed provider output stays visible instead of vanishing.
+fn arguments_json(arguments: &str) -> String {
+    if arguments.trim().is_empty() {
+        return "{}".to_owned();
+    }
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) if value.is_object() => value.to_string(),
+        _ => {
+            let mut out = String::new();
+            push_json_string(&mut out, arguments);
+            out
+        }
+    }
+}
+
+fn usage_json(usage: Usage) -> String {
+    format!(
+        "{{\"input\":{},\"output\":{},\"cacheRead\":{},\"cacheWrite\":{},\"totalTokens\":{}}}",
+        usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total_tokens
+    )
+}
+
+const fn stop_reason_name(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Stop => "stop",
+        StopReason::Length => "length",
+        StopReason::ToolUse => "toolUse",
+        StopReason::Error => "error",
+        StopReason::Aborted => "aborted",
+    }
+}
+
+/// Encodes a message in the documented wire shape.
+///
+/// Parity gaps: assistant `usage` omits `cost` (the Rust model registry has no
+/// pricing yet) and `api` is omitted (the runtime has no API-kind concept).
+/// Image and thinking content blocks do not exist in the Rust `Message`.
 #[must_use]
-pub fn encode_message(message: &Message, timestamp_ms: u64) -> String {
+pub fn encode_message(message: &Message) -> String {
     let mut out = String::from("{\"role\":");
     match message.role {
         MessageRole::System => {
@@ -416,10 +451,30 @@ pub fn encode_message(message: &Message, timestamp_ms: u64) -> String {
                 out.push_str(",\"name\":");
                 push_json_string(&mut out, &call.name);
                 out.push_str(",\"arguments\":");
-                push_json_string(&mut out, &call.arguments);
+                out.push_str(&arguments_json(&call.arguments));
                 out.push('}');
             }
             out.push(']');
+            if let Some(provider) = &message.provider {
+                out.push_str(",\"provider\":");
+                push_json_string(&mut out, provider);
+            }
+            if let Some(model) = &message.model {
+                out.push_str(",\"model\":");
+                push_json_string(&mut out, model);
+            }
+            if let Some(usage) = message.usage {
+                out.push_str(",\"usage\":");
+                out.push_str(&usage_json(usage));
+            }
+            if let Some(reason) = message.stop_reason {
+                out.push_str(",\"stopReason\":");
+                push_json_string(&mut out, stop_reason_name(reason));
+            }
+            if let Some(error) = &message.error_message {
+                out.push_str(",\"errorMessage\":");
+                push_json_string(&mut out, error);
+            }
         }
         MessageRole::Tool => {
             push_json_string(&mut out, "toolResult");
@@ -436,28 +491,147 @@ pub fn encode_message(message: &Message, timestamp_ms: u64) -> String {
             out.push_str(if message.is_error { "true" } else { "false" });
         }
     }
-    let _ = write!(out, ",\"timestamp\":{timestamp_ms}}}");
+    let _ = write!(out, ",\"timestamp\":{}}}", message.timestamp_ms);
     out
 }
 
-/// Maps one runtime event to its JSONL record, or `None` when the event has no
-/// documented wire form yet.
+/// Renders Unix milliseconds as an ISO 8601 UTC timestamp with millisecond precision.
+#[must_use]
+pub fn iso_timestamp(unix_ms: u64) -> String {
+    let milliseconds = unix_ms % 1000;
+    let seconds = unix_ms / 1000;
+    let second_of_day = seconds % 86_400;
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX / 2);
+    // Civil-from-days (Howard Hinnant): days since 1970-01-01 to a proleptic Gregorian date.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{milliseconds:03}Z",
+        second_of_day / 3600,
+        second_of_day % 3600 / 60,
+        second_of_day % 60
+    )
+}
+
+/// Builds the JSON-mode session header record.
+#[must_use]
+pub fn session_header_jsonl(session_id: &str, timestamp_ms: u64, cwd: &str) -> String {
+    JsonlRecord::new("session")
+        .raw("version", "3")
+        .string("id", session_id)
+        .string("timestamp", &iso_timestamp(timestamp_ms))
+        .string("cwd", cwd)
+        .finish()
+}
+
+fn assistant_event_json(event: &AssistantEvent) -> String {
+    let mut out = String::new();
+    match event {
+        AssistantEvent::TextStart { content_index } => {
+            let _ = write!(
+                out,
+                "{{\"type\":\"text_start\",\"contentIndex\":{content_index}}}"
+            );
+        }
+        AssistantEvent::TextDelta {
+            content_index,
+            delta,
+        } => {
+            let _ = write!(
+                out,
+                "{{\"type\":\"text_delta\",\"contentIndex\":{content_index},\"delta\":"
+            );
+            push_json_string(&mut out, delta);
+            out.push('}');
+        }
+        AssistantEvent::TextEnd {
+            content_index,
+            content,
+        } => {
+            let _ = write!(
+                out,
+                "{{\"type\":\"text_end\",\"contentIndex\":{content_index},\"content\":"
+            );
+            push_json_string(&mut out, content);
+            out.push('}');
+        }
+        AssistantEvent::ToolCallStart {
+            content_index,
+            id,
+            name,
+        } => {
+            let _ = write!(
+                out,
+                "{{\"type\":\"toolcall_start\",\"contentIndex\":{content_index},\"id\":"
+            );
+            push_json_string(&mut out, id.as_str());
+            out.push_str(",\"toolName\":");
+            push_json_string(&mut out, name);
+            out.push('}');
+        }
+        AssistantEvent::ToolCallEnd {
+            content_index,
+            tool_call,
+        } => {
+            let _ = write!(
+                out,
+                "{{\"type\":\"toolcall_end\",\"contentIndex\":{content_index},\"toolCall\":{{\"type\":\"toolCall\",\"id\":"
+            );
+            push_json_string(&mut out, tool_call.id.as_str());
+            out.push_str(",\"name\":");
+            push_json_string(&mut out, &tool_call.name);
+            out.push_str(",\"arguments\":");
+            out.push_str(&arguments_json(&tool_call.arguments));
+            out.push_str("}}");
+        }
+    }
+    out
+}
+
+/// Maps one runtime event to its JSONL record(s).
 ///
 /// `RetryStart` and `RetryEnd` map to `auto_retry_start` and `auto_retry_end`.
 /// `AgentEnd` maps to `agent_end` followed by `agent_settled`, because the Rust
 /// runtime has no automatic work that outlives a run.
+///
+/// Parity gap: `tool_execution_end.durationMs` is not reported because the
+/// runtime does not time tool execution yet.
 #[must_use]
-pub fn event_to_jsonl(event: &AgentEvent, timestamp_ms: u64) -> Option<String> {
-    Some(match event {
+pub fn event_to_jsonl(event: &AgentEvent) -> String {
+    match event {
         AgentEvent::AgentStart => JsonlRecord::new("agent_start").finish(),
         AgentEvent::TurnStart { .. } => JsonlRecord::new("turn_start").finish(),
         AgentEvent::MessageStart { message } => JsonlRecord::new("message_start")
-            .raw("message", &encode_message(message, timestamp_ms))
+            .raw("message", &encode_message(message))
             .finish(),
         AgentEvent::MessageEnd { message } => JsonlRecord::new("message_end")
-            .raw("message", &encode_message(message, timestamp_ms))
+            .raw("message", &encode_message(message))
             .finish(),
-        AgentEvent::MessageUpdate { .. } => return None,
+        AgentEvent::MessageUpdate { message, event } => {
+            let usage = message.usage.map_or_else(
+                || {
+                    "{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0}"
+                        .to_owned()
+                },
+                usage_json,
+            );
+            JsonlRecord::new("message_update")
+                .raw("usage", &usage)
+                .raw("assistantMessageEvent", &assistant_event_json(event))
+                .finish()
+        }
         AgentEvent::RetryStart { attempt } => JsonlRecord::new("auto_retry_start")
             .raw("attempt", &attempt.to_string())
             .finish(),
@@ -472,7 +646,7 @@ pub fn event_to_jsonl(event: &AgentEvent, timestamp_ms: u64) -> Option<String> {
         } => JsonlRecord::new("tool_execution_start")
             .string("toolCallId", call_id.as_str())
             .string("toolName", tool_name)
-            .string("args", arguments)
+            .raw("args", &arguments_json(arguments))
             .finish(),
         AgentEvent::ToolExecutionUpdate {
             call_id,
@@ -499,18 +673,23 @@ pub fn event_to_jsonl(event: &AgentEvent, timestamp_ms: u64) -> Option<String> {
         } => {
             let results = tool_results
                 .iter()
-                .map(|result| encode_message(result, timestamp_ms))
+                .map(encode_message)
                 .collect::<Vec<_>>()
                 .join(",");
             JsonlRecord::new("turn_end")
-                .raw("message", &encode_message(message, timestamp_ms))
+                .raw("message", &encode_message(message))
                 .raw("toolResults", &format!("[{results}]"))
                 .finish()
         }
-        AgentEvent::AgentEnd { outcome } => {
+        AgentEvent::AgentEnd { outcome, messages } => {
             let aborted = matches!(outcome, AgentOutcome::Aborted);
+            let generated = messages
+                .iter()
+                .map(encode_message)
+                .collect::<Vec<_>>()
+                .join(",");
             let mut records = JsonlRecord::new("agent_end")
-                .raw("messages", "[]")
+                .raw("messages", &format!("[{generated}]"))
                 .boolean("willRetry", false)
                 .finish();
             records.push_str(
@@ -520,7 +699,7 @@ pub fn event_to_jsonl(event: &AgentEvent, timestamp_ms: u64) -> Option<String> {
             );
             records
         }
-    })
+    }
 }
 
 /// Encodes a tool result in the documented `{content, details}` wire shape.
@@ -536,8 +715,9 @@ pub fn encode_tool_result(text: &str) -> String {
 mod tests {
     use super::{
         JsonlRecord, RpcCommandName, SessionEventName, encode_message, encode_tool_result,
-        event_to_jsonl, push_json_string,
+        event_to_jsonl, iso_timestamp, push_json_string, session_header_jsonl,
     };
+    use nyan_coding_agent_core::Message;
 
     fn encoded(value: &str) -> String {
         let mut out = String::new();
@@ -581,65 +761,178 @@ mod tests {
         );
     }
 
+    fn stamped(mut message: Message, timestamp_ms: u64) -> Message {
+        message.timestamp_ms = timestamp_ms;
+        message
+    }
+
     #[test]
-    fn run_events_map_to_documented_records() {
-        use nyan_coding_agent_core::{Message, MessageRole, ToolCallId};
-        use nyan_coding_agent_runtime::{AgentEvent, AgentOutcome};
+    fn user_and_tool_messages_use_the_documented_shape() {
+        use nyan_coding_agent_core::{MessageRole, ToolCallId};
+        use nyan_coding_agent_runtime::AgentEvent;
 
         assert_eq!(
-            event_to_jsonl(&AgentEvent::AgentStart, 1).as_deref(),
-            Some("{\"type\":\"agent_start\"}\n")
+            event_to_jsonl(&AgentEvent::AgentStart),
+            "{\"type\":\"agent_start\"}\n"
         );
+        let user = stamped(Message::text(MessageRole::User, "hi\n"), 1_733_234_401_000);
         assert_eq!(
-            event_to_jsonl(
-                &AgentEvent::MessageEnd {
-                    message: Message::text(MessageRole::User, "hi\n")
-                },
-                1_733_234_401_000
-            )
-            .as_deref(),
-            Some(concat!(
+            event_to_jsonl(&AgentEvent::MessageEnd { message: user }),
+            concat!(
                 "{\"type\":\"message_end\",\"message\":{\"role\":\"user\",",
                 "\"content\":\"hi\\n\",\"timestamp\":1733234401000}}\n"
-            ))
+            )
         );
-        let tool_result = Message::tool_result(
-            ToolCallId::new("call-1").expect("tool call id"),
-            "echo",
-            "out",
-            true,
+        let tool_result = stamped(
+            Message::tool_result(
+                ToolCallId::new("call-1").expect("tool call id"),
+                "echo",
+                "out",
+                true,
+            ),
+            7,
         );
-        let encoded = encode_message(&tool_result, 7);
         assert_eq!(
-            encoded,
+            encode_message(&tool_result),
             concat!(
                 "{\"role\":\"toolResult\",\"toolCallId\":\"call-1\",\"toolName\":\"echo\",",
                 "\"content\":[{\"type\":\"text\",\"text\":\"out\"}],\"isError\":true,",
                 "\"timestamp\":7}"
             )
         );
-        let end = event_to_jsonl(
-            &AgentEvent::AgentEnd {
-                outcome: AgentOutcome::Aborted,
-            },
-            1,
-        )
-        .expect("agent end");
-        assert_eq!(end.lines().count(), 2);
-        assert!(
-            end.lines()
-                .nth(1)
-                .expect("settled line")
-                .contains("\"aborted\":true")
-        );
-        assert!(
-            event_to_jsonl(
-                &AgentEvent::MessageUpdate {
-                    message: Message::text(MessageRole::Assistant, "x")
-                },
-                1
+    }
+
+    #[test]
+    fn assistant_messages_carry_provider_usage_and_stop_reason() {
+        use nyan_coding_agent_core::{MessageRole, StopReason, ToolCall, ToolCallId, Usage};
+
+        let mut message = Message::text(MessageRole::Assistant, "done");
+        message.timestamp_ms = 9;
+        message.provider = Some("openai".to_owned());
+        message.model = Some("gpt-test".to_owned());
+        message.usage = Some(Usage {
+            input: 10,
+            output: 2,
+            cache_read: 1,
+            cache_write: 0,
+            total_tokens: 12,
+        });
+        message.stop_reason = Some(StopReason::ToolUse);
+        message.tool_calls = vec![ToolCall {
+            id: ToolCallId::new("c1").expect("id"),
+            name: "bash".to_owned(),
+            arguments: "{\"command\":\"ls\"}".to_owned(),
+        }];
+        assert_eq!(
+            encode_message(&message),
+            concat!(
+                "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"},",
+                "{\"type\":\"toolCall\",\"id\":\"c1\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}],",
+                "\"provider\":\"openai\",\"model\":\"gpt-test\",",
+                "\"usage\":{\"input\":10,\"output\":2,\"cacheRead\":1,\"cacheWrite\":0,\"totalTokens\":12},",
+                "\"stopReason\":\"toolUse\",\"timestamp\":9}"
             )
-            .is_none()
+        );
+    }
+
+    #[test]
+    fn tool_arguments_that_are_not_an_object_stay_visible() {
+        use nyan_coding_agent_core::{MessageRole, ToolCall, ToolCallId};
+
+        let mut message = Message::text(MessageRole::Assistant, "");
+        message.timestamp_ms = 1;
+        message.tool_calls = ["", "not json", "[1]"]
+            .iter()
+            .enumerate()
+            .map(|(index, arguments)| ToolCall {
+                id: ToolCallId::new(format!("c{index}")).expect("id"),
+                name: "t".to_owned(),
+                arguments: (*arguments).to_owned(),
+            })
+            .collect();
+        let encoded = encode_message(&message);
+        assert!(encoded.contains("\"arguments\":{}"), "{encoded}");
+        assert!(encoded.contains("\"arguments\":\"not json\""), "{encoded}");
+        assert!(encoded.contains("\"arguments\":\"[1]\""), "{encoded}");
+    }
+
+    #[test]
+    fn streaming_updates_are_delta_only() {
+        use nyan_coding_agent_core::{MessageRole, ToolCall, ToolCallId};
+        use nyan_coding_agent_runtime::{AgentEvent, AssistantEvent};
+
+        let message = Message::text(MessageRole::Assistant, "Hello");
+        let update = |event| {
+            event_to_jsonl(&AgentEvent::MessageUpdate {
+                message: message.clone(),
+                event,
+            })
+        };
+        let zero_usage = "\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0}";
+        assert_eq!(
+            update(AssistantEvent::TextDelta {
+                content_index: 0,
+                delta: "Hel\"lo".to_owned()
+            }),
+            format!(
+                "{{\"type\":\"message_update\",{zero_usage},\"assistantMessageEvent\":{{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"Hel\\\"lo\"}}}}\n"
+            )
+        );
+        let ended = update(AssistantEvent::ToolCallEnd {
+            content_index: 1,
+            tool_call: ToolCall {
+                id: ToolCallId::new("c1").expect("id"),
+                name: "bash".to_owned(),
+                arguments: "{\"a\":1}".to_owned(),
+            },
+        });
+        assert!(ended.contains(
+            "\"assistantMessageEvent\":{\"type\":\"toolcall_end\",\"contentIndex\":1,\"toolCall\":{\"type\":\"toolCall\",\"id\":\"c1\",\"name\":\"bash\",\"arguments\":{\"a\":1}}}"
+        ));
+        assert!(
+            !ended.contains("\"message\""),
+            "wire updates omit the cumulative message"
+        );
+    }
+
+    #[test]
+    fn agent_end_lists_generated_messages_and_settles() {
+        use nyan_coding_agent_core::MessageRole;
+        use nyan_coding_agent_runtime::{AgentEvent, AgentOutcome};
+
+        let generated = stamped(Message::text(MessageRole::User, "go"), 5);
+        let end = event_to_jsonl(&AgentEvent::AgentEnd {
+            outcome: AgentOutcome::Aborted,
+            messages: vec![generated],
+        });
+        let mut lines = end.lines();
+        assert_eq!(
+            lines.next(),
+            Some(concat!(
+                "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"user\",\"content\":\"go\",\"timestamp\":5}],",
+                "\"willRetry\":false}"
+            ))
+        );
+        assert_eq!(
+            lines.next(),
+            Some("{\"type\":\"agent_settled\",\"aborted\":true}")
+        );
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn timestamps_render_as_iso_8601_utc() {
+        assert_eq!(iso_timestamp(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_timestamp(1_733_234_401_000), "2024-12-03T14:00:01.000Z");
+        assert_eq!(iso_timestamp(951_782_400_123), "2000-02-29T00:00:00.123Z");
+        assert_eq!(iso_timestamp(4_102_444_799_999), "2099-12-31T23:59:59.999Z");
+    }
+
+    #[test]
+    fn session_header_matches_the_documented_record() {
+        assert_eq!(
+            session_header_jsonl("uuid", 1_733_234_401_000, "/path"),
+            "{\"type\":\"session\",\"version\":3,\"id\":\"uuid\",\"timestamp\":\"2024-12-03T14:00:01.000Z\",\"cwd\":\"/path\"}\n"
         );
     }
 

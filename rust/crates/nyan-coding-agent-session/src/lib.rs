@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nyan_coding_agent_core::{
-    AgentMode, CoreError, Message, MessageRole, SessionId, ToolCall, ToolCallId,
+    AgentMode, CoreError, Message, MessageRole, SessionId, StopReason, ToolCall, ToolCallId, Usage,
 };
 
 const RUST_SESSION_HEADER: &[u8] = b"NYANRS01\n1\n";
@@ -210,7 +210,7 @@ impl std::fmt::Display for SessionMessageError {
 
 impl std::error::Error for SessionMessageError {}
 
-const MESSAGE_CODEC_VERSION: u8 = 1;
+const MESSAGE_CODEC_VERSION: u8 = 2;
 
 /// Encodes one provider-neutral message into a stable Rust-native payload.
 ///
@@ -242,6 +242,33 @@ pub fn encode_message(message: &Message) -> Result<Vec<u8>, SessionMessageError>
         put_string(&mut bytes, &call.name)?;
         put_string(&mut bytes, &call.arguments)?;
     }
+    bytes.extend_from_slice(&message.timestamp_ms.to_le_bytes());
+    put_optional_string(&mut bytes, message.provider.as_deref())?;
+    put_optional_string(&mut bytes, message.model.as_deref())?;
+    match message.usage {
+        Some(usage) => {
+            bytes.push(1);
+            for value in [
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                usage.total_tokens,
+            ] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        None => bytes.push(0),
+    }
+    bytes.push(match message.stop_reason {
+        None => 0,
+        Some(StopReason::Stop) => 1,
+        Some(StopReason::Length) => 2,
+        Some(StopReason::ToolUse) => 3,
+        Some(StopReason::Error) => 4,
+        Some(StopReason::Aborted) => 5,
+    });
+    put_optional_string(&mut bytes, message.error_message.as_deref())?;
     Ok(bytes)
 }
 
@@ -285,6 +312,30 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
             arguments: cursor.string()?,
         });
     }
+    let timestamp_ms = cursor.u64()?;
+    let provider = cursor.optional_string()?;
+    let model = cursor.optional_string()?;
+    let usage = match cursor.u8()? {
+        0 => None,
+        1 => Some(Usage {
+            input: cursor.u64()?,
+            output: cursor.u64()?,
+            cache_read: cursor.u64()?,
+            cache_write: cursor.u64()?,
+            total_tokens: cursor.u64()?,
+        }),
+        value => return Err(SessionMessageError::InvalidFlag { value }),
+    };
+    let stop_reason = match cursor.u8()? {
+        0 => None,
+        1 => Some(StopReason::Stop),
+        2 => Some(StopReason::Length),
+        3 => Some(StopReason::ToolUse),
+        4 => Some(StopReason::Error),
+        5 => Some(StopReason::Aborted),
+        value => return Err(SessionMessageError::InvalidFlag { value }),
+    };
+    let error_message = cursor.optional_string()?;
     Ok(Message {
         role,
         text,
@@ -292,6 +343,12 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
         tool_name,
         is_error,
         tool_calls,
+        timestamp_ms,
+        provider,
+        model,
+        usage,
+        stop_reason,
+        error_message,
     })
 }
 
@@ -343,6 +400,21 @@ impl Cursor<'_> {
         self.position = end;
         Ok(u32::from_le_bytes(
             bytes.try_into().expect("four-byte slice"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, SessionMessageError> {
+        let end = self
+            .position
+            .checked_add(8)
+            .ok_or(SessionMessageError::Truncated)?;
+        let bytes = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(SessionMessageError::Truncated)?;
+        self.position = end;
+        Ok(u64::from_le_bytes(
+            bytes.try_into().expect("eight-byte slice"),
         ))
     }
 
@@ -1112,7 +1184,7 @@ mod tests {
         decode_message, encode_message,
     };
     use nyan_coding_agent_core::{
-        AgentMode, Message, MessageRole, SessionId, ToolCall, ToolCallId,
+        AgentMode, Message, MessageRole, SessionId, StopReason, ToolCall, ToolCallId, Usage,
     };
 
     fn test_root(name: &str) -> std::path::PathBuf {
@@ -1221,9 +1293,52 @@ mod tests {
                 name: "echo".to_owned(),
                 arguments: "hello".to_owned(),
             }],
+            timestamp_ms: 1_733_234_401_000,
+            provider: Some("openai".to_owned()),
+            model: Some("gpt-test".to_owned()),
+            usage: Some(Usage {
+                input: 100,
+                output: 20,
+                cache_read: 5,
+                cache_write: 3,
+                total_tokens: 120,
+            }),
+            stop_reason: Some(StopReason::Length),
+            error_message: Some("cut off".to_owned()),
         };
         let encoded = encode_message(&message).expect("encode message");
         assert_eq!(decode_message(&encoded).expect("decode message"), message);
+    }
+
+    #[test]
+    fn message_codec_roundtrips_every_stop_reason_and_rejects_the_old_version() {
+        for reason in [
+            None,
+            Some(StopReason::Stop),
+            Some(StopReason::Length),
+            Some(StopReason::ToolUse),
+            Some(StopReason::Error),
+            Some(StopReason::Aborted),
+        ] {
+            let mut message = Message::text(MessageRole::Assistant, "x");
+            message.stop_reason = reason;
+            let encoded = encode_message(&message).expect("encode");
+            assert_eq!(
+                decode_message(&encoded).expect("decode").stop_reason,
+                reason
+            );
+        }
+        let mut old = encode_message(&Message::text(MessageRole::User, "x")).expect("encode");
+        old[0] = 1;
+        assert_eq!(
+            decode_message(&old),
+            Err(super::SessionMessageError::UnsupportedVersion { version: 1 })
+        );
+        let truncated = encode_message(&Message::text(MessageRole::User, "x")).expect("encode");
+        assert_eq!(
+            decode_message(&truncated[..truncated.len() - 1]),
+            Err(super::SessionMessageError::Truncated)
+        );
     }
 
     #[test]
