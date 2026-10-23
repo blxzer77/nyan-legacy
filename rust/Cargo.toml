@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/nyan-coding-agent-core",
+    "crates/nyan-coding-agent-auth",
     "crates/nyan-coding-agent-session",
     "crates/nyan-coding-agent-provider",
     "crates/nyan-coding-agent-tools",
@@ -12,6 +13,7 @@ members = [
 ]
 default-members = [
     "crates/nyan-coding-agent-core",
+    "crates/nyan-coding-agent-auth",
     "crates/nyan-coding-agent-session",
     "crates/nyan-coding-agent-provider",
     "crates/nyan-coding-agent-tools",

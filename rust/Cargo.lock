@@ -649,6 +649,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyan-coding-agent-auth"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "nyan-coding-agent-cli"
 version = "0.1.0"
 dependencies = [
