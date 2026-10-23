@@ -18,6 +18,7 @@ use nyan_coding_agent_tools::builtin::BuiltinTools;
 use crate::app_mode::{AppMode, resolve_app_mode};
 use crate::args::{Args, DiagnosticKind, parse_args};
 use crate::headless::{HeadlessMode, HeadlessOptions, SharedWriter, run_headless};
+use crate::initial_message::{build_prompts, read_file_arguments};
 use crate::session_setup::open_session;
 use crate::system_prompt::{
     PromptOptions, build_system_prompt, load_project_context_files, text_or_file,
@@ -29,6 +30,9 @@ pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Looks up an environment variable.
 pub type EnvLookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Reads whatever was piped to stdin, trimmed.
+pub type StdinReader = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// Everything the process takes from its surroundings.
 pub struct Environment {
@@ -42,6 +46,8 @@ pub struct Environment {
     pub cwd: PathBuf,
     /// Base URL of the OpenAI-compatible endpoint.
     pub openai_base_url: String,
+    /// Reads piped stdin: `None` when stdin is a terminal or holds only whitespace.
+    pub read_stdin: StdinReader,
 }
 
 impl std::fmt::Debug for Environment {
@@ -219,12 +225,6 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
             ),
         );
     }
-    if !parsed.file_args.is_empty() {
-        return fail(
-            err,
-            "@file arguments are not supported by the Rust preview yet",
-        );
-    }
     let model = match resolve_model(&parsed) {
         Ok(model) => model,
         Err(message) => return fail(err, &message),
@@ -252,6 +252,12 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         Ok(tools) => tools,
         Err(message) => return fail(err, &message),
     };
+    let file_text = match read_file_arguments(&parsed.file_args, &env.cwd) {
+        Ok(text) => text,
+        Err(message) => return fail(err, &message),
+    };
+    let stdin = (env.read_stdin)();
+    let prompts = build_prompts(stdin.as_deref(), &file_text, &parsed.messages);
     let system_prompt = build_prompt(&parsed, &tools, env);
     let session = match open_session(&parsed, &agent_dir(env), &env.cwd) {
         Ok(session) => session,
@@ -261,7 +267,7 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         mode,
         model,
         api_key,
-        messages: parsed.messages,
+        messages: prompts,
         tools,
         system_prompt,
         session,

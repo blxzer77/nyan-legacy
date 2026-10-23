@@ -72,6 +72,19 @@ fn execute_with_agent(
     cwd: PathBuf,
     agent_dir: &std::path::Path,
 ) -> Outcome {
+    execute_with_stdin(argv, base_url, key, tty, cwd, agent_dir, None)
+}
+
+fn execute_with_stdin(
+    argv: &[&str],
+    base_url: &str,
+    key: Option<&str>,
+    tty: bool,
+    cwd: PathBuf,
+    agent_dir: &std::path::Path,
+    stdin: Option<&str>,
+) -> Outcome {
+    let stdin = stdin.map(str::to_owned);
     let agent_dir = agent_dir.to_string_lossy().into_owned();
     let out_bytes = Arc::new(Mutex::new(Vec::new()));
     let err_bytes = Arc::new(Mutex::new(Vec::new()));
@@ -88,6 +101,7 @@ fn execute_with_agent(
         stdout_is_tty: tty,
         cwd,
         openai_base_url: base_url.to_owned(),
+        read_stdin: Box::new(move || stdin.clone()),
     };
     let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
     let code = run(&argv, &environment, &out, &err);
@@ -626,6 +640,7 @@ fn system_prompt_flags_and_project_context_shape_the_first_message() {
             stdout_is_tty: false,
             cwd: project.clone(),
             openai_base_url: format!("http://{address}/v1"),
+            read_stdin: Box::new(|| None),
         };
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
         assert_eq!(run(&argv, &environment, &out, &err), 0);
@@ -872,6 +887,65 @@ fn a_session_held_by_another_process_exits_one_before_any_request() {
         outcome.stderr.contains("is in use by another Nyan process"),
         "{}",
         outcome.stderr
+    );
+    for directory in [agent, cwd] {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[test]
+fn stdin_and_file_arguments_form_the_first_prompt() {
+    let agent = scratch("agent-initial");
+    let cwd = scratch("cwd-initial");
+    std::fs::write(cwd.join("notes.md"), "remember the milk").expect("file");
+    let runtime = Runtime::new().expect("runtime");
+    let (address, captured) = serve(&runtime, "200 OK", answer_body());
+    let outcome = execute_with_stdin(
+        &["-p", "--model", "openai/m", "@notes.md", "summarize"],
+        &format!("http://{address}/v1"),
+        Some("k"),
+        false,
+        cwd.clone(),
+        &agent,
+        Some("from a pipe"),
+    );
+    assert_eq!(outcome.code, 0, "{}", outcome.stderr);
+    let messages = request_messages(&captured);
+    assert_eq!(
+        messages[1]["content"],
+        format!(
+            "from a pipe<file name=\"{}\">\nremember the milk\n</file>\nsummarize",
+            cwd.join("notes.md").display()
+        )
+    );
+    for directory in [agent, cwd] {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[test]
+fn a_missing_file_argument_fails_before_any_request_or_session() {
+    let agent = scratch("agent-missing");
+    let cwd = scratch("cwd-missing");
+    let outcome = execute_with_agent(
+        &["-p", "--model", "openai/m", "@absent.md", "hi"],
+        "http://127.0.0.1:1/v1",
+        Some("k"),
+        false,
+        cwd.clone(),
+        &agent,
+    );
+    assert_eq!(outcome.code, 1);
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "Error: File not found: {}\n",
+            cwd.join("absent.md").display()
+        )
+    );
+    assert!(
+        !agent.join("sessions-rust").exists(),
+        "no session was created"
     );
     for directory in [agent, cwd] {
         let _ = std::fs::remove_dir_all(directory);
