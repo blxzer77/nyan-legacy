@@ -3,6 +3,7 @@
 //! Tokio is confined to this crate: providers take a runtime handle, and the
 //! futures they return are executor-neutral.
 
+pub mod cpa;
 pub mod openai;
 pub mod responses;
 pub mod sse;
