@@ -357,6 +357,85 @@ fn sse_body(chunks: &[&str]) -> String {
 }
 
 #[test]
+fn tool_flags_decide_which_tools_the_model_is_offered() {
+    let cases: [(&[&str], &[&str]); 4] = [
+        (
+            &["-p", "--model", "openai/m", "hi"],
+            &["read", "bash", "edit", "write"],
+        ),
+        (
+            &["-p", "--model", "openai/m", "--tools", "ls,grep,find", "hi"],
+            &["grep", "find", "ls"],
+        ),
+        (
+            &["-p", "--model", "openai/m", "--tools", "+ls,-bash", "hi"],
+            &["read", "edit", "write", "ls"],
+        ),
+        (
+            &[
+                "-p",
+                "--model",
+                "openai/m",
+                "--exclude-tools",
+                "bash,write",
+                "hi",
+            ],
+            &["read", "edit"],
+        ),
+    ];
+    for (argv, expected) in cases {
+        let runtime = Runtime::new().expect("runtime");
+        let (address, captured) = serve(&runtime, "200 OK", answer_body());
+        let outcome = execute(argv, &format!("http://{address}/v1"), Some("k"), false);
+        assert_eq!(outcome.code, 0, "{argv:?}: {}", outcome.stderr);
+        let request = captured.lock().expect("lock").clone();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+        let offered: Vec<&str> = body["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| tool["function"]["name"].as_str().expect("name"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(offered, expected, "{argv:?}");
+    }
+    let runtime = Runtime::new().expect("runtime");
+    let (address, captured) = serve(&runtime, "200 OK", answer_body());
+    let outcome = execute(
+        &["-p", "--model", "openai/m", "--no-tools", "hi"],
+        &format!("http://{address}/v1"),
+        Some("k"),
+        false,
+    );
+    assert_eq!(outcome.code, 0, "{}", outcome.stderr);
+    let request = captured.lock().expect("lock").clone();
+    assert!(
+        !request.contains("\"tools\""),
+        "no tools field when none are active"
+    );
+}
+
+#[test]
+fn an_unknown_tool_name_is_rejected_before_any_network_use() {
+    let outcome = execute(
+        &["-p", "--model", "openai/m", "--tools", "teleport", "hi"],
+        "http://127.0.0.1:1/v1",
+        Some("k"),
+        false,
+    );
+    assert_eq!(outcome.code, 1);
+    assert!(
+        outcome.stderr.contains("unknown tool \"teleport\""),
+        "{}",
+        outcome.stderr
+    );
+    assert_eq!(outcome.stdout, "");
+}
+
+#[test]
 fn a_tool_call_changes_the_workspace_and_its_result_reaches_the_next_request() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

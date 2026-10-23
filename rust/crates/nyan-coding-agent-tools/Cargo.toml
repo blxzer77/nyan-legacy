@@ -8,7 +8,10 @@ repository.workspace = true
 
 [dependencies]
 command-group = "=5.0.1"
+globset = "=0.4.19"
+ignore = "=0.4.30"
 nyan-coding-agent-core = { path = "../nyan-coding-agent-core" }
+regex = "=1.13.1"
 serde_json = "=1.0.154"
 
 [lints]

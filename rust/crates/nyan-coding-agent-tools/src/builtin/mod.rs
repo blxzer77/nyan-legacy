@@ -7,6 +7,8 @@
 
 mod bash;
 mod edit;
+mod find;
+mod grep;
 mod ls;
 pub mod paths;
 mod read;
@@ -155,14 +157,26 @@ impl BuiltinTools {
         }
     }
 
-    /// The file tools: `read`, `write`, `edit`, and `ls`.
+    /// The named built-in tools, in declaration order. Unknown names are ignored.
     #[must_use]
-    pub fn file_tools() -> Self {
+    pub fn only(names: &[&str]) -> Self {
+        let mut all = Self::all();
+        all.tools
+            .retain(|tool| names.contains(&tool.definition().name.as_str()));
+        all
+    }
+
+    /// Every built-in tool: the coding tools plus `grep`, `find`, and `ls`.
+    #[must_use]
+    pub fn all() -> Self {
         Self {
             tools: vec![
                 Box::new(read::tool()),
-                Box::new(write::tool()),
+                Box::new(bash::BashTool),
                 Box::new(edit::tool()),
+                Box::new(write::tool()),
+                Box::new(grep::tool()),
+                Box::new(find::tool()),
                 Box::new(ls::tool()),
             ],
         }

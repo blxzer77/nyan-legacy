@@ -15,6 +15,7 @@ use nyan_coding_agent_tools::builtin::BuiltinTools;
 use crate::app_mode::{AppMode, resolve_app_mode};
 use crate::args::{Args, DiagnosticKind, parse_args};
 use crate::headless::{HeadlessMode, HeadlessOptions, SharedWriter, run_headless};
+use crate::tool_selection::select_tools;
 
 /// The `OpenAI` endpoint used when nothing else is configured.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -67,8 +68,9 @@ fn help_text() -> String {
         "nyan-coding-agent {VERSION}\n\n\
          Rust Coding Agent preview. It is not a usable replacement yet.\n\n\
          Protocol contracts frozen: {} RPC commands, {} session events.\n\n\
-         Supported now: --print and --mode json with --provider openai and the\
-         read, bash, edit, and write tools.\n\n\
+         Supported now: --print and --mode json with --provider openai and\
+         the read, bash, edit, write, grep, find, and ls tools\
+         (--tools, --exclude-tools, --no-tools).\n\n\
          Options:\n  -h, --help       Show this help\n  -v, --version    Show the version\n",
         RpcCommandName::all().len(),
         SessionEventName::all().len()
@@ -116,6 +118,7 @@ enum Plan {
         model: ProviderModel,
         api_key: String,
         messages: Vec<String>,
+        tools: Vec<&'static str>,
     },
 }
 
@@ -196,25 +199,31 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
             "no API key for provider \"openai\": set OPENAI_API_KEY or pass --api-key",
         );
     };
+    let tools = match select_tools(&parsed) {
+        Ok(tools) => tools,
+        Err(message) => return fail(err, &message),
+    };
     Plan::Run {
         mode,
         model,
         api_key,
         messages: parsed.messages,
+        tools,
     }
 }
 
 /// Runs the process for `argv` (without the program name) and returns its exit code.
 #[must_use]
 pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWriter) -> i32 {
-    let (mode, model, api_key, messages) = match plan(argv, env, out, err) {
+    let (mode, model, api_key, messages, tools) = match plan(argv, env, out, err) {
         Plan::Exit(code) => return code,
         Plan::Run {
             mode,
             model,
             api_key,
             messages,
-        } => (mode, model, api_key, messages),
+            tools,
+        } => (mode, model, api_key, messages, tools),
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -251,7 +260,7 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
             model,
         },
         &providers,
-        &BuiltinTools::coding_tools(),
+        &BuiltinTools::only(&tools),
         out.clone(),
         err.clone(),
     ))
