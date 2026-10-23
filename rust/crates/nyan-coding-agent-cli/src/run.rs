@@ -9,16 +9,17 @@ use std::sync::{Arc, Mutex};
 
 use nyan_coding_agent_session::NativeSession;
 
-use nyan_coding_agent_core::{CoreError, VERSION};
+use nyan_coding_agent_core::VERSION;
 use nyan_coding_agent_protocol::{RpcCommandName, SessionEventName};
-use nyan_coding_agent_provider::{ModelProvider, ProviderModel, ProviderRegistry};
-use nyan_coding_agent_provider_http::OpenAiChatProvider;
+use nyan_coding_agent_provider::ProviderModel;
 use nyan_coding_agent_tools::builtin::BuiltinTools;
 
 use crate::app_mode::{AppMode, resolve_app_mode};
-use crate::args::{Args, DiagnosticKind, parse_args};
+use crate::args::{Args, DiagnosticKind, ListModels, parse_args};
 use crate::headless::{HeadlessMode, HeadlessOptions, SharedWriter, run_headless};
 use crate::initial_message::{build_prompts, read_file_arguments};
+use crate::login::{run_list_models, run_login, run_logout};
+use crate::providers::{ProviderSetup, build_provider, resolve_model, resolve_provider};
 use crate::session_setup::open_session;
 use crate::system_prompt::{
     PromptOptions, build_system_prompt, load_project_context_files, text_or_file,
@@ -30,6 +31,9 @@ pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Looks up an environment variable.
 pub type EnvLookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Asks one question and returns the answer line, or `None` at end of input.
+pub type PromptFn = Box<dyn Fn(&str, bool) -> Option<String> + Send + Sync>;
 
 /// Reads whatever was piped to stdin, trimmed.
 pub type StdinReader = Box<dyn Fn() -> Option<String> + Send + Sync>;
@@ -48,6 +52,8 @@ pub struct Environment {
     pub openai_base_url: String,
     /// Reads piped stdin: `None` when stdin is a terminal or holds only whitespace.
     pub read_stdin: StdinReader,
+    /// Asks the user one question (`secret` hides the answer); `None` when input has ended.
+    pub prompt: PromptFn,
 }
 
 impl std::fmt::Debug for Environment {
@@ -62,32 +68,33 @@ impl std::fmt::Debug for Environment {
     }
 }
 
-struct OneProvider(OpenAiChatProvider);
-
-impl ProviderRegistry for OneProvider {
-    fn provider(&self, id: &str) -> Result<&dyn ModelProvider, CoreError> {
-        if id == self.0.id() {
-            Ok(&self.0)
-        } else {
-            Err(CoreError::Unsupported {
-                operation: format!("provider {id}"),
-            })
-        }
-    }
-}
-
 fn help_text() -> String {
-    format!(
-        "nyan-coding-agent {VERSION}\n\n\
-         Rust Coding Agent preview. It is not a usable replacement yet.\n\n\
-         Protocol contracts frozen: {} RPC commands, {} session events.\n\n\
-         Supported now: --print and --mode json with --provider openai and\
-         the read, bash, edit, write, grep, find, and ls tools\
-         (--tools, --exclude-tools, --no-tools).\n\n\
-         Options:\n  -h, --help       Show this help\n  -v, --version    Show the version\n",
-        RpcCommandName::all().len(),
-        SessionEventName::all().len()
-    )
+    let lines = [
+        format!("nyan-coding-agent {VERSION}"),
+        String::new(),
+        "Rust Coding Agent preview. It is not a usable replacement yet.".to_owned(),
+        String::new(),
+        format!(
+            "Protocol contracts frozen: {} RPC commands, {} session events.",
+            RpcCommandName::all().len(),
+            SessionEventName::all().len()
+        ),
+        String::new(),
+        "Supported now: --print and --mode json with the openai provider (OPENAI_API_KEY)"
+            .to_owned(),
+        "and CLIProxyAPI (`nyan login cliproxyapi`), the read, bash, edit, write, grep,".to_owned(),
+        "find, and ls tools, sessions, @files, and piped stdin.".to_owned(),
+        String::new(),
+        "Commands:".to_owned(),
+        "  login [provider]    Store a login and choose a default model".to_owned(),
+        "  logout [provider]   Remove a stored login".to_owned(),
+        String::new(),
+        "Options:".to_owned(),
+        "  -h, --help          Show this help".to_owned(),
+        "  -v, --version       Show the version".to_owned(),
+        "  --list-models [s]   List the models of logged-in providers".to_owned(),
+    ];
+    lines.join("\n") + "\n"
 }
 
 fn write_to(writer: &SharedWriter, text: &str) {
@@ -95,29 +102,6 @@ fn write_to(writer: &SharedWriter, text: &str) {
         let _ = writer
             .write_all(text.as_bytes())
             .and_then(|()| writer.flush());
-    }
-}
-
-/// Splits `provider/model` when no `--provider` was given.
-fn resolve_model(args: &Args) -> Result<ProviderModel, String> {
-    let Some(model) = args.model.as_deref() else {
-        return Err("--model is required: the Rust preview has no default model".to_owned());
-    };
-    match args.provider.as_deref() {
-        Some(provider) => Ok(ProviderModel {
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-        }),
-        None => model
-            .split_once('/')
-            .filter(|(provider, id)| !provider.is_empty() && !id.is_empty())
-            .map(|(provider, id)| ProviderModel {
-                provider: provider.to_owned(),
-                model: id.to_owned(),
-            })
-            .ok_or_else(|| {
-                "--model needs a provider: pass --provider or use \"provider/model\"".to_owned()
-            }),
     }
 }
 
@@ -130,7 +114,7 @@ enum Plan {
     Run {
         mode: HeadlessMode,
         model: ProviderModel,
-        api_key: String,
+        setup: ProviderSetup,
         messages: Vec<String>,
         tools: Vec<&'static str>,
         system_prompt: String,
@@ -139,7 +123,7 @@ enum Plan {
 }
 
 /// The agent directory: `NYAN_CODING_AGENT_DIR`, else `~/.nyan/agent`.
-fn agent_dir(env: &Environment) -> PathBuf {
+pub(crate) fn agent_dir(env: &Environment) -> PathBuf {
     if let Some(dir) = (env.var)("NYAN_CODING_AGENT_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
     }
@@ -206,6 +190,13 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         return Plan::Exit(0);
     }
 
+    if let Some(list) = &parsed.list_models {
+        let search = match list {
+            ListModels::Search(pattern) => Some(pattern.as_str()),
+            ListModels::All => None,
+        };
+        return Plan::Exit(run_list_models(search, env, &agent_dir(env), out, err));
+    }
     let mode = match resolve_app_mode(&parsed, env.stdin_is_tty, env.stdout_is_tty) {
         AppMode::Print => HeadlessMode::Print,
         AppMode::Json => HeadlessMode::Json,
@@ -225,28 +216,14 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
             ),
         );
     }
-    let model = match resolve_model(&parsed) {
+    let agent = agent_dir(env);
+    let model = match resolve_model(&parsed, &agent) {
         Ok(model) => model,
         Err(message) => return fail(err, &message),
     };
-    if model.provider != "openai" {
-        return fail(
-            err,
-            &format!(
-                "provider \"{}\" is not supported by the Rust preview yet (supported: openai)",
-                model.provider
-            ),
-        );
-    }
-    let Some(api_key) = parsed
-        .api_key
-        .clone()
-        .or_else(|| (env.var)("OPENAI_API_KEY").filter(|key| !key.is_empty()))
-    else {
-        return fail(
-            err,
-            "no API key for provider \"openai\": set OPENAI_API_KEY or pass --api-key",
-        );
+    let setup = match resolve_provider(&model.provider, &parsed, env, &agent) {
+        Ok(setup) => setup,
+        Err(message) => return fail(err, &message),
     };
     let tools = match select_tools(&parsed) {
         Ok(tools) => tools,
@@ -266,7 +243,7 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
     Plan::Run {
         mode,
         model,
-        api_key,
+        setup,
         messages: prompts,
         tools,
         system_prompt,
@@ -277,26 +254,23 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
 /// Runs the process for `argv` (without the program name) and returns its exit code.
 #[must_use]
 pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWriter) -> i32 {
-    let (mode, model, api_key, messages, tools, system_prompt, session) =
+    match argv.first().map(String::as_str) {
+        Some("login") => return run_login(&argv[1..], env, &agent_dir(env), out, err),
+        Some("logout") => return run_logout(&argv[1..], &agent_dir(env), out, err),
+        _ => {}
+    }
+    let (mode, model, setup, messages, tools, system_prompt, session) =
         match plan(argv, env, out, err) {
             Plan::Exit(code) => return code,
             Plan::Run {
                 mode,
                 model,
-                api_key,
+                setup,
                 messages,
                 tools,
                 system_prompt,
                 session,
-            } => (
-                mode,
-                model,
-                api_key,
-                messages,
-                tools,
-                system_prompt,
-                session,
-            ),
+            } => (mode, model, setup, messages, tools, system_prompt, session),
         };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -312,19 +286,13 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
             return 1;
         }
     };
-    let provider = match OpenAiChatProvider::new(
-        "openai",
-        env.openai_base_url.clone(),
-        Some(api_key),
-        runtime.handle().clone(),
-    ) {
-        Ok(provider) => provider,
+    let providers = match build_provider(&model.provider, setup, runtime.handle().clone()) {
+        Ok(providers) => providers,
         Err(error) => {
             write_to(err, &format!("Error: {error}\n"));
             return 1;
         }
     };
-    let providers = OneProvider(provider);
     runtime.block_on(run_headless(
         HeadlessOptions {
             mode,

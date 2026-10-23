@@ -103,6 +103,7 @@ fn execute_with_stdin(
         cwd,
         openai_base_url: base_url.to_owned(),
         read_stdin: Box::new(move || stdin.clone()),
+        prompt: Box::new(|_, _| None),
     };
     let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
     let code = run(&argv, &environment, &out, &err);
@@ -329,7 +330,12 @@ fn configuration_errors_are_reported_before_any_network_use() {
             1,
             "no API key for provider \"openai\"",
         ),
-        (&["-p", "hi"], Some("k"), 1, "--model is required"),
+        (
+            &["-p", "hi"],
+            Some("k"),
+            1,
+            "no model selected and nothing is logged in",
+        ),
         (
             &["-p", "--model", "gpt", "hi"],
             Some("k"),
@@ -380,7 +386,9 @@ fn version_help_and_parse_errors_do_not_need_a_provider() {
     let piped = execute(&[], "", None, false);
     assert_eq!(piped.code, 1);
     assert!(
-        piped.stderr.contains("--model is required"),
+        piped
+            .stderr
+            .contains("no model selected and nothing is logged in"),
         "{}",
         piped.stderr
     );
@@ -642,6 +650,7 @@ fn system_prompt_flags_and_project_context_shape_the_first_message() {
             cwd: project.clone(),
             openai_base_url: format!("http://{address}/v1"),
             read_stdin: Box::new(|| None),
+            prompt: Box::new(|_, _| None),
         };
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
         assert_eq!(run(&argv, &environment, &out, &err), 0);

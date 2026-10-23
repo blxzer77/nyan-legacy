@@ -1,0 +1,382 @@
+//! `nyan login`, `nyan logout`, and `--list-models`.
+//!
+//! Login follows the TypeScript `CLIProxyAPI` flow: ask for the base URL and the
+//! key, prove them by fetching the model catalog, and only then store them.
+//! What differs is the next step. There is no built-in default model, so once the
+//! catalog is known the user chooses a default from it, and that choice is saved
+//! in `settings.json`.
+//!
+//! The key is stored as a plain `api_key` credential with the base URL beside it
+//! (`env.CLIPROXYAPI_BASE_URL`), not as the `oauth`-shaped entry with a
+//! hundred-year expiry the TypeScript extension used.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::Path;
+
+use nyan_coding_agent_auth::{AuthStore, Credential};
+use nyan_coding_agent_provider_http::cpa::{CatalogModel, fetch_catalog, resolve_endpoints};
+use tokio::runtime::Handle;
+
+use crate::headless::SharedWriter;
+use crate::providers::{CPA_BASE_URL_SETTING, CPA_PROVIDER, DEFAULT_CPA_BASE_URL, cpa_connection};
+use crate::run::Environment;
+use crate::settings::{DefaultModel, read_default_model, write_default_model};
+
+/// The providers `nyan login` can set up: id and display name.
+pub const LOGIN_PROVIDERS: [(&str, &str); 1] = [(CPA_PROVIDER, "CLIProxyAPI")];
+
+fn say(writer: &SharedWriter, text: &str) {
+    if let Ok(mut writer) = writer.lock() {
+        let _ = writer
+            .write_all(text.as_bytes())
+            .and_then(|()| writer.flush());
+    }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start the async runtime: {error}"))
+}
+
+fn ask(env: &Environment, message: &str, secret: bool) -> Result<String, String> {
+    (env.prompt)(message, secret).ok_or_else(|| "Login cancelled".to_owned())
+}
+
+/// Picks the provider named in `rest`, or asks when there is a choice.
+fn choose_provider(rest: &[String], env: &Environment) -> Result<&'static str, String> {
+    if let Some(name) = rest.first() {
+        return LOGIN_PROVIDERS
+            .iter()
+            .find(|(id, display)| {
+                id.eq_ignore_ascii_case(name) || display.eq_ignore_ascii_case(name)
+            })
+            .map(|(id, _)| *id)
+            .ok_or_else(|| {
+                format!(
+                    "cannot log in to \"{name}\" yet (available: {})",
+                    LOGIN_PROVIDERS
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+    }
+    let providers: &[(&'static str, &'static str)] = &LOGIN_PROVIDERS;
+    if let [(id, _)] = providers {
+        return Ok(id);
+    }
+    let mut menu = String::new();
+    for (index, (_, name)) in LOGIN_PROVIDERS.iter().enumerate() {
+        let _ = writeln!(menu, "  {}) {name}", index + 1);
+    }
+    let answer = ask(env, &format!("Choose a provider:\n{menu}> "), false)?;
+    answer
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| LOGIN_PROVIDERS.get(number.wrapping_sub(1)))
+        .map(|(id, _)| *id)
+        .ok_or_else(|| "Login cancelled".to_owned())
+}
+
+fn format_tokens(count: u64) -> String {
+    if count >= 1_000_000 && count % 1_000_000 == 0 {
+        format!("{}M", count / 1_000_000)
+    } else if count >= 1_000 {
+        format!("{}K", count / 1_000)
+    } else {
+        count.to_string()
+    }
+}
+
+/// Runs `nyan login [provider]` and returns the exit code.
+#[must_use]
+pub fn run_login(
+    rest: &[String],
+    env: &Environment,
+    agent_dir: &Path,
+    out: &SharedWriter,
+    err: &SharedWriter,
+) -> i32 {
+    let outcome = choose_provider(rest, env).and_then(|_| {
+        let runtime = runtime()?;
+        login_cpa(env, agent_dir, out, runtime.handle())
+    });
+    match outcome {
+        Ok(()) => 0,
+        Err(message) => {
+            say(err, &format!("Error: {message}\n"));
+            1
+        }
+    }
+}
+
+fn login_cpa(
+    env: &Environment,
+    agent_dir: &Path,
+    out: &SharedWriter,
+    handle: &Handle,
+) -> Result<(), String> {
+    say(
+        out,
+        "Configure CLIProxyAPI. Preferred base URL form: host:port (for example http://127.0.0.1:8317).\n",
+    );
+    let mut default_url = DEFAULT_CPA_BASE_URL.to_owned();
+    loop {
+        let typed = ask(
+            env,
+            &format!("CLIProxyAPI base URL [{default_url}]: "),
+            false,
+        )?;
+        let entered = if typed.trim().is_empty() {
+            default_url.clone()
+        } else {
+            typed.trim().to_owned()
+        };
+        let endpoints = match resolve_endpoints(&entered) {
+            Ok(endpoints) => endpoints,
+            Err(message) => {
+                say(out, &format!("Invalid base URL: {message}\n"));
+                default_url = entered;
+                continue;
+            }
+        };
+        let key = ask(env, "CLIProxyAPI API key: ", true)?;
+        let key = key.trim();
+        if key.is_empty() {
+            say(out, "API key cannot be empty.\n");
+            default_url = entered;
+            continue;
+        }
+        say(out, "Validating credentials via the models endpoint...\n");
+        let fetched = handle.block_on(fetch_catalog(handle, &endpoints.models_url, key));
+        match fetched {
+            Ok(models) => {
+                let settings = BTreeMap::from([(CPA_BASE_URL_SETTING.to_owned(), entered)]);
+                AuthStore::new(agent_dir)
+                    .save_api_key(CPA_PROVIDER, key, &settings)
+                    .map_err(|error| error.to_string())?;
+                say(
+                    out,
+                    &format!(
+                        "Registered {} model(s) from {}.\n",
+                        models.len(),
+                        endpoints.models_url
+                    ),
+                );
+                return choose_default(env, agent_dir, out, &models);
+            }
+            Err(error) => {
+                say(
+                    out,
+                    &format!(
+                        "Login validation failed: {error}\nPlease re-enter the base URL and API key.\n"
+                    ),
+                );
+                default_url = entered;
+            }
+        }
+    }
+}
+
+/// Lets the user choose the default model from the catalog just fetched.
+fn choose_default(
+    env: &Environment,
+    agent_dir: &Path,
+    out: &SharedWriter,
+    models: &[CatalogModel],
+) -> Result<(), String> {
+    if models.is_empty() {
+        say(
+            out,
+            "The proxy returned no models, so no default model was saved.\n",
+        );
+        return Ok(());
+    }
+    if let Some(current) = read_default_model(agent_dir)?
+        && current.provider == CPA_PROVIDER
+        && models.iter().any(|model| model.id == current.model)
+    {
+        say(
+            out,
+            &format!(
+                "Default model unchanged: {}/{}\n",
+                current.provider, current.model
+            ),
+        );
+        return Ok(());
+    }
+    let mut menu = String::from("Models:\n");
+    for (index, model) in models.iter().enumerate() {
+        let _ = writeln!(
+            menu,
+            "  {:>2}) {}  ({} context{})",
+            index + 1,
+            model.id,
+            format_tokens(model.context_window),
+            if model.reasoning { ", reasoning" } else { "" }
+        );
+    }
+    say(out, &menu);
+    loop {
+        let Some(answer) = (env.prompt)("Default model (number or id, blank to skip): ", false)
+        else {
+            say(out, "No default model saved.\n");
+            return Ok(());
+        };
+        let answer = answer.trim();
+        if answer.is_empty() {
+            say(
+                out,
+                "No default model saved; pass --model cliproxyapi/<id> to choose one per run.\n",
+            );
+            return Ok(());
+        }
+        let chosen = answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| models.get(number.wrapping_sub(1)))
+            .or_else(|| models.iter().find(|model| model.id == answer));
+        if let Some(model) = chosen {
+            write_default_model(
+                agent_dir,
+                &DefaultModel {
+                    provider: CPA_PROVIDER.to_owned(),
+                    model: model.id.clone(),
+                },
+            )?;
+            say(
+                out,
+                &format!("Default model: {CPA_PROVIDER}/{}\n", model.id),
+            );
+            return Ok(());
+        }
+        say(out, &format!("\"{answer}\" is not in the list.\n"));
+    }
+}
+
+/// Runs `nyan logout [provider]` and returns the exit code.
+#[must_use]
+pub fn run_logout(
+    rest: &[String],
+    agent_dir: &Path,
+    out: &SharedWriter,
+    err: &SharedWriter,
+) -> i32 {
+    let store = AuthStore::new(agent_dir);
+    let outcome = (|| {
+        let provider = if let Some(name) = rest.first() {
+            name.clone()
+        } else {
+            let stored = store.providers().map_err(|error| error.to_string())?;
+            match stored.as_slice() {
+                [only] => only.clone(),
+                [] => return Err("nothing is logged in".to_owned()),
+                many => {
+                    return Err(format!(
+                        "name the provider to log out of ({})",
+                        many.join(", ")
+                    ));
+                }
+            }
+        };
+        if store.remove(&provider).map_err(|error| error.to_string())? {
+            Ok(format!("Logged out of {provider}.\n"))
+        } else {
+            Err(format!("no stored login for \"{provider}\""))
+        }
+    })();
+    match outcome {
+        Ok(message) => {
+            say(out, &message);
+            0
+        }
+        Err(message) => {
+            say(err, &format!("Error: {message}\n"));
+            1
+        }
+    }
+}
+
+/// Runs `--list-models [search]` over the providers that are logged in.
+#[must_use]
+pub fn run_list_models(
+    search: Option<&str>,
+    env: &Environment,
+    agent_dir: &Path,
+    out: &SharedWriter,
+    err: &SharedWriter,
+) -> i32 {
+    let outcome = (|| {
+        let store = AuthStore::new(agent_dir);
+        let runtime = runtime()?;
+        let mut rows: Vec<(String, CatalogModel)> = Vec::new();
+        for provider in store.providers().map_err(|error| error.to_string())? {
+            if provider != CPA_PROVIDER {
+                continue;
+            }
+            if !matches!(store.credential(&provider), Ok(Some(Credential::ApiKey(_)))) {
+                continue;
+            }
+            let connection = cpa_connection(None, env, agent_dir)?;
+            let models = runtime
+                .block_on(fetch_catalog(
+                    runtime.handle(),
+                    &connection.endpoints.models_url,
+                    &connection.api_key,
+                ))
+                .map_err(|error| format!("{provider}: {error}"))?;
+            rows.extend(models.into_iter().map(|model| (provider.clone(), model)));
+        }
+        Ok::<_, String>(rows)
+    })();
+    let rows = match outcome {
+        Ok(rows) => rows,
+        Err(message) => {
+            say(err, &format!("Error: {message}\n"));
+            return 1;
+        }
+    };
+    let needle = search.map(str::to_lowercase);
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|(provider, model)| {
+            needle.as_ref().is_none_or(|needle| {
+                format!("{provider}/{}", model.id)
+                    .to_lowercase()
+                    .contains(needle)
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        say(
+            out,
+            match search {
+                Some(_) => "No models match the search.\n",
+                None => "No models available. Run `nyan login` to add a provider.\n",
+            },
+        );
+        return 0;
+    }
+    let mut table = String::from(
+        "provider      model                          context  max-out  thinking  images\n",
+    );
+    for (provider, model) in rows {
+        let _ = writeln!(
+            table,
+            "{provider:<13} {:<30} {:<8} {:<8} {:<9} {}",
+            model.id,
+            format_tokens(model.context_window),
+            format_tokens(model.max_tokens),
+            if model.reasoning { "yes" } else { "no" },
+            if model.image_input { "yes" } else { "no" },
+        );
+    }
+    say(out, &table);
+    0
+}
