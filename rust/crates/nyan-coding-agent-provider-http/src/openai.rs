@@ -5,24 +5,18 @@
 //! channel, so the future returned by `stream` can be awaited on any executor.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, CancellationToken, Message, MessageRole, Usage};
+use nyan_coding_agent_core::{BoxFuture, Message, MessageRole, Usage};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
-    ProviderStreamEvent, ToolCallRequest, ToolSpec,
+    ToolCallRequest, ToolSpec,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, mpsc};
 
-use crate::sse::SseDecoder;
-
-const CANCELLATION_POLL: Duration = Duration::from_millis(50);
-const MAX_ERROR_BODY_BYTES: usize = 4096;
-
-type EventResult = Result<ProviderStreamEvent, ProviderError>;
+use crate::sse::SseEvent;
+use crate::transport::{Applied, Finished, Post, StreamProtocol, Transport, usage_from_counts};
 
 /// A provider that speaks the `OpenAI` chat-completions streaming protocol.
 #[derive(Clone, Debug)]
@@ -30,9 +24,7 @@ pub struct OpenAiChatProvider {
     id: String,
     base_url: String,
     api_key: Option<String>,
-    client: reqwest::Client,
-    handle: Handle,
-    idle_timeout: Duration,
+    transport: Transport,
 }
 
 impl OpenAiChatProvider {
@@ -47,27 +39,18 @@ impl OpenAiChatProvider {
         api_key: Option<String>,
         handle: Handle,
     ) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|error| ProviderError::Request {
-                message: format!("failed to build the HTTP client: {error}"),
-                retryable: false,
-            })?;
         Ok(Self {
             id: id.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key,
-            client,
-            handle,
-            idle_timeout: Duration::from_secs(120),
+            transport: Transport::new(handle)?,
         })
     }
 
     /// Sets how long a response may stay silent before the stream fails.
     #[must_use]
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
-        self.idle_timeout = idle_timeout;
+        self.transport.set_idle_timeout(idle_timeout);
         self
     }
 }
@@ -81,93 +64,14 @@ impl ModelProvider for OpenAiChatProvider {
         &self,
         request: ProviderRequest,
     ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
-        let client = self.client.clone();
-        let url = format!("{}/chat/completions", self.base_url);
-        let api_key = self.api_key.clone();
-        let handle = self.handle.clone();
-        let idle_timeout = self.idle_timeout;
-        let cancellation = request.cancellation.clone();
-        let body = build_request_body(&request).to_string();
-        Box::pin(async move {
-            if cancellation.is_cancelled() {
-                return Err(ProviderError::Cancelled);
-            }
-            let admission = handle.spawn(async move {
-                let mut builder = client
-                    .post(url)
-                    .header("content-type", "application/json")
-                    .header("accept", "text/event-stream")
-                    .body(body);
-                if let Some(key) = api_key {
-                    builder = builder.bearer_auth(key);
-                }
-                let response = builder
-                    .send()
-                    .await
-                    .map_err(|error| transport_error(&error))?;
-                let status = response.status();
-                if status.is_success() {
-                    return Ok(response);
-                }
-                let text = response.text().await.unwrap_or_default();
-                Err(status_error(status.as_u16(), &text))
-            });
-            let response = admission.await.map_err(|error| ProviderError::Request {
-                message: format!("the request task failed: {error}"),
-                retryable: false,
-            })??;
-            let (sender, receiver) = mpsc::channel(64);
-            handle.spawn(pump(response, sender, cancellation, idle_timeout));
-            Ok(Box::new(ChannelStream {
-                receiver: Arc::new(Mutex::new(receiver)),
-            }) as Box<dyn ProviderStream>)
-        })
-    }
-}
-
-struct ChannelStream {
-    receiver: Arc<Mutex<mpsc::Receiver<EventResult>>>,
-}
-
-impl ProviderStream for ChannelStream {
-    fn next(&mut self) -> BoxFuture<Result<Option<ProviderStreamEvent>, ProviderError>> {
-        let receiver = Arc::clone(&self.receiver);
-        Box::pin(async move {
-            match receiver.lock().await.recv().await {
-                Some(Ok(event)) => Ok(Some(event)),
-                Some(Err(error)) => Err(error),
-                None => Ok(None),
-            }
-        })
-    }
-}
-
-fn transport_error(error: &reqwest::Error) -> ProviderError {
-    ProviderError::Request {
-        message: format!("request failed: {error}"),
-        retryable: error.is_connect() || error.is_timeout() || error.is_request(),
-    }
-}
-
-fn status_error(status: u16, body: &str) -> ProviderError {
-    let mut detail: String = body.chars().take(MAX_ERROR_BODY_BYTES).collect();
-    if let Ok(value) = serde_json::from_str::<Value>(body)
-        && let Some(message) = value.pointer("/error/message").and_then(Value::as_str)
-    {
-        message.clone_into(&mut detail);
-    }
-    let message = format!("HTTP {status}: {detail}");
-    match status {
-        401 | 403 => ProviderError::Authentication { message },
-        404 => ProviderError::ModelUnavailable { message },
-        408 | 409 | 425 | 429 | 500..=599 => ProviderError::Request {
-            message,
-            retryable: true,
-        },
-        _ => ProviderError::Request {
-            message,
-            retryable: false,
-        },
+        let post = Post {
+            url: format!("{}/chat/completions", self.base_url),
+            body: build_request_body(&request).to_string(),
+            bearer: self.api_key.clone(),
+            headers: Vec::new(),
+        };
+        self.transport
+            .start(post, request.cancellation.clone(), Accumulator::default())
     }
 }
 
@@ -251,25 +155,17 @@ struct Accumulator {
 
 fn parse_usage(value: &Value) -> Usage {
     let count = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
-    let input = count("/prompt_tokens");
-    let output = count("/completion_tokens");
-    let reported_total = count("/total_tokens");
-    Usage {
-        input,
-        output,
-        cache_read: count("/prompt_tokens_details/cached_tokens"),
-        cache_write: 0,
-        total_tokens: if reported_total > 0 {
-            reported_total
-        } else {
-            input.saturating_add(output)
-        },
-    }
+    usage_from_counts(
+        count("/prompt_tokens"),
+        count("/completion_tokens"),
+        count("/prompt_tokens_details/cached_tokens"),
+        count("/prompt_tokens_details/cache_write_tokens"),
+    )
 }
 
 impl Accumulator {
     /// Applies one decoded chunk and returns the text it carried, if any.
-    fn apply(&mut self, chunk: &Value) -> Result<Option<String>, ProviderError> {
+    fn apply_chunk(&mut self, chunk: &Value) -> Result<Option<String>, ProviderError> {
         if let Some(error) = chunk.get("error") {
             let message = error
                 .get("message")
@@ -314,9 +210,29 @@ impl Accumulator {
             .filter(|text| !text.is_empty())
             .map(str::to_owned))
     }
+}
 
-    /// Returns the usage, tool-call events, and terminal reason once the stream is complete.
-    fn finish(self) -> (Option<Usage>, Vec<ToolCallRequest>, ProviderStopReason) {
+impl StreamProtocol for Accumulator {
+    fn apply(&mut self, event: &SseEvent) -> Result<Applied, ProviderError> {
+        if event.data == "[DONE]" {
+            return Ok(Applied::Done);
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+            return Err(ProviderError::Stream {
+                message: "the provider sent a chunk that is not valid JSON".to_owned(),
+                retryable: false,
+            });
+        };
+        Ok(self
+            .apply_chunk(&value)?
+            .map_or(Applied::Nothing, Applied::Text))
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
+    fn finish(self) -> Finished {
         let usage = self.usage;
         let has_calls = !self.tool_calls.is_empty();
         let calls = self
@@ -343,112 +259,10 @@ impl Accumulator {
             _ if has_calls => ProviderStopReason::ToolUse,
             _ => ProviderStopReason::Stop,
         };
-        (usage, calls, reason)
-    }
-}
-
-async fn pump(
-    mut response: reqwest::Response,
-    sender: mpsc::Sender<EventResult>,
-    cancellation: CancellationToken,
-    idle_timeout: Duration,
-) {
-    let mut decoder = SseDecoder::new();
-    let mut accumulator = Accumulator::default();
-    let mut idle = Duration::ZERO;
-    let mut done = false;
-    'read: loop {
-        if cancellation.is_cancelled() {
-            let _ = sender.send(Err(ProviderError::Cancelled)).await;
-            return;
-        }
-        let chunk = match tokio::time::timeout(CANCELLATION_POLL, response.chunk()).await {
-            Err(_) => {
-                idle += CANCELLATION_POLL;
-                if idle >= idle_timeout {
-                    let _ = sender
-                        .send(Err(ProviderError::Stream {
-                            message: "the response stream went silent".to_owned(),
-                            retryable: true,
-                        }))
-                        .await;
-                    return;
-                }
-                continue;
-            }
-            Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => {
-                let _ = sender
-                    .send(Err(ProviderError::Stream {
-                        message: format!("the response stream failed: {error}"),
-                        retryable: true,
-                    }))
-                    .await;
-                return;
-            }
-        };
-        idle = Duration::ZERO;
-        for event in decoder.push(&chunk) {
-            if event.data == "[DONE]" {
-                done = true;
-                break 'read;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
-                let _ = sender
-                    .send(Err(ProviderError::Stream {
-                        message: "the provider sent a chunk that is not valid JSON".to_owned(),
-                        retryable: false,
-                    }))
-                    .await;
-                return;
-            };
-            match accumulator.apply(&value) {
-                Ok(Some(text)) => {
-                    if sender
-                        .send(Ok(ProviderStreamEvent::TextDelta { text }))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = sender.send(Err(error)).await;
-                    return;
-                }
-            }
+        Finished {
+            usage,
+            calls,
+            reason,
         }
     }
-    if !done && accumulator.finish_reason.is_none() {
-        let _ = sender
-            .send(Err(ProviderError::Stream {
-                message: "the response ended before a terminal event".to_owned(),
-                retryable: true,
-            }))
-            .await;
-        return;
-    }
-    let (usage, calls, reason) = accumulator.finish();
-    if let Some(usage) = usage
-        && sender
-            .send(Ok(ProviderStreamEvent::Usage(usage)))
-            .await
-            .is_err()
-    {
-        return;
-    }
-    for call in calls {
-        if sender
-            .send(Ok(ProviderStreamEvent::ToolCall(call)))
-            .await
-            .is_err()
-        {
-            return;
-        }
-    }
-    let _ = sender
-        .send(Ok(ProviderStreamEvent::Finished { reason }))
-        .await;
 }

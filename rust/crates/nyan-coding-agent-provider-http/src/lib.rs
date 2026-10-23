@@ -4,6 +4,9 @@
 //! futures they return are executor-neutral.
 
 pub mod openai;
+pub mod responses;
 pub mod sse;
+pub(crate) mod transport;
 
 pub use openai::OpenAiChatProvider;
+pub use responses::OpenAiResponsesProvider;

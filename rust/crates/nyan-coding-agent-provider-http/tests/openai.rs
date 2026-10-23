@@ -1,82 +1,17 @@
 //! Drives the provider through its public `ModelProvider` entry point against a
 //! loopback HTTP server. Nothing here talks to a real provider.
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nyan_coding_agent_core::{CancellationToken, Message, MessageRole};
+use nyan_coding_agent_core::CancellationToken;
 use nyan_coding_agent_provider::{
-    ModelProvider, ProviderError, ProviderModel, ProviderRequest, ProviderStopReason,
-    ProviderStream, ProviderStreamEvent, ToolSpec,
+    ModelProvider, ProviderError, ProviderStopReason, ProviderStream, ProviderStreamEvent,
 };
 use nyan_coding_agent_provider_http::OpenAiChatProvider;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+
+mod common;
+use common::{Server, drain, request, serve, sse};
 use tokio::runtime::Runtime;
-
-struct Server {
-    address: SocketAddr,
-    captured: Arc<Mutex<String>>,
-}
-
-/// Serves one response: the status line and headers, then each `(delay, bytes)`
-/// chunk, then either closes or (when `hold_open`) stays silent.
-fn serve(
-    runtime: &Runtime,
-    status: &'static str,
-    chunks: Vec<(u64, Vec<u8>)>,
-    hold_open: bool,
-) -> Server {
-    let listener = runtime
-        .block_on(TcpListener::bind("127.0.0.1:0"))
-        .expect("bind loopback");
-    let address = listener.local_addr().expect("local address");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&captured);
-    runtime.spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let mut received = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let read = socket.read(&mut buffer).await.unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            received.extend_from_slice(&buffer[..read]);
-            let text = String::from_utf8_lossy(&received).into_owned();
-            if let Some(header_end) = text.find("\r\n\r\n") {
-                let length = text
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                if received.len() >= header_end + 4 + length {
-                    break;
-                }
-            }
-        }
-        *sink.lock().expect("captured lock") = String::from_utf8_lossy(&received).into_owned();
-        let head = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
-        );
-        let _ = socket.write_all(head.as_bytes()).await;
-        for (delay, bytes) in chunks {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            let _ = socket.write_all(&bytes).await;
-            let _ = socket.flush().await;
-        }
-        if hold_open {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
-    });
-    Server { address, captured }
-}
 
 fn provider(runtime: &Runtime, server: &Server) -> OpenAiChatProvider {
     OpenAiChatProvider::new(
@@ -87,41 +22,6 @@ fn provider(runtime: &Runtime, server: &Server) -> OpenAiChatProvider {
     )
     .expect("build provider")
     .with_idle_timeout(Duration::from_secs(5))
-}
-
-fn request(cancellation: CancellationToken) -> ProviderRequest {
-    ProviderRequest {
-        model: ProviderModel {
-            provider: "loopback".to_owned(),
-            model: "test-model".to_owned(),
-        },
-        messages: vec![Message::text(MessageRole::User, "hello")],
-        tools: vec![ToolSpec {
-            name: "echo".to_owned(),
-            description: "Echo input".to_owned(),
-            parameters_schema:
-                r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#
-                    .to_owned(),
-        }],
-        cancellation,
-    }
-}
-
-fn sse(data: &str) -> Vec<u8> {
-    format!("data: {data}\n\n").into_bytes()
-}
-
-fn drain(
-    runtime: &Runtime,
-    mut stream: Box<dyn ProviderStream>,
-) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
-    let mut events = Vec::new();
-    loop {
-        match runtime.block_on(stream.next())? {
-            Some(event) => events.push(event),
-            None => return Ok(events),
-        }
-    }
 }
 
 fn open(
@@ -241,7 +141,7 @@ fn usage_is_reported_before_the_terminal_event() {
                 text: "ok".to_owned()
             },
             ProviderStreamEvent::Usage(nyan_coding_agent_core::Usage {
-                input: 12,
+                input: 8,
                 output: 3,
                 cache_read: 4,
                 cache_write: 0,
