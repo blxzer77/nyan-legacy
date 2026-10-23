@@ -394,6 +394,11 @@ pub enum SessionStoreError {
         /// Session file path.
         path: PathBuf,
     },
+    /// A journal message payload could not be decoded.
+    MessageDecode {
+        /// Codec diagnostic.
+        message: String,
+    },
     /// A filesystem operation failed.
     Io {
         /// Logical operation being attempted.
@@ -413,6 +418,7 @@ impl SessionStoreError {
             Self::InvalidHeader { .. } => "session_invalid_header",
             Self::UnsupportedVersion { .. } => "session_unsupported_version",
             Self::CorruptRecord { .. } => "session_corrupt_record",
+            Self::MessageDecode { .. } => "session_message_decode",
             Self::Io { .. } => "session_io",
         }
     }
@@ -439,6 +445,9 @@ impl std::fmt::Display for SessionStoreError {
             }
             Self::CorruptRecord { path } => {
                 write!(formatter, "session journal is corrupt: {}", path.display())
+            }
+            Self::MessageDecode { message } => {
+                write!(formatter, "session message decode failed: {message}")
             }
             Self::Io { operation, message } => {
                 write!(formatter, "session {operation} failed: {message}")
@@ -760,6 +769,99 @@ impl SessionJournal {
     pub fn decode_message_record(record: &SessionRecord) -> Result<Message, SessionMessageError> {
         decode_message(&record.payload)
     }
+
+    /// Replays all user, assistant, and tool-result messages in journal order.
+    ///
+    /// Metadata and run-marker records remain available through [`Self::records`]
+    /// but are omitted from the provider transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the journal or a message payload is invalid.
+    pub fn replay_messages(&mut self) -> Result<Vec<Message>, SessionStoreError> {
+        self.records()?
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.kind,
+                    SessionRecordKind::UserMessage
+                        | SessionRecordKind::AssistantMessage
+                        | SessionRecordKind::ToolResult
+                )
+            })
+            .map(|record| {
+                Self::decode_message_record(&record).map_err(|error| {
+                    SessionStoreError::MessageDecode {
+                        message: error.to_string(),
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+/// An opened Rust-native session with its replayed provider transcript.
+#[derive(Debug)]
+pub struct NativeSession {
+    opened: OpenedSession,
+    journal: Option<SessionJournal>,
+    messages: Vec<Message>,
+}
+
+impl NativeSession {
+    /// Opens a session and replays its committed message records.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store or codec error when selection, locking, or replay fails.
+    pub fn open(
+        store: &FileSessionStore,
+        request: SessionOpenRequest,
+    ) -> Result<Self, SessionStoreError> {
+        let opened = store.open(request)?;
+        let mut journal = opened.path().map(|_| opened.journal()).transpose()?;
+        let messages = journal
+            .as_mut()
+            .map(SessionJournal::replay_messages)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            opened,
+            journal,
+            messages,
+        })
+    }
+
+    /// Returns the selected session metadata.
+    #[must_use]
+    pub fn session(&self) -> &OpenedSession {
+        &self.opened
+    }
+
+    /// Returns the replayed and newly appended provider messages.
+    #[must_use]
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Appends one message and updates the in-memory transcript only after the write succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store or codec error when the message cannot be committed.
+    pub fn append_message(
+        &mut self,
+        kind: SessionRecordKind,
+        message: Message,
+    ) -> Result<u64, SessionStoreError> {
+        let sequence = if let Some(journal) = &mut self.journal {
+            journal.append_message(kind, &message)?
+        } else {
+            self.messages.len() as u64
+        };
+        self.messages.push(message);
+        Ok(sequence)
+    }
 }
 
 fn read_records(file: &mut File, path: &Path) -> Result<Vec<SessionRecord>, SessionStoreError> {
@@ -822,9 +924,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        FileSessionStore, SessionDescriptor, SessionFormat, SessionJournal, SessionOpenRequest,
-        SessionRecord, SessionRecordKind, SessionStore, SessionStoreError, decode_message,
-        encode_message,
+        FileSessionStore, NativeSession, SessionDescriptor, SessionFormat, SessionJournal,
+        SessionOpenRequest, SessionRecord, SessionRecordKind, SessionStore, SessionStoreError,
+        decode_message, encode_message,
     };
     use nyan_coding_agent_core::{
         AgentMode, Message, MessageRole, SessionId, ToolCall, ToolCallId,
@@ -957,6 +1059,33 @@ mod tests {
         );
         drop(journal);
         drop(opened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn native_session_reopens_its_provider_transcript() {
+        let root = test_root("native-session");
+        let store = FileSessionStore::new(&root);
+        let mut session = NativeSession::open(&store, request(&root)).expect("open native session");
+        session
+            .append_message(
+                SessionRecordKind::UserMessage,
+                Message::text(MessageRole::User, "hello"),
+            )
+            .expect("append user message");
+        session
+            .append_message(
+                SessionRecordKind::AssistantMessage,
+                Message::text(MessageRole::Assistant, "world"),
+            )
+            .expect("append assistant message");
+        drop(session);
+
+        let reopened = NativeSession::open(&store, request(&root)).expect("reopen native session");
+        assert_eq!(reopened.messages().len(), 2);
+        assert_eq!(reopened.messages()[0].text, "hello");
+        assert_eq!(reopened.messages()[1].text, "world");
+        drop(reopened);
         fs::remove_dir_all(root).expect("remove test root");
     }
 
