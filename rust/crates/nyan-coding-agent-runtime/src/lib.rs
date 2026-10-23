@@ -1648,7 +1648,7 @@ mod tests {
             Arc::new(EventLog::default()),
         ))
         .expect_err("incomplete run must be refused");
-        assert_eq!(error.code(), "session_io");
+        assert_eq!(error.code(), "session_incomplete_run");
         assert_eq!(session.lock().expect("session lock").messages().len(), 0);
         drop(runtime);
         drop(session);

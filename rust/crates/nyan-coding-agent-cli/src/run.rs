@@ -5,6 +5,9 @@
 //! runs, with the environment and the provider endpoint injected.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use nyan_coding_agent_session::NativeSession;
 
 use nyan_coding_agent_core::{CoreError, VERSION};
 use nyan_coding_agent_protocol::{RpcCommandName, SessionEventName};
@@ -15,6 +18,7 @@ use nyan_coding_agent_tools::builtin::BuiltinTools;
 use crate::app_mode::{AppMode, resolve_app_mode};
 use crate::args::{Args, DiagnosticKind, parse_args};
 use crate::headless::{HeadlessMode, HeadlessOptions, SharedWriter, run_headless};
+use crate::session_setup::open_session;
 use crate::system_prompt::{
     PromptOptions, build_system_prompt, load_project_context_files, text_or_file,
 };
@@ -112,6 +116,7 @@ fn resolve_model(args: &Args) -> Result<ProviderModel, String> {
 }
 
 /// What the arguments ask the process to do.
+#[allow(clippy::large_enum_variant)] // built once per process and moved straight out
 enum Plan {
     /// Finish now with this exit code; output was already written.
     Exit(i32),
@@ -123,6 +128,7 @@ enum Plan {
         messages: Vec<String>,
         tools: Vec<&'static str>,
         system_prompt: String,
+        session: NativeSession,
     },
 }
 
@@ -247,6 +253,10 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         Err(message) => return fail(err, &message),
     };
     let system_prompt = build_prompt(&parsed, &tools, env);
+    let session = match open_session(&parsed, &agent_dir(env), &env.cwd) {
+        Ok(session) => session,
+        Err(message) => return fail(err, &message),
+    };
     Plan::Run {
         mode,
         model,
@@ -254,23 +264,34 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         messages: parsed.messages,
         tools,
         system_prompt,
+        session,
     }
 }
 
 /// Runs the process for `argv` (without the program name) and returns its exit code.
 #[must_use]
 pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWriter) -> i32 {
-    let (mode, model, api_key, messages, tools, system_prompt) = match plan(argv, env, out, err) {
-        Plan::Exit(code) => return code,
-        Plan::Run {
-            mode,
-            model,
-            api_key,
-            messages,
-            tools,
-            system_prompt,
-        } => (mode, model, api_key, messages, tools, system_prompt),
-    };
+    let (mode, model, api_key, messages, tools, system_prompt, session) =
+        match plan(argv, env, out, err) {
+            Plan::Exit(code) => return code,
+            Plan::Run {
+                mode,
+                model,
+                api_key,
+                messages,
+                tools,
+                system_prompt,
+                session,
+            } => (
+                mode,
+                model,
+                api_key,
+                messages,
+                tools,
+                system_prompt,
+                session,
+            ),
+        };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -308,6 +329,7 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
         },
         &providers,
         &BuiltinTools::only(&tools),
+        Arc::new(Mutex::new(session)),
         out.clone(),
         err.clone(),
     ))

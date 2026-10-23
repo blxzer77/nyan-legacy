@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use nyan_coding_agent_core::{Message, MessageRole, StopReason, now_ms};
 use nyan_coding_agent_protocol::{event_to_jsonl, session_header_jsonl};
 use nyan_coding_agent_provider::{ProviderModel, ProviderRegistry};
-use nyan_coding_agent_runtime::{AgentContext, AgentEvent, AgentRuntime, EventSink, RuntimeConfig};
+use nyan_coding_agent_runtime::{AgentEvent, AgentRuntime, EventSink, RuntimeConfig};
+use nyan_coding_agent_session::{NativeSession, SessionRecordKind, SessionStoreError};
 use nyan_coding_agent_tools::ToolRegistry;
 
 /// Which headless output to produce.
@@ -39,6 +40,9 @@ pub struct HeadlessOptions {
     /// The system prompt, placed first in every request.
     pub system_prompt: Option<String>,
 }
+
+/// A session shared between the run and the code that reports on it afterwards.
+pub type SharedSession = Arc<Mutex<NativeSession>>;
 
 /// A byte sink shared between the caller and the event sink.
 pub type SharedWriter = Arc<Mutex<dyn Write + Send>>;
@@ -92,65 +96,48 @@ pub fn new_session_id() -> String {
     )
 }
 
-/// Runs the prompts and returns the process exit code.
-///
-/// `out` receives stdout and `err` receives stderr. In JSON mode stdout carries
-/// only JSONL records; every diagnostic goes to `err`.
-pub async fn run_headless(
-    options: HeadlessOptions,
-    providers: &dyn ProviderRegistry,
-    tools: &dyn ToolRegistry,
-    out: SharedWriter,
-    err: SharedWriter,
+fn describe_store_error(error: &SessionStoreError) -> String {
+    match error {
+        SessionStoreError::IncompleteRun => "this session's previous run did not finish, so its outcome is unknown and the session cannot continue safely. Start a new session instead.".to_owned(),
+        other => format!("could not save the session: {other}"),
+    }
+}
+
+/// Refuses a session whose last run never finished, then records the system
+/// prompt unless the session already holds exactly that one.
+fn prepare_session(session: &SharedSession, prompt: Option<&str>) -> Result<(), String> {
+    let mut guard = session
+        .lock()
+        .map_err(|_| "the session lock was poisoned".to_owned())?;
+    if guard.has_incomplete_run() {
+        return Err(describe_store_error(&SessionStoreError::IncompleteRun));
+    }
+    let Some(prompt) = prompt else {
+        return Ok(());
+    };
+    let stored = guard
+        .messages()
+        .first()
+        .is_some_and(|first| first.role == MessageRole::System && first.text == prompt);
+    if stored {
+        return Ok(());
+    }
+    guard
+        .append_message(
+            SessionRecordKind::SystemPrompt,
+            Message::text(MessageRole::System, prompt.to_owned()),
+        )
+        .map(|_| ())
+        .map_err(|error| describe_store_error(&error))
+}
+
+/// Prints the final answer (print mode) and maps its stop reason to an exit code.
+fn report_answer(
+    options: &HeadlessOptions,
+    answer: &Message,
+    out: &SharedWriter,
+    write_err: &dyn Fn(&str),
 ) -> i32 {
-    let write_err = |text: &str| {
-        if let Ok(mut err) = err.lock() {
-            let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
-        }
-    };
-    let sink: Arc<dyn EventSink> = match options.mode {
-        HeadlessMode::Json => {
-            let header = session_header_jsonl(
-                &new_session_id(),
-                now_ms(),
-                &options.cwd.display().to_string(),
-            );
-            if let Ok(mut out) = out.lock() {
-                let _ = out.write_all(header.as_bytes()).and_then(|()| out.flush());
-            }
-            Arc::new(JsonlSink {
-                out: Arc::clone(&out),
-            })
-        }
-        HeadlessMode::Print => Arc::new(NullSink),
-    };
-
-    let mut runtime = AgentRuntime::new(
-        providers,
-        tools,
-        RuntimeConfig::new(options.model.clone(), options.cwd.clone()),
-    );
-    if let Some(prompt) = &options.system_prompt {
-        runtime.set_context(AgentContext {
-            messages: vec![Message::text(MessageRole::System, prompt.clone())],
-        });
-    }
-    let mut last_answer: Option<Message> = None;
-    for text in &options.messages {
-        let result = runtime
-            .run(Message::text(MessageRole::User, text.clone()), sink.clone())
-            .await;
-        last_answer = result
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == MessageRole::Assistant)
-            .cloned();
-    }
-
-    let Some(answer) = last_answer else {
-        return 0;
-    };
     match answer.stop_reason {
         Some(reason @ (StopReason::Error | StopReason::Aborted)) => {
             if options.mode == HeadlessMode::Print {
@@ -188,6 +175,86 @@ pub async fn run_headless(
             0
         }
     }
+}
+
+/// Runs the prompts and returns the process exit code.
+///
+/// `out` receives stdout and `err` receives stderr. In JSON mode stdout carries
+/// only JSONL records; every diagnostic goes to `err`.
+pub async fn run_headless(
+    options: HeadlessOptions,
+    providers: &dyn ProviderRegistry,
+    tools: &dyn ToolRegistry,
+    session: SharedSession,
+    out: SharedWriter,
+    err: SharedWriter,
+) -> i32 {
+    let write_err = |text: &str| {
+        if let Ok(mut err) = err.lock() {
+            let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
+        }
+    };
+    let sink: Arc<dyn EventSink> = match options.mode {
+        HeadlessMode::Json => {
+            let session_id = session
+                .lock()
+                .map(|guard| guard.session().descriptor.id.as_str().to_owned())
+                .unwrap_or_default();
+            let header =
+                session_header_jsonl(&session_id, now_ms(), &options.cwd.display().to_string());
+            if let Ok(mut out) = out.lock() {
+                let _ = out.write_all(header.as_bytes()).and_then(|()| out.flush());
+            }
+            Arc::new(JsonlSink {
+                out: Arc::clone(&out),
+            })
+        }
+        HeadlessMode::Print => Arc::new(NullSink),
+    };
+
+    let mut runtime = AgentRuntime::new(
+        providers,
+        tools,
+        RuntimeConfig::new(options.model.clone(), options.cwd.clone()),
+    );
+    if let Err(message) = prepare_session(&session, options.system_prompt.as_deref()) {
+        write_err(&format!("Error: {message}\n"));
+        return 1;
+    }
+    let mut last_answer: Option<Message> = None;
+    let mut persistence_failed = false;
+    for text in &options.messages {
+        let outcome = runtime
+            .run_persistent(
+                Arc::clone(&session),
+                Message::text(MessageRole::User, text.clone()),
+                sink.clone(),
+            )
+            .await;
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                write_err(&format!("Error: {}\n", describe_store_error(&error)));
+                return 1;
+            }
+        };
+        if let Some(error) = &result.persistence_error {
+            persistence_failed = true;
+            write_err(&format!("Error: could not save the session: {error}\n"));
+        }
+        last_answer = result
+            .run
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .cloned();
+    }
+    let Some(answer) = last_answer else {
+        return i32::from(persistence_failed);
+    };
+    let code = report_answer(&options, &answer, &out, &write_err);
+    if persistence_failed { 1 } else { code }
 }
 
 #[cfg(test)]
@@ -295,6 +362,28 @@ mod tests {
         String::from_utf8(bytes.lock().expect("capture lock").clone()).expect("utf8 output")
     }
 
+    fn ephemeral_session() -> super::SharedSession {
+        use nyan_coding_agent_core::{AgentMode, SessionId};
+        use nyan_coding_agent_session::{
+            FileSessionStore, NativeSession, SessionDescriptor, SessionOpenRequest,
+        };
+        let store = FileSessionStore::new("");
+        Arc::new(Mutex::new(
+            NativeSession::open(
+                &store,
+                SessionOpenRequest {
+                    descriptor: SessionDescriptor::ephemeral(
+                        SessionId::new("test-session").expect("id"),
+                        "/tmp/project",
+                    ),
+                    mode: AgentMode::Print,
+                    storage_root: None,
+                },
+            )
+            .expect("ephemeral session"),
+        ))
+    }
+
     fn answer(
         text: &str,
         reason: ProviderStopReason,
@@ -317,6 +406,7 @@ mod tests {
         };
         let (out, out_bytes) = capture();
         let (err, err_bytes) = capture();
+        let session = ephemeral_session();
         let code = block_on(run_headless(
             HeadlessOptions {
                 mode,
@@ -333,6 +423,7 @@ mod tests {
             },
             &provider,
             &NoTools,
+            session,
             out,
             err,
         ));
@@ -406,7 +497,9 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(err, "");
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].starts_with("{\"type\":\"session\",\"version\":3,\"id\":\""));
+        assert!(
+            lines[0].starts_with("{\"type\":\"session\",\"version\":3,\"id\":\"test-session\"")
+        );
         assert!(lines[0].ends_with("\"cwd\":\"/tmp/project\"}"));
         let types: Vec<String> = lines
             .iter()

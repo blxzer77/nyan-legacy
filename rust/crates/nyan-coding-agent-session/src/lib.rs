@@ -107,6 +107,10 @@ pub enum SessionRecordKind {
     RunStarted,
     /// Run terminal marker.
     RunFinished,
+    /// The system prompt the session was started with.
+    SystemPrompt,
+    /// The session's display name; the last one wins.
+    SessionName,
 }
 
 impl SessionRecordKind {
@@ -118,6 +122,8 @@ impl SessionRecordKind {
             Self::ToolResult => 4,
             Self::RunStarted => 5,
             Self::RunFinished => 6,
+            Self::SystemPrompt => 7,
+            Self::SessionName => 8,
         }
     }
 
@@ -129,6 +135,8 @@ impl SessionRecordKind {
             4 => Self::ToolResult,
             5 => Self::RunStarted,
             6 => Self::RunFinished,
+            7 => Self::SystemPrompt,
+            8 => Self::SessionName,
             _ => return None,
         })
     }
@@ -466,6 +474,8 @@ pub enum SessionStoreError {
         /// Session file path.
         path: PathBuf,
     },
+    /// The session's previous run never finished, so its outcome is unknown.
+    IncompleteRun,
     /// A journal message payload could not be decoded.
     MessageDecode {
         /// Codec diagnostic.
@@ -490,6 +500,7 @@ impl SessionStoreError {
             Self::InvalidHeader { .. } => "session_invalid_header",
             Self::UnsupportedVersion { .. } => "session_unsupported_version",
             Self::CorruptRecord { .. } => "session_corrupt_record",
+            Self::IncompleteRun => "session_incomplete_run",
             Self::MessageDecode { .. } => "session_message_decode",
             Self::Io { .. } => "session_io",
         }
@@ -518,6 +529,8 @@ impl std::fmt::Display for SessionStoreError {
             Self::CorruptRecord { path } => {
                 write!(formatter, "session journal is corrupt: {}", path.display())
             }
+            Self::IncompleteRun => formatter
+                .write_str("the session's previous run did not finish, so its outcome is unknown"),
             Self::MessageDecode { message } => {
                 write!(formatter, "session message decode failed: {message}")
             }
@@ -573,6 +586,31 @@ impl FileSessionStore {
 }
 
 impl FileSessionStore {
+    /// Lists sessions newest first by last modification, then by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the root cannot be read.
+    pub fn sessions_by_recency(
+        &self,
+        storage_root: Option<&Path>,
+    ) -> Result<Vec<SessionId>, SessionStoreError> {
+        let root = storage_root.unwrap_or(self.root.as_path());
+        let mut entries: Vec<(std::time::SystemTime, SessionId)> = self
+            .session_ids(Some(root))?
+            .into_iter()
+            .map(|id| {
+                let modified =
+                    fs::metadata(root.join(format!("{}.session", encode_session_id(&id))))
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                (modified, id)
+            })
+            .collect();
+        entries.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        Ok(entries.into_iter().map(|(_, id)| id).collect())
+    }
+
     /// Lists Rust-native session ids in a storage root, sorted by id.
     ///
     /// Missing roots are treated as an empty session directory.
@@ -919,7 +957,8 @@ impl SessionJournal {
             .filter(|record| {
                 matches!(
                     record.kind,
-                    SessionRecordKind::UserMessage
+                    SessionRecordKind::SystemPrompt
+                        | SessionRecordKind::UserMessage
                         | SessionRecordKind::AssistantMessage
                         | SessionRecordKind::ToolResult
                 )
@@ -942,6 +981,7 @@ pub struct NativeSession {
     journal: Option<SessionJournal>,
     messages: Vec<Message>,
     incomplete_run: bool,
+    name: Option<String>,
 }
 
 impl NativeSession {
@@ -956,14 +996,15 @@ impl NativeSession {
     ) -> Result<Self, SessionStoreError> {
         let opened = store.open(request)?;
         let mut journal = opened.path().map(|_| opened.journal()).transpose()?;
-        let (messages, incomplete_run) = if let Some(journal) = &mut journal {
+        let (messages, incomplete_run, name) = if let Some(journal) = &mut journal {
             let records = journal.records()?;
             let messages = records
                 .iter()
                 .filter(|record| {
                     matches!(
                         record.kind,
-                        SessionRecordKind::UserMessage
+                        SessionRecordKind::SystemPrompt
+                            | SessionRecordKind::UserMessage
                             | SessionRecordKind::AssistantMessage
                             | SessionRecordKind::ToolResult
                     )
@@ -983,15 +1024,23 @@ impl NativeSession {
                         SessionRecordKind::RunFinished => false,
                         _ => incomplete,
                     });
-            (messages, incomplete_run)
+            let mut messages = messages;
+            normalize_system_messages(&mut messages);
+            let name = records
+                .iter()
+                .rev()
+                .find(|record| record.kind == SessionRecordKind::SessionName)
+                .and_then(|record| String::from_utf8(record.payload.clone()).ok());
+            (messages, incomplete_run, name)
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, None)
         };
         Ok(Self {
             opened,
             journal,
             messages,
             incomplete_run,
+            name,
         })
     }
 
@@ -1005,6 +1054,28 @@ impl NativeSession {
     #[must_use]
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Returns the display name, if one was set.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Sets the display name and records it in the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the record cannot be committed.
+    pub fn set_name(&mut self, name: &str) -> Result<(), SessionStoreError> {
+        if let Some(journal) = &mut self.journal {
+            journal.append(SessionRecord::new(
+                SessionRecordKind::SessionName,
+                name.as_bytes().to_vec(),
+            ))?;
+        }
+        self.name = Some(name.to_owned());
+        Ok(())
     }
 
     /// Returns whether replay found a run start without a later run finish.
@@ -1021,10 +1092,7 @@ impl NativeSession {
     /// marker cannot be persisted.
     pub fn begin_run(&mut self, payload: impl Into<Vec<u8>>) -> Result<(), SessionStoreError> {
         if self.incomplete_run {
-            return Err(SessionStoreError::Io {
-                operation: "begin session run".to_owned(),
-                message: "session already has an incomplete run".to_owned(),
-            });
+            return Err(SessionStoreError::IncompleteRun);
         }
         if let Some(journal) = &mut self.journal {
             journal.append(SessionRecord::new(SessionRecordKind::RunStarted, payload))?;
@@ -1062,6 +1130,7 @@ impl NativeSession {
             self.messages.len() as u64
         };
         self.messages.push(message);
+        normalize_system_messages(&mut self.messages);
         Ok(sequence)
     }
 
@@ -1110,9 +1179,22 @@ impl NativeSession {
     }
 }
 
+/// Keeps only the latest system message and moves it to the front.
+fn normalize_system_messages(messages: &mut Vec<Message>) {
+    let Some(latest) = messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::System)
+    else {
+        return;
+    };
+    let system = messages[latest].clone();
+    messages.retain(|message| message.role != MessageRole::System);
+    messages.insert(0, system);
+}
+
 fn record_kind_for_message(message: &Message) -> SessionRecordKind {
     match message.role {
-        MessageRole::System => SessionRecordKind::Metadata,
+        MessageRole::System => SessionRecordKind::SystemPrompt,
         MessageRole::User => SessionRecordKind::UserMessage,
         MessageRole::Assistant => SessionRecordKind::AssistantMessage,
         MessageRole::Tool => SessionRecordKind::ToolResult,
@@ -1410,6 +1492,98 @@ mod tests {
             .finish_run(b"aborted".to_vec())
             .expect("finish recovery");
         assert!(!reopened.has_incomplete_run());
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn the_latest_system_prompt_replaces_earlier_ones_and_stays_first() {
+        let root = test_root("system-prompt");
+        let store = FileSessionStore::new(&root);
+        let mut session =
+            NativeSession::open(&store, request_for(&root, "prompted")).expect("open");
+        let append = |session: &mut NativeSession, role, text: &str| {
+            let kind = match role {
+                MessageRole::System => SessionRecordKind::SystemPrompt,
+                MessageRole::User => SessionRecordKind::UserMessage,
+                _ => SessionRecordKind::AssistantMessage,
+            };
+            session
+                .append_message(kind, Message::text(role, text))
+                .expect("append");
+        };
+        append(&mut session, MessageRole::System, "prompt one");
+        append(&mut session, MessageRole::User, "hello");
+        append(&mut session, MessageRole::System, "prompt two");
+        let texts = |session: &NativeSession| {
+            session
+                .messages()
+                .iter()
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&session), ["prompt two", "hello"]);
+        drop(session);
+        let reopened = NativeSession::open(&store, request_for(&root, "prompted")).expect("reopen");
+        assert_eq!(
+            texts(&reopened),
+            ["prompt two", "hello"],
+            "replay normalizes the same way"
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn the_session_name_persists_and_the_last_one_wins() {
+        let root = test_root("name");
+        let store = FileSessionStore::new(&root);
+        let mut session = NativeSession::open(&store, request_for(&root, "named")).expect("open");
+        assert_eq!(session.name(), None);
+        session.set_name("first").expect("name");
+        session.set_name("second").expect("rename");
+        drop(session);
+        let reopened = NativeSession::open(&store, request_for(&root, "named")).expect("reopen");
+        assert_eq!(reopened.name(), Some("second"));
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn sessions_list_newest_first() {
+        let root = test_root("recency");
+        let store = FileSessionStore::new(&root);
+        for id in ["old", "mid", "new"] {
+            let session = NativeSession::open(&store, request_for(&root, id)).expect("open");
+            drop(session);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let ids: Vec<String> = store
+            .sessions_by_recency(Some(&root))
+            .expect("list")
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(ids, ["new", "mid", "old"]);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn an_unfinished_run_has_its_own_error_code() {
+        let root = test_root("incomplete-code");
+        let store = FileSessionStore::new(&root);
+        let mut session = NativeSession::open(&store, request_for(&root, "crashed")).expect("open");
+        session.begin_run(Vec::new()).expect("begin");
+        drop(session);
+        let mut reopened =
+            NativeSession::open(&store, request_for(&root, "crashed")).expect("reopen");
+        assert_eq!(
+            reopened
+                .begin_run(Vec::new())
+                .expect_err("must refuse")
+                .code(),
+            "session_incomplete_run"
+        );
         drop(reopened);
         fs::remove_dir_all(root).expect("remove test root");
     }

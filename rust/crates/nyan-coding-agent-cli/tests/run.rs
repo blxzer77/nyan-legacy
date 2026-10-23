@@ -46,13 +46,44 @@ fn execute_in(
     tty: bool,
     cwd: PathBuf,
 ) -> Outcome {
+    let agent_dir = scratch("agent");
+    let outcome = execute_with_agent(argv, base_url, key, tty, cwd, &agent_dir);
+    let _ = std::fs::remove_dir_all(agent_dir);
+    outcome
+}
+
+/// A fresh directory under the system temp dir.
+fn scratch(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let path =
+        std::env::temp_dir().join(format!("nyan-cli-{label}-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&path).expect("scratch dir");
+    path
+}
+
+fn execute_with_agent(
+    argv: &[&str],
+    base_url: &str,
+    key: Option<&str>,
+    tty: bool,
+    cwd: PathBuf,
+    agent_dir: &std::path::Path,
+) -> Outcome {
+    let agent_dir = agent_dir.to_string_lossy().into_owned();
     let out_bytes = Arc::new(Mutex::new(Vec::new()));
     let err_bytes = Arc::new(Mutex::new(Vec::new()));
     let out: SharedWriter = Arc::new(Mutex::new(Capture(Arc::clone(&out_bytes))));
     let err: SharedWriter = Arc::new(Mutex::new(Capture(Arc::clone(&err_bytes))));
     let key = key.map(str::to_owned);
     let environment = Environment {
-        var: Box::new(move |name| (name == "OPENAI_API_KEY").then(|| key.clone()).flatten()),
+        var: Box::new(move |name| match name {
+            "OPENAI_API_KEY" => key.clone(),
+            "NYAN_CODING_AGENT_DIR" => Some(agent_dir.clone()),
+            _ => None,
+        }),
         stdin_is_tty: tty,
         stdout_is_tty: tty,
         cwd,
@@ -645,4 +676,204 @@ fn system_prompt_flags_and_project_context_shape_the_first_message() {
         "a custom prompt replaces the tool list"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+fn request_messages(captured: &Arc<Mutex<String>>) -> Vec<serde_json::Value> {
+    let request = captured.lock().expect("lock").clone();
+    let body: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    body["messages"].as_array().expect("messages").clone()
+}
+
+#[test]
+fn a_saved_session_is_continued_with_its_history_and_no_session_saves_nothing() {
+    let agent = scratch("agent-persist");
+    let cwd = scratch("cwd-persist");
+    let run_once = |argv: &[&str]| {
+        let runtime = Runtime::new().expect("runtime");
+        let (address, captured) = serve(&runtime, "200 OK", answer_body());
+        let outcome = execute_with_agent(
+            argv,
+            &format!("http://{address}/v1"),
+            Some("k"),
+            false,
+            cwd.clone(),
+            &agent,
+        );
+        (outcome, captured)
+    };
+
+    let (first, _) = run_once(&["-p", "--model", "openai/m", "my name is Ada"]);
+    assert_eq!(first.code, 0, "{}", first.stderr);
+    assert!(agent.join("sessions-rust").is_dir(), "the run was saved");
+
+    let (second, captured) = run_once(&["-p", "--model", "openai/m", "--continue", "who am I?"]);
+    assert_eq!(second.code, 0, "{}", second.stderr);
+    let messages = request_messages(&captured);
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message["role"].as_str().expect("role"))
+        .collect();
+    assert_eq!(roles, ["system", "user", "assistant", "user"]);
+    assert_eq!(messages[1]["content"], "my name is Ada");
+    assert_eq!(messages[2]["content"], "Hello");
+    assert_eq!(messages[3]["content"], "who am I?");
+
+    let (third, captured) = run_once(&["-p", "--model", "openai/m", "who am I?"]);
+    assert_eq!(third.code, 0, "{}", third.stderr);
+    assert_eq!(
+        request_messages(&captured).len(),
+        2,
+        "without --continue a run starts fresh"
+    );
+
+    let throwaway = scratch("agent-ephemeral");
+    let runtime = Runtime::new().expect("runtime");
+    let (address, _) = serve(&runtime, "200 OK", answer_body());
+    let ephemeral = execute_with_agent(
+        &["-p", "--model", "openai/m", "--no-session", "forget me"],
+        &format!("http://{address}/v1"),
+        Some("k"),
+        false,
+        cwd.clone(),
+        &throwaway,
+    );
+    assert_eq!(ephemeral.code, 0, "{}", ephemeral.stderr);
+    assert!(
+        !throwaway.join("sessions-rust").exists(),
+        "--no-session writes nothing"
+    );
+    for directory in [agent, cwd, throwaway] {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[test]
+fn a_session_whose_previous_run_never_finished_is_refused_not_continued() {
+    let agent = scratch("agent-crashed");
+    let cwd = scratch("cwd-crashed");
+    // Make a session that died mid-run: a run-start marker with no finish.
+    {
+        use nyan_coding_agent_core::{AgentMode, SessionId};
+        use nyan_coding_agent_session::{
+            FileSessionStore, NativeSession, SessionDescriptor, SessionOpenRequest,
+        };
+        let runtime = Runtime::new().expect("runtime");
+        let (address, _) = serve(&runtime, "200 OK", answer_body());
+        let seed = execute_with_agent(
+            &[
+                "-p",
+                "--model",
+                "openai/m",
+                "--session-id",
+                "crashy",
+                "start",
+            ],
+            &format!("http://{address}/v1"),
+            Some("k"),
+            false,
+            cwd.clone(),
+            &agent,
+        );
+        assert_eq!(seed.code, 0, "{}", seed.stderr);
+        let store_root = std::fs::read_dir(agent.join("sessions-rust"))
+            .expect("store")
+            .next()
+            .expect("one directory per working directory")
+            .expect("entry")
+            .path();
+        let store = FileSessionStore::new(&store_root);
+        let mut session = NativeSession::open(
+            &store,
+            SessionOpenRequest {
+                descriptor: SessionDescriptor::persistent(
+                    SessionId::new("crashy").expect("id"),
+                    cwd.clone(),
+                ),
+                mode: AgentMode::Print,
+                storage_root: Some(store_root),
+            },
+        )
+        .expect("reopen");
+        session
+            .begin_run(Vec::new())
+            .expect("begin a run that never finishes");
+    }
+
+    let outcome = execute_with_agent(
+        &[
+            "-p",
+            "--model",
+            "openai/m",
+            "--session-id",
+            "crashy",
+            "again",
+        ],
+        "http://127.0.0.1:1/v1",
+        Some("k"),
+        false,
+        cwd.clone(),
+        &agent,
+    );
+    assert_eq!(outcome.code, 1);
+    assert_eq!(outcome.stdout, "");
+    assert!(
+        outcome
+            .stderr
+            .contains("did not finish, so its outcome is unknown"),
+        "{}",
+        outcome.stderr
+    );
+    for directory in [agent, cwd] {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[test]
+fn a_session_held_by_another_process_exits_one_before_any_request() {
+    let agent = scratch("agent-busy");
+    let cwd = scratch("cwd-busy");
+    let first_runtime = Runtime::new().expect("runtime");
+    let (address, _) = serve(&first_runtime, "200 OK", answer_body());
+    let seed = execute_with_agent(
+        &["-p", "--model", "openai/m", "--session-id", "busy", "hi"],
+        &format!("http://{address}/v1"),
+        Some("k"),
+        false,
+        cwd.clone(),
+        &agent,
+    );
+    assert_eq!(seed.code, 0, "{}", seed.stderr);
+    let store_root = std::fs::read_dir(agent.join("sessions-rust"))
+        .expect("store")
+        .next()
+        .expect("directory")
+        .expect("entry")
+        .path();
+    // Hold the lock the way a running process would.
+    let lock = std::fs::read_dir(&store_root)
+        .expect("session files")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "session"))
+        .expect("session file")
+        .with_extension("lock");
+    std::fs::write(&lock, "").expect("create the lock");
+    let outcome = execute_with_agent(
+        &["-p", "--model", "openai/m", "--session-id", "busy", "again"],
+        "http://127.0.0.1:1/v1",
+        Some("k"),
+        false,
+        cwd.clone(),
+        &agent,
+    );
+    assert_eq!(outcome.code, 1);
+    assert!(
+        outcome.stderr.contains("is in use by another Nyan process"),
+        "{}",
+        outcome.stderr
+    );
+    for directory in [agent, cwd] {
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }
