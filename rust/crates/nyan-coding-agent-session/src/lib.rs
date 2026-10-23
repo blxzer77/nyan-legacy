@@ -869,6 +869,7 @@ pub struct NativeSession {
     opened: OpenedSession,
     journal: Option<SessionJournal>,
     messages: Vec<Message>,
+    incomplete_run: bool,
 }
 
 impl NativeSession {
@@ -883,15 +884,42 @@ impl NativeSession {
     ) -> Result<Self, SessionStoreError> {
         let opened = store.open(request)?;
         let mut journal = opened.path().map(|_| opened.journal()).transpose()?;
-        let messages = journal
-            .as_mut()
-            .map(SessionJournal::replay_messages)
-            .transpose()?
-            .unwrap_or_default();
+        let (messages, incomplete_run) = if let Some(journal) = &mut journal {
+            let records = journal.records()?;
+            let messages = records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.kind,
+                        SessionRecordKind::UserMessage
+                            | SessionRecordKind::AssistantMessage
+                            | SessionRecordKind::ToolResult
+                    )
+                })
+                .map(SessionJournal::decode_message_record)
+                .map(|result| {
+                    result.map_err(|error| SessionStoreError::MessageDecode {
+                        message: error.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let incomplete_run =
+                records
+                    .iter()
+                    .fold(false, |incomplete, record| match record.kind {
+                        SessionRecordKind::RunStarted => true,
+                        SessionRecordKind::RunFinished => false,
+                        _ => incomplete,
+                    });
+            (messages, incomplete_run)
+        } else {
+            (Vec::new(), false)
+        };
         Ok(Self {
             opened,
             journal,
             messages,
+            incomplete_run,
         })
     }
 
@@ -905,6 +933,45 @@ impl NativeSession {
     #[must_use]
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Returns whether replay found a run start without a later run finish.
+    #[must_use]
+    pub fn has_incomplete_run(&self) -> bool {
+        self.incomplete_run
+    }
+
+    /// Commits a run-start marker before external work begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if another run is already marked incomplete or the
+    /// marker cannot be persisted.
+    pub fn begin_run(&mut self, payload: impl Into<Vec<u8>>) -> Result<(), SessionStoreError> {
+        if self.incomplete_run {
+            return Err(SessionStoreError::Io {
+                operation: "begin session run".to_owned(),
+                message: "session already has an incomplete run".to_owned(),
+            });
+        }
+        if let Some(journal) = &mut self.journal {
+            journal.append(SessionRecord::new(SessionRecordKind::RunStarted, payload))?;
+        }
+        self.incomplete_run = true;
+        Ok(())
+    }
+
+    /// Commits a run-finished marker after the run outcome is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the marker cannot be persisted.
+    pub fn finish_run(&mut self, payload: impl Into<Vec<u8>>) -> Result<(), SessionStoreError> {
+        if let Some(journal) = &mut self.journal {
+            journal.append(SessionRecord::new(SessionRecordKind::RunFinished, payload))?;
+        }
+        self.incomplete_run = false;
+        Ok(())
     }
 
     /// Appends one message and updates the in-memory transcript only after the write succeeds.
@@ -1205,6 +1272,29 @@ mod tests {
         assert_eq!(reopened.messages().len(), 2);
         assert_eq!(reopened.messages()[0].text, "hello");
         assert_eq!(reopened.messages()[1].text, "world");
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn native_session_recovers_incomplete_run_marker() {
+        let root = test_root("recovery");
+        let store = FileSessionStore::new(&root);
+        let mut session = NativeSession::open(&store, request_for(&root, "recoverable"))
+            .expect("open recoverable session");
+        assert!(!session.has_incomplete_run());
+        session.begin_run(b"run-1".to_vec()).expect("begin run");
+        assert!(session.has_incomplete_run());
+        drop(session);
+
+        let mut reopened = NativeSession::open(&store, request_for(&root, "recoverable"))
+            .expect("reopen recoverable session");
+        assert!(reopened.has_incomplete_run());
+        assert!(reopened.begin_run(b"run-2".to_vec()).is_err());
+        reopened
+            .finish_run(b"aborted".to_vec())
+            .expect("finish recovery");
+        assert!(!reopened.has_incomplete_run());
         drop(reopened);
         fs::remove_dir_all(root).expect("remove test root");
     }
