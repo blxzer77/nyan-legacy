@@ -173,7 +173,15 @@ fn print_mode_prints_the_answer_and_sends_the_credential_and_model() {
     let body: serde_json::Value =
         serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
     assert_eq!(body["model"], "gpt-test");
-    assert_eq!(body["messages"][0]["content"], "say hi");
+    assert_eq!(body["messages"][0]["role"], "system");
+    let system = body["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt");
+    assert!(system.starts_with("You are an expert coding assistant operating inside nyan"));
+    assert!(system.contains("- bash: Execute bash commands"));
+    assert!(system.ends_with("<cwd>\n/tmp/project\n</cwd>"));
+    assert_eq!(body["messages"][1]["role"], "user");
+    assert_eq!(body["messages"][1]["content"], "say hi");
 }
 
 #[test]
@@ -486,10 +494,12 @@ fn a_tool_call_changes_the_workspace_and_its_result_reaches_the_next_request() {
     let second_body: serde_json::Value =
         serde_json::from_str(second.split("\r\n\r\n").nth(1).expect("body")).expect("json");
     let messages = second_body["messages"].as_array().expect("messages");
-    let assistant = &messages[1];
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["content"], "create the file");
+    let assistant = &messages[2];
     assert_eq!(assistant["tool_calls"][0]["id"], "call_w");
     assert_eq!(assistant["tool_calls"][0]["function"]["name"], "write");
-    let result = &messages[2];
+    let result = &messages[3];
     assert_eq!(result["role"], "tool");
     assert_eq!(result["tool_call_id"], "call_w");
     assert_eq!(result["content"], "Successfully wrote to out/hello.txt");
@@ -544,10 +554,95 @@ fn a_bash_tool_call_runs_in_the_workspace_and_a_failure_is_reported_back_to_the_
     let second = requests[1].lock().expect("lock").clone();
     let body: serde_json::Value =
         serde_json::from_str(second.split("\r\n\r\n").nth(1).expect("body")).expect("json");
-    let result = body["messages"][2]["content"]
+    let result = body["messages"][3]["content"]
         .as_str()
         .expect("tool result text");
     assert!(result.contains("missing.txt"), "{result}");
     assert!(result.ends_with("Command exited with code 1"), "{result}");
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn system_prompt_flags_and_project_context_shape_the_first_message() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("nyan-e2e-prompt-{}-{nonce}", std::process::id()));
+    let project = root.join("project");
+    let agent = root.join("agent");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    std::fs::write(project.join("AGENTS.md"), "Project rule: use tabs.").expect("context file");
+    std::fs::write(agent.join("AGENTS.md"), "Global rule: be kind.").expect("global context");
+    std::fs::write(root.join("extra.md"), "From a file.").expect("append file");
+
+    let first_message = |argv: &[&str]| -> String {
+        let runtime = Runtime::new().expect("runtime");
+        let (address, captured) = serve(&runtime, "200 OK", answer_body());
+        let out_bytes = Arc::new(Mutex::new(Vec::new()));
+        let err_bytes = Arc::new(Mutex::new(Vec::new()));
+        let out: SharedWriter = Arc::new(Mutex::new(Capture(Arc::clone(&out_bytes))));
+        let err: SharedWriter = Arc::new(Mutex::new(Capture(Arc::clone(&err_bytes))));
+        let agent_dir = agent.to_string_lossy().into_owned();
+        let environment = Environment {
+            var: Box::new(move |name| match name {
+                "OPENAI_API_KEY" => Some("k".to_owned()),
+                "NYAN_CODING_AGENT_DIR" => Some(agent_dir.clone()),
+                _ => None,
+            }),
+            stdin_is_tty: false,
+            stdout_is_tty: false,
+            cwd: project.clone(),
+            openai_base_url: format!("http://{address}/v1"),
+        };
+        let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+        assert_eq!(run(&argv, &environment, &out, &err), 0);
+        let request = captured.lock().expect("lock").clone();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+        body["messages"][0]["content"]
+            .as_str()
+            .expect("system")
+            .to_owned()
+    };
+
+    let default = first_message(&["-p", "--model", "openai/m", "hi"]);
+    let global = default
+        .find("Global rule: be kind.")
+        .expect("global context");
+    let project_rule = default
+        .find("Project rule: use tabs.")
+        .expect("project context");
+    assert!(
+        global < project_rule,
+        "the global file comes before the project's"
+    );
+    assert!(default.contains("<project_instructions path=\""));
+
+    let without = first_message(&["-p", "--model", "openai/m", "--no-context-files", "hi"]);
+    assert!(!without.contains("Project rule") && !without.contains("Global rule"));
+
+    let custom = first_message(&[
+        "-p",
+        "--model",
+        "openai/m",
+        "--system-prompt",
+        "You are terse.",
+        "--append-system-prompt",
+        "Rule one.",
+        "--append-system-prompt",
+        root.join("extra.md").to_str().expect("utf8"),
+        "--no-tools",
+        "hi",
+    ]);
+    assert!(
+        custom.starts_with("You are terse.\n\n<addendum>\nRule one.\n\nFrom a file.\n</addendum>"),
+        "{custom}"
+    );
+    assert!(
+        !custom.contains("<tools>"),
+        "a custom prompt replaces the tool list"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }

@@ -15,6 +15,9 @@ use nyan_coding_agent_tools::builtin::BuiltinTools;
 use crate::app_mode::{AppMode, resolve_app_mode};
 use crate::args::{Args, DiagnosticKind, parse_args};
 use crate::headless::{HeadlessMode, HeadlessOptions, SharedWriter, run_headless};
+use crate::system_prompt::{
+    PromptOptions, build_system_prompt, load_project_context_files, text_or_file,
+};
 use crate::tool_selection::select_tools;
 
 /// The `OpenAI` endpoint used when nothing else is configured.
@@ -119,7 +122,47 @@ enum Plan {
         api_key: String,
         messages: Vec<String>,
         tools: Vec<&'static str>,
+        system_prompt: String,
     },
+}
+
+/// The agent directory: `NYAN_CODING_AGENT_DIR`, else `~/.nyan/agent`.
+fn agent_dir(env: &Environment) -> PathBuf {
+    if let Some(dir) = (env.var)("NYAN_CODING_AGENT_DIR").filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let home_variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    (env.var)(home_variable)
+        .filter(|home| !home.is_empty())
+        .map_or_else(
+            || PathBuf::from(".nyan").join("agent"),
+            |home| PathBuf::from(home).join(".nyan").join("agent"),
+        )
+}
+
+fn build_prompt(parsed: &Args, tools: &[&str], env: &Environment) -> String {
+    let appended: Vec<String> = parsed
+        .append_system_prompt
+        .iter()
+        .flatten()
+        .map(|text| text_or_file(text))
+        .filter(|text| !text.is_empty())
+        .collect();
+    build_system_prompt(&PromptOptions {
+        custom_prompt: parsed
+            .system_prompt
+            .as_deref()
+            .map(text_or_file)
+            .filter(|text| !text.is_empty()),
+        selected_tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+        append: (!appended.is_empty()).then(|| appended.join("\n\n")),
+        context_files: if parsed.no_context_files {
+            Vec::new()
+        } else {
+            load_project_context_files(&env.cwd, &agent_dir(env))
+        },
+        cwd: env.cwd.clone(),
+    })
 }
 
 fn fail(err: &SharedWriter, message: &str) -> Plan {
@@ -203,19 +246,21 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         Ok(tools) => tools,
         Err(message) => return fail(err, &message),
     };
+    let system_prompt = build_prompt(&parsed, &tools, env);
     Plan::Run {
         mode,
         model,
         api_key,
         messages: parsed.messages,
         tools,
+        system_prompt,
     }
 }
 
 /// Runs the process for `argv` (without the program name) and returns its exit code.
 #[must_use]
 pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWriter) -> i32 {
-    let (mode, model, api_key, messages, tools) = match plan(argv, env, out, err) {
+    let (mode, model, api_key, messages, tools, system_prompt) = match plan(argv, env, out, err) {
         Plan::Exit(code) => return code,
         Plan::Run {
             mode,
@@ -223,7 +268,8 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
             api_key,
             messages,
             tools,
-        } => (mode, model, api_key, messages, tools),
+            system_prompt,
+        } => (mode, model, api_key, messages, tools, system_prompt),
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -258,6 +304,7 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
             messages,
             cwd: env.cwd.clone(),
             model,
+            system_prompt: Some(system_prompt),
         },
         &providers,
         &BuiltinTools::only(&tools),

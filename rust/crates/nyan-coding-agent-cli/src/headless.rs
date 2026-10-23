@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use nyan_coding_agent_core::{Message, MessageRole, StopReason, now_ms};
 use nyan_coding_agent_protocol::{event_to_jsonl, session_header_jsonl};
 use nyan_coding_agent_provider::{ProviderModel, ProviderRegistry};
-use nyan_coding_agent_runtime::{AgentEvent, AgentRuntime, EventSink, RuntimeConfig};
+use nyan_coding_agent_runtime::{AgentContext, AgentEvent, AgentRuntime, EventSink, RuntimeConfig};
 use nyan_coding_agent_tools::ToolRegistry;
 
 /// Which headless output to produce.
@@ -36,6 +36,8 @@ pub struct HeadlessOptions {
     pub cwd: PathBuf,
     /// Selected provider and model.
     pub model: ProviderModel,
+    /// The system prompt, placed first in every request.
+    pub system_prompt: Option<String>,
 }
 
 /// A byte sink shared between the caller and the event sink.
@@ -128,6 +130,11 @@ pub async fn run_headless(
         tools,
         RuntimeConfig::new(options.model.clone(), options.cwd.clone()),
     );
+    if let Some(prompt) = &options.system_prompt {
+        runtime.set_context(AgentContext {
+            messages: vec![Message::text(MessageRole::System, prompt.clone())],
+        });
+    }
     let mut last_answer: Option<Message> = None;
     for text in &options.messages {
         let result = runtime
@@ -322,6 +329,7 @@ mod tests {
                     provider: "scripted".to_owned(),
                     model: "m".to_owned(),
                 },
+                system_prompt: None,
             },
             &provider,
             &NoTools,

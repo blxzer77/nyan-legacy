@@ -4,4 +4,5 @@ pub mod app_mode;
 pub mod args;
 pub mod headless;
 pub mod run;
+pub mod system_prompt;
 pub mod tool_selection;
