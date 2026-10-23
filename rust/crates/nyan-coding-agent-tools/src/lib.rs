@@ -14,7 +14,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll, Waker};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use command_group::{CommandGroup, GroupChild};
 use nyan_coding_agent_core::{BoxFuture, CancellationToken, ExecutionContext, ToolResult};
@@ -79,8 +79,14 @@ impl std::fmt::Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
+/// How long output readers may keep running after the process leader has exited.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Receives output bytes from a running process as they arrive, on the reader threads.
+pub type OutputSink = Arc<dyn Fn(&[u8]) + Send + Sync + 'static>;
+
 /// A managed subprocess specification.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ProcessSpec {
     /// Executable name or path.
     pub program: String,
@@ -88,6 +94,23 @@ pub struct ProcessSpec {
     pub args: Vec<String>,
     /// Working directory for the child.
     pub cwd: PathBuf,
+    /// Kill the process group after this long.
+    pub timeout: Option<Duration>,
+    /// When set, output is streamed here and not captured in [`ProcessOutput`].
+    pub on_output: Option<OutputSink>,
+}
+
+impl std::fmt::Debug for ProcessSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessSpec")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("timeout", &self.timeout)
+            .field("streaming", &self.on_output.is_some())
+            .finish()
+    }
 }
 
 impl ProcessSpec {
@@ -98,6 +121,8 @@ impl ProcessSpec {
             program: program.into(),
             args: Vec::new(),
             cwd: cwd.into(),
+            timeout: None,
+            on_output: None,
         }
     }
 
@@ -107,31 +132,49 @@ impl ProcessSpec {
         self.args.push(argument.into());
         self
     }
+
+    /// Kills the process group if it runs longer than `timeout`.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Streams output to `sink` instead of capturing it.
+    #[must_use]
+    pub fn with_output_sink(mut self, sink: OutputSink) -> Self {
+        self.on_output = Some(sink);
+        self
+    }
 }
 
 /// Captured result of a managed process group.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessOutput {
-    /// Exit code, or `None` when the process terminated by signal.
+    /// Exit code, or `None` when the process terminated by signal or timed out.
     pub status_code: Option<i32>,
-    /// Complete captured stdout.
+    /// Whether the process group was killed because it exceeded its timeout.
+    pub timed_out: bool,
+    /// Complete captured stdout (empty when streaming).
     pub stdout: String,
-    /// Complete captured stderr.
+    /// Complete captured stderr (empty when streaming).
     pub stderr: String,
 }
 
-/// Runs one subprocess group and owns it until exit or cancellation.
+/// Runs one subprocess group and owns it until exit, timeout, or cancellation.
 ///
 /// The returned future does not choose an async executor. The process group is
 /// polled by a dedicated standard-library thread, and cancellation kills the
 /// group before the future resolves. Dropping the future also requests cancellation.
+/// A timeout kills the group too, but keeps the output produced so far and
+/// reports it through [`ProcessOutput::timed_out`].
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Execution`] when spawning or capturing output fails,
 /// [`ToolError::Cancelled`] when cancellation happens before spawn, and
-/// [`ToolError::UnknownOutcome`] when a running process group is terminated or
-/// its completion cannot be proven.
+/// [`ToolError::UnknownOutcome`] when a running process group is terminated by
+/// cancellation or its completion cannot be proven.
 pub fn run_process(
     spec: ProcessSpec,
     cancellation: CancellationToken,
@@ -140,11 +183,11 @@ pub fn run_process(
     let state = Arc::new(ProcessFutureState {
         done: AtomicBool::new(false),
         waker: Mutex::new(None),
-        cancellation: cancellation.clone(),
+        dropped: AtomicBool::new(false),
     });
     let thread_state = Arc::clone(&state);
     thread::spawn(move || {
-        let result = execute_process(spec, cancellation);
+        let result = execute_process(spec, &cancellation, &thread_state.dropped);
         let _ = sender.send(result);
         thread_state.done.store(true, Ordering::Release);
         if let Ok(mut waker) = thread_state.waker.lock()
@@ -159,7 +202,9 @@ pub fn run_process(
 struct ProcessFutureState {
     done: AtomicBool,
     waker: Mutex<Option<Waker>>,
-    cancellation: CancellationToken,
+    /// Set when the caller dropped the future. It ends this process group only:
+    /// the caller's cancellation token belongs to the whole run and must not be touched.
+    dropped: AtomicBool,
 }
 
 struct ProcessFuture {
@@ -169,7 +214,7 @@ struct ProcessFuture {
 
 impl Drop for ProcessFuture {
     fn drop(&mut self) {
-        self.state.cancellation.cancel();
+        self.state.dropped.store(true, Ordering::Release);
     }
 }
 
@@ -196,19 +241,22 @@ impl Future for ProcessFuture {
     }
 }
 
-// The worker owns both values so the caller can return immediately while the child is alive.
+// The worker owns the spec so the caller can return immediately while the child is alive.
 #[allow(clippy::needless_pass_by_value)]
 fn execute_process(
     spec: ProcessSpec,
-    cancellation: CancellationToken,
+    cancellation: &CancellationToken,
+    dropped: &AtomicBool,
 ) -> Result<ProcessOutput, ToolError> {
-    if cancellation.is_cancelled() {
+    let stop_requested = || cancellation.is_cancelled() || dropped.load(Ordering::Acquire);
+    if stop_requested() {
         return Err(ToolError::Cancelled);
     }
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
         .current_dir(&spec.cwd)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child: GroupChild = command
@@ -235,11 +283,15 @@ fn execute_process(
             message: "child stderr pipe was not available after spawn".to_owned(),
         });
     };
-    let stdout_reader = thread::spawn(move || read_pipe(&mut stdout));
-    let stderr_reader = thread::spawn(move || read_pipe(&mut stderr));
+    let stdout_sink = spec.on_output.clone();
+    let stderr_sink = spec.on_output.clone();
+    let stdout_reader = thread::spawn(move || read_pipe(&mut stdout, stdout_sink.as_ref()));
+    let stderr_reader = thread::spawn(move || read_pipe(&mut stderr, stderr_sink.as_ref()));
 
+    let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
+    let mut timed_out = false;
     let status = loop {
-        if cancellation.is_cancelled() {
+        if stop_requested() {
             let _ = child.kill();
             let _ = child.wait();
             discard_pipe(stdout_reader);
@@ -249,8 +301,13 @@ fn execute_process(
                 message: "process group was terminated before completion".to_owned(),
             });
         }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().ok();
+        }
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => thread::sleep(Duration::from_millis(10)),
             Err(error) => {
                 let _ = child.kill();
@@ -264,23 +321,49 @@ fn execute_process(
             }
         }
     };
+    // A background grandchild can keep the pipes open after the leader exits. Give the
+    // readers a short grace period, then end the whole group so they reach EOF.
+    let grace_deadline = Instant::now() + PIPE_DRAIN_GRACE;
+    while !(stdout_reader.is_finished() && stderr_reader.is_finished()) {
+        if Instant::now() >= grace_deadline {
+            let _ = child.kill();
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     let stdout = join_pipe(stdout_reader)?;
     let stderr = join_pipe(stderr_reader)?;
     Ok(ProcessOutput {
-        status_code: status.code(),
+        status_code: if timed_out {
+            None
+        } else {
+            status.and_then(|status| status.code())
+        },
+        timed_out,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
 }
 
-fn read_pipe(reader: &mut impl Read) -> Result<Vec<u8>, ToolError> {
-    let mut output = Vec::new();
-    reader
-        .read_to_end(&mut output)
-        .map_err(|error| ToolError::Execution {
-            message: format!("failed to read child output: {error}"),
-        })?;
-    Ok(output)
+/// Reads a pipe to its end, streaming chunks to `sink` or capturing them.
+fn read_pipe(reader: &mut impl Read, sink: Option<&OutputSink>) -> Result<Vec<u8>, ToolError> {
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(captured),
+            Ok(count) => match sink {
+                Some(sink) => sink(&buffer[..count]),
+                None => captured.extend_from_slice(&buffer[..count]),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(ToolError::Execution {
+                    message: format!("failed to read child output: {error}"),
+                });
+            }
+        }
+    }
 }
 
 fn join_pipe(reader: thread::JoinHandle<Result<Vec<u8>, ToolError>>) -> Result<Vec<u8>, ToolError> {
@@ -371,6 +454,107 @@ mod tests {
         canceller.join().expect("canceller thread");
 
         assert!(matches!(result, Err(ToolError::UnknownOutcome { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finishing_a_process_does_not_cancel_the_run_that_owns_the_token() {
+        let cancellation = CancellationToken::new();
+        let output = block_on(run_process(
+            ProcessSpec::new("true", "."),
+            cancellation.clone(),
+        ))
+        .expect("run");
+        assert_eq!(output.status_code, Some(0));
+        assert!(
+            !cancellation.is_cancelled(),
+            "the token is shared with the whole run and must survive one process"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_future_ends_the_process_group_without_cancelling_the_run() {
+        let cancellation = CancellationToken::new();
+        let marker = std::env::temp_dir().join(format!(
+            "nyan-drop-{}-{}",
+            std::process::id(),
+            nyan_coding_agent_core::now_ms()
+        ));
+        let script = format!("sleep 1; touch {}", marker.display());
+        let mut future = run_process(
+            ProcessSpec::new("sh", ".").arg("-c").arg(script),
+            cancellation.clone(),
+        );
+        // Poll once so the process starts, then abandon it.
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut future).poll(&mut context).is_pending());
+        drop(future);
+        thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "the abandoned command must not keep running"
+        );
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> ProcessSpec {
+        ProcessSpec::new("sh", ".").arg("-c").arg(script)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_kills_the_group_and_keeps_the_output_so_far() {
+        let started = std::time::Instant::now();
+        let output = block_on(run_process(
+            shell("echo before; sleep 30 & sleep 30").with_timeout(Duration::from_millis(300)),
+            CancellationToken::new(),
+        ))
+        .expect("timed out run");
+        assert!(output.timed_out);
+        assert_eq!(output.status_code, None);
+        assert_eq!(output.stdout, "before\n");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_grandchild_does_not_hold_the_result_hostage() {
+        let started = std::time::Instant::now();
+        let output = block_on(run_process(
+            shell("sleep 30 & echo done"),
+            CancellationToken::new(),
+        ))
+        .expect("run");
+        assert_eq!(output.stdout, "done\n");
+        assert_eq!(output.status_code, Some(0));
+        assert!(!output.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_output_arrives_in_chunks_and_is_not_captured() {
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: super::OutputSink = Arc::new(move |chunk| {
+            sink_seen
+                .lock()
+                .expect("sink lock")
+                .extend_from_slice(chunk);
+        });
+        let output = block_on(run_process(
+            shell("printf one; printf two >&2").with_output_sink(sink),
+            CancellationToken::new(),
+        ))
+        .expect("run");
+        assert_eq!((output.stdout.as_str(), output.stderr.as_str()), ("", ""));
+        let mut bytes = seen.lock().expect("seen lock").clone();
+        bytes.sort_unstable();
+        let mut expected = b"onetwo".to_vec();
+        expected.sort_unstable();
+        assert_eq!(bytes, expected);
     }
 
     fn block_on<F: Future>(future: F) -> F::Output {

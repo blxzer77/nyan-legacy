@@ -36,6 +36,8 @@ pub struct Truncation {
     pub output_lines: usize,
     /// Bytes in the kept content.
     pub output_bytes: usize,
+    /// Whether the last line was cut to fit (tail truncation only).
+    pub last_line_partial: bool,
     /// Whether the first line alone exceeds the byte limit (head truncation).
     pub first_line_exceeds_limit: bool,
 }
@@ -80,6 +82,7 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
             total_bytes,
             output_lines: total_lines,
             output_bytes: total_bytes,
+            last_line_partial: false,
             first_line_exceeds_limit: false,
         };
     }
@@ -92,6 +95,7 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
             total_bytes,
             output_lines: 0,
             output_bytes: 0,
+            last_line_partial: false,
             first_line_exceeds_limit: true,
         };
     }
@@ -119,13 +123,114 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         truncated_by: Some(truncated_by),
         total_lines,
         total_bytes,
+        last_line_partial: false,
+        first_line_exceeds_limit: false,
+    }
+}
+
+/// Keeps the last `max_bytes` of `line`, starting on a character boundary.
+fn tail_of_line(line: &str, max_bytes: usize) -> &str {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    let mut start = line.len() - max_bytes;
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    &line[start..]
+}
+
+/// Keeps the last lines and bytes of `content`.
+///
+/// Suited to command output, where the end holds the errors and final results.
+/// When the last line alone exceeds the byte limit, its tail is returned and
+/// [`Truncation::last_line_partial`] is set.
+#[must_use]
+pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Truncation {
+    let total_bytes = content.len();
+    let lines = lines_for_counting(content);
+    let total_lines = lines.len();
+    if total_lines <= max_lines && total_bytes <= max_bytes {
+        return Truncation {
+            content: content.to_owned(),
+            truncated: false,
+            truncated_by: None,
+            total_lines,
+            total_bytes,
+            output_lines: total_lines,
+            output_bytes: total_bytes,
+            last_line_partial: false,
+            first_line_exceeds_limit: false,
+        };
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut kept_bytes = 0;
+    let mut truncated_by = TruncatedBy::Lines;
+    let mut last_line_partial = false;
+    for line in lines.iter().rev() {
+        if kept.len() >= max_lines {
+            break;
+        }
+        let line_bytes = line.len() + usize::from(!kept.is_empty());
+        if kept_bytes + line_bytes > max_bytes {
+            truncated_by = TruncatedBy::Bytes;
+            if kept.is_empty() {
+                let partial = tail_of_line(line, max_bytes);
+                kept.push(partial);
+                kept_bytes = partial.len();
+                last_line_partial = true;
+            }
+            break;
+        }
+        kept.push(line);
+        kept_bytes += line_bytes;
+    }
+    if kept.len() >= max_lines && kept_bytes <= max_bytes {
+        truncated_by = TruncatedBy::Lines;
+    }
+    kept.reverse();
+    let content = kept.join("\n");
+    Truncation {
+        output_bytes: content.len(),
+        output_lines: kept.len(),
+        content,
+        truncated: true,
+        truncated_by: Some(truncated_by),
+        total_lines,
+        total_bytes,
+        last_line_partial,
         first_line_exceeds_limit: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TruncatedBy, format_size, truncate_head};
+    use super::{TruncatedBy, format_size, truncate_head, truncate_tail};
+
+    #[test]
+    fn tail_truncation_keeps_the_last_lines() {
+        let result = truncate_tail("1\n2\n3\n4\n5", 2, 1000);
+        assert_eq!(result.content, "4\n5");
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
+        assert_eq!((result.total_lines, result.output_lines), (5, 2));
+        assert!(!result.last_line_partial);
+    }
+
+    #[test]
+    fn tail_truncation_by_bytes_never_splits_a_line() {
+        let result = truncate_tail("aaaa\nbbbb\ncccc", 100, 9);
+        assert_eq!(result.content, "bbbb\ncccc");
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+    }
+
+    #[test]
+    fn a_last_line_over_the_byte_limit_is_cut_on_a_character_boundary() {
+        let result = truncate_tail("short\n\u{4e16}\u{754c}\u{4e16}\u{754c}", 100, 7);
+        assert!(result.last_line_partial);
+        assert_eq!(result.content, "\u{4e16}\u{754c}");
+        assert!(result.content.len() <= 7);
+        assert_eq!(result.output_lines, 1);
+    }
 
     #[test]
     fn content_within_both_limits_is_untouched() {

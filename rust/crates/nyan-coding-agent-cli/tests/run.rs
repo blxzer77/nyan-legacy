@@ -397,9 +397,9 @@ fn a_tool_call_changes_the_workspace_and_its_result_reaches_the_next_request() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().expect("name"))
         .collect();
-    assert_eq!(declared, ["read", "write", "edit", "ls"]);
+    assert_eq!(declared, ["read", "bash", "edit", "write"]);
     assert_eq!(
-        first_body["tools"][1]["function"]["parameters"]["required"][1],
+        first_body["tools"][3]["function"]["parameters"]["required"][1],
         "content"
     );
 
@@ -425,5 +425,50 @@ fn a_tool_call_changes_the_workspace_and_its_result_reaches_the_next_request() {
         .collect();
     assert!(types.iter().any(|kind| kind == "tool_execution_start"));
     assert!(types.iter().any(|kind| kind == "tool_execution_end"));
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bash_tool_call_runs_in_the_workspace_and_a_failure_is_reported_back_to_the_model() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let workspace =
+        std::env::temp_dir().join(format!("nyan-e2e-bash-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+
+    let runtime = Runtime::new().expect("runtime");
+    let tool_turn = sse_body(&[
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"name":"bash","arguments":"{\"command\":\"echo made > made.txt; cat missing.txt\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]);
+    let (address, requests) = serve_many(
+        &runtime,
+        vec![("200 OK", tool_turn), ("200 OK", answer_body())],
+    );
+    let outcome = execute_in(
+        &["-p", "--model", "openai/m", "run it"],
+        &format!("http://{address}/v1"),
+        Some("k"),
+        false,
+        workspace.clone(),
+    );
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, "Hello\n");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("made.txt")).expect("command wrote the file"),
+        "made\n"
+    );
+    let second = requests[1].lock().expect("lock").clone();
+    let body: serde_json::Value =
+        serde_json::from_str(second.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    let result = body["messages"][2]["content"]
+        .as_str()
+        .expect("tool result text");
+    assert!(result.contains("missing.txt"), "{result}");
+    assert!(result.ends_with("Command exited with code 1"), "{result}");
     let _ = std::fs::remove_dir_all(workspace);
 }

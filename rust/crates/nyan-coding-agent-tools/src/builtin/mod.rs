@@ -5,6 +5,7 @@
 //! message. File tools run their blocking work inline; they are short, and the
 //! runtime serializes polling of one thread anyway.
 
+mod bash;
 mod edit;
 mod ls;
 pub mod paths;
@@ -141,6 +142,19 @@ impl std::fmt::Debug for BuiltinTools {
 }
 
 impl BuiltinTools {
+    /// The default coding tools, in the TypeScript order: `read`, `bash`, `edit`, `write`.
+    #[must_use]
+    pub fn coding_tools() -> Self {
+        Self {
+            tools: vec![
+                Box::new(read::tool()),
+                Box::new(bash::BashTool),
+                Box::new(edit::tool()),
+                Box::new(write::tool()),
+            ],
+        }
+    }
+
     /// The file tools: `read`, `write`, `edit`, and `ls`.
     #[must_use]
     pub fn file_tools() -> Self {

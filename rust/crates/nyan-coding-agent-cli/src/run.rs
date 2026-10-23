@@ -68,7 +68,7 @@ fn help_text() -> String {
          Rust Coding Agent preview. It is not a usable replacement yet.\n\n\
          Protocol contracts frozen: {} RPC commands, {} session events.\n\n\
          Supported now: --print and --mode json with --provider openai and the\
-         read, write, edit, and ls tools.\n\n\
+         read, bash, edit, and write tools.\n\n\
          Options:\n  -h, --help       Show this help\n  -v, --version    Show the version\n",
         RpcCommandName::all().len(),
         SessionEventName::all().len()
@@ -251,7 +251,7 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
             model,
         },
         &providers,
-        &BuiltinTools::file_tools(),
+        &BuiltinTools::coding_tools(),
         out.clone(),
         err.clone(),
     ))
