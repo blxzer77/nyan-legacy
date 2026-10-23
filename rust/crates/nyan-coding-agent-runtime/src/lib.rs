@@ -681,6 +681,7 @@ impl<'a> AgentRuntime<'a> {
                     .map(|definition| ToolSpec {
                         name: definition.name,
                         description: definition.description,
+                        parameters_schema: definition.parameters_schema,
                     })
                     .collect(),
                 cancellation: self.cancellation.clone(),
@@ -1335,6 +1336,7 @@ mod tests {
             ToolDefinition {
                 name: "echo".to_owned(),
                 description: "Echo input".to_owned(),
+                parameters_schema: String::new(),
             }
         }
 
@@ -1377,6 +1379,7 @@ mod tests {
             ToolDefinition {
                 name: "cancel".to_owned(),
                 description: "Cancel the owning run".to_owned(),
+                parameters_schema: String::new(),
             }
         }
 
@@ -1411,6 +1414,7 @@ mod tests {
             ToolDefinition {
                 name: "uncertain".to_owned(),
                 description: "An effect with an unknown outcome".to_owned(),
+                parameters_schema: String::new(),
             }
         }
 

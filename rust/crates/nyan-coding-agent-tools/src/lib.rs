@@ -1,5 +1,7 @@
 //! Tool registration, execution, and direct subprocess boundaries.
 
+pub mod builtin;
+
 use std::future::Future;
 use std::io::Read;
 use std::path::PathBuf;
@@ -24,6 +26,8 @@ pub struct ToolDefinition {
     pub name: String,
     /// Model-facing description.
     pub description: String,
+    /// JSON Schema of the arguments, as JSON text. Empty means an object with no properties.
+    pub parameters_schema: String,
 }
 
 /// Errors from tool admission or execution.
@@ -329,6 +333,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "read".to_owned(),
             description: "Read a file".to_owned(),
+            parameters_schema: String::new(),
         };
         assert_eq!(definition.name, "read");
     }

@@ -99,6 +99,9 @@ fn request(cancellation: CancellationToken) -> ProviderRequest {
         tools: vec![ToolSpec {
             name: "echo".to_owned(),
             description: "Echo input".to_owned(),
+            parameters_schema:
+                r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#
+                    .to_owned(),
         }],
         cancellation,
     }
@@ -177,6 +180,10 @@ fn text_arrives_incrementally_and_the_request_is_well_formed() {
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["messages"][0]["content"], "hello");
     assert_eq!(body["tools"][0]["function"]["name"], "echo");
+    assert_eq!(
+        body["tools"][0]["function"]["parameters"]["required"][0], "text",
+        "the declared argument schema reaches the provider"
+    );
 }
 
 #[test]

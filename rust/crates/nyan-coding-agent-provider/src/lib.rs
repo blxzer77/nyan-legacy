@@ -21,16 +21,14 @@ impl From<ProviderModel> for ModelRef {
 }
 
 /// A tool the model may call.
-///
-/// Parity gap: only the name and description are declared. The JSON schema of
-/// the arguments is not carried yet, which providers treat as an object with no
-/// declared properties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolSpec {
     /// Stable tool name.
     pub name: String,
     /// Model-facing description.
     pub description: String,
+    /// JSON Schema of the arguments, as JSON text. Empty means an object with no properties.
+    pub parameters_schema: String,
 }
 
 /// A provider-neutral request.

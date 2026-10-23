@@ -643,6 +643,7 @@ version = "0.1.0"
 dependencies = [
  "command-group",
  "nyan-coding-agent-core",
+ "serde_json",
 ]
 
 [[package]]

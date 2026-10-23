@@ -10,7 +10,7 @@ use nyan_coding_agent_core::{CoreError, VERSION};
 use nyan_coding_agent_protocol::{RpcCommandName, SessionEventName};
 use nyan_coding_agent_provider::{ModelProvider, ProviderModel, ProviderRegistry};
 use nyan_coding_agent_provider_http::OpenAiChatProvider;
-use nyan_coding_agent_tools::{Tool, ToolDefinition, ToolRegistry};
+use nyan_coding_agent_tools::builtin::BuiltinTools;
 
 use crate::app_mode::{AppMode, resolve_app_mode};
 use crate::args::{Args, DiagnosticKind, parse_args};
@@ -62,24 +62,13 @@ impl ProviderRegistry for OneProvider {
     }
 }
 
-struct NoTools;
-
-impl ToolRegistry for NoTools {
-    fn tool(&self, _name: &str) -> Option<&dyn Tool> {
-        None
-    }
-
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        Vec::new()
-    }
-}
-
 fn help_text() -> String {
     format!(
         "nyan-coding-agent {VERSION}\n\n\
          Rust Coding Agent preview. It is not a usable replacement yet.\n\n\
          Protocol contracts frozen: {} RPC commands, {} session events.\n\n\
-         Supported now: --print and --mode json with --provider openai.\n\n\
+         Supported now: --print and --mode json with --provider openai and the\
+         read, write, edit, and ls tools.\n\n\
          Options:\n  -h, --help       Show this help\n  -v, --version    Show the version\n",
         RpcCommandName::all().len(),
         SessionEventName::all().len()
@@ -262,7 +251,7 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
             model,
         },
         &providers,
-        &NoTools,
+        &BuiltinTools::file_tools(),
         out.clone(),
         err.clone(),
     ))

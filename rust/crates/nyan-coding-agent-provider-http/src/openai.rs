@@ -187,12 +187,16 @@ pub fn build_request_body(request: &ProviderRequest) -> Value {
 }
 
 fn wire_tool(tool: &ToolSpec) -> Value {
+    let parameters = serde_json::from_str::<Value>(&tool.parameters_schema)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
     json!({
         "type": "function",
         "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": parameters,
         },
     })
 }

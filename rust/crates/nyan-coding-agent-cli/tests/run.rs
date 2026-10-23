@@ -36,6 +36,16 @@ struct Outcome {
 }
 
 fn execute(argv: &[&str], base_url: &str, key: Option<&str>, tty: bool) -> Outcome {
+    execute_in(argv, base_url, key, tty, PathBuf::from("/tmp/project"))
+}
+
+fn execute_in(
+    argv: &[&str],
+    base_url: &str,
+    key: Option<&str>,
+    tty: bool,
+    cwd: PathBuf,
+) -> Outcome {
     let out_bytes = Arc::new(Mutex::new(Vec::new()));
     let err_bytes = Arc::new(Mutex::new(Vec::new()));
     let out: SharedWriter = Arc::new(Mutex::new(Capture(Arc::clone(&out_bytes))));
@@ -45,7 +55,7 @@ fn execute(argv: &[&str], base_url: &str, key: Option<&str>, tty: bool) -> Outco
         var: Box::new(move |name| (name == "OPENAI_API_KEY").then(|| key.clone()).flatten()),
         stdin_is_tty: tty,
         stdout_is_tty: tty,
-        cwd: PathBuf::from("/tmp/project"),
+        cwd,
         openai_base_url: base_url.to_owned(),
     };
     let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
@@ -67,46 +77,61 @@ fn serve(
     status: &'static str,
     body: String,
 ) -> (SocketAddr, Arc<Mutex<String>>) {
+    let (address, mut captured) = serve_many(runtime, vec![(status, body)]);
+    (address, captured.remove(0))
+}
+
+/// Answers one request per scripted response, in order, and returns each
+/// request it received.
+fn serve_many(
+    runtime: &Runtime,
+    responses: Vec<(&'static str, String)>,
+) -> (SocketAddr, Vec<Arc<Mutex<String>>>) {
     let listener = runtime
         .block_on(TcpListener::bind("127.0.0.1:0"))
         .expect("bind loopback");
     let address = listener.local_addr().expect("address");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&captured);
+    let captured: Vec<Arc<Mutex<String>>> = responses
+        .iter()
+        .map(|_| Arc::new(Mutex::new(String::new())))
+        .collect();
+    let sinks = captured.clone();
     runtime.spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let mut received = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let read = socket.read(&mut buffer).await.unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            received.extend_from_slice(&buffer[..read]);
-            let text = String::from_utf8_lossy(&received).into_owned();
-            if let Some(end) = text.find("\r\n\r\n") {
-                let length = text
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                if received.len() >= end + 4 + length {
+        for ((status, body), sink) in responses.into_iter().zip(sinks) {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                if read == 0 {
                     break;
                 }
+                received.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&received).into_owned();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if received.len() >= end + 4 + length {
+                        break;
+                    }
+                }
             }
+            *sink.lock().expect("captured lock") = String::from_utf8_lossy(&received).into_owned();
+            let head = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.flush().await;
         }
-        *sink.lock().expect("captured lock") = String::from_utf8_lossy(&received).into_owned();
-        let head = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
-        );
-        let _ = socket.write_all(head.as_bytes()).await;
-        let _ = socket.write_all(body.as_bytes()).await;
-        let _ = socket.flush().await;
     });
     (address, captured)
 }
@@ -319,4 +344,86 @@ fn version_help_and_parse_errors_do_not_need_a_provider() {
             .stderr
             .starts_with("Warning: Invalid thinking level \"ultra\"")
     );
+}
+
+fn sse_body(chunks: &[&str]) -> String {
+    let mut body = String::new();
+    for data in chunks {
+        body.push_str("data: ");
+        body.push_str(data);
+        body.push_str("\n\n");
+    }
+    body
+}
+
+#[test]
+fn a_tool_call_changes_the_workspace_and_its_result_reaches_the_next_request() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let workspace = std::env::temp_dir().join(format!("nyan-e2e-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+
+    let runtime = Runtime::new().expect("runtime");
+    let tool_turn = sse_body(&[
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_w","function":{"name":"write","arguments":"{\"path\":\"out/hello.txt\",\"content\":\"hi there\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]);
+    let (address, requests) = serve_many(
+        &runtime,
+        vec![("200 OK", tool_turn), ("200 OK", answer_body())],
+    );
+    let outcome = execute_in(
+        &["--mode", "json", "--model", "openai/m", "create the file"],
+        &format!("http://{address}/v1"),
+        Some("k"),
+        true,
+        workspace.clone(),
+    );
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("out/hello.txt")).expect("tool wrote the file"),
+        "hi there"
+    );
+
+    let first = requests[0].lock().expect("lock").clone();
+    let first_body: serde_json::Value =
+        serde_json::from_str(first.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    let declared: Vec<&str> = first_body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(declared, ["read", "write", "edit", "ls"]);
+    assert_eq!(
+        first_body["tools"][1]["function"]["parameters"]["required"][1],
+        "content"
+    );
+
+    let second = requests[1].lock().expect("lock").clone();
+    let second_body: serde_json::Value =
+        serde_json::from_str(second.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    let messages = second_body["messages"].as_array().expect("messages");
+    let assistant = &messages[1];
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_w");
+    assert_eq!(assistant["tool_calls"][0]["function"]["name"], "write");
+    let result = &messages[2];
+    assert_eq!(result["role"], "tool");
+    assert_eq!(result["tool_call_id"], "call_w");
+    assert_eq!(result["content"], "Successfully wrote to out/hello.txt");
+
+    let types: Vec<String> = outcome
+        .stdout
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).expect("jsonl");
+            value["type"].as_str().expect("type").to_owned()
+        })
+        .collect();
+    assert!(types.iter().any(|kind| kind == "tool_execution_start"));
+    assert!(types.iter().any(|kind| kind == "tool_execution_end"));
+    let _ = std::fs::remove_dir_all(workspace);
 }

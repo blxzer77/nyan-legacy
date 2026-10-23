@@ -41,8 +41,9 @@ Windows machine; the Linux host cannot execute the Windows Job Object path.
 
 `nyan-coding-agent-provider-http` (reqwest with rustls on tokio, Decision #47)
 cannot be cross-checked for Windows from a Linux host without a mingw C
-compiler, because the rustls crypto provider compiles C code. Exclude it from
-the local Windows cross-check with `--workspace --exclude
-nyan-coding-agent-provider-http`; the Windows runner builds and tests it.
+compiler, because the rustls crypto provider compiles C code. Exclude it, and the CLI crate that depends
+on it, from the local Windows cross-check with `--workspace --exclude
+nyan-coding-agent-provider-http --exclude nyan-coding-agent-cli`; the Windows
+runner builds and tests both.
 That Windows build has not run yet, so it is unverified until the workflow
 runs on GitHub.
