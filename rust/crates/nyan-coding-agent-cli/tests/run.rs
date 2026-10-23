@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use nyan_coding_agent_cli::headless::SharedWriter;
 use nyan_coding_agent_cli::run::{Environment, run};
+use nyan_coding_agent_cli::session_setup::SESSION_STORE_DIR;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -720,7 +721,7 @@ fn a_saved_session_is_continued_with_its_history_and_no_session_saves_nothing() 
 
     let (first, _) = run_once(&["-p", "--model", "openai/m", "my name is Ada"]);
     assert_eq!(first.code, 0, "{}", first.stderr);
-    assert!(agent.join("sessions-rust").is_dir(), "the run was saved");
+    assert!(agent.join(SESSION_STORE_DIR).is_dir(), "the run was saved");
 
     let (second, captured) = run_once(&["-p", "--model", "openai/m", "--continue", "who am I?"]);
     assert_eq!(second.code, 0, "{}", second.stderr);
@@ -755,7 +756,7 @@ fn a_saved_session_is_continued_with_its_history_and_no_session_saves_nothing() 
     );
     assert_eq!(ephemeral.code, 0, "{}", ephemeral.stderr);
     assert!(
-        !throwaway.join("sessions-rust").exists(),
+        !throwaway.join(SESSION_STORE_DIR).exists(),
         "--no-session writes nothing"
     );
     for directory in [agent, cwd, throwaway] {
@@ -791,7 +792,7 @@ fn a_session_whose_previous_run_never_finished_is_refused_not_continued() {
             &agent,
         );
         assert_eq!(seed.code, 0, "{}", seed.stderr);
-        let store_root = std::fs::read_dir(agent.join("sessions-rust"))
+        let store_root = std::fs::read_dir(agent.join(SESSION_STORE_DIR))
             .expect("store")
             .next()
             .expect("one directory per working directory")
@@ -859,7 +860,7 @@ fn a_session_held_by_another_process_exits_one_before_any_request() {
         &agent,
     );
     assert_eq!(seed.code, 0, "{}", seed.stderr);
-    let store_root = std::fs::read_dir(agent.join("sessions-rust"))
+    let store_root = std::fs::read_dir(agent.join(SESSION_STORE_DIR))
         .expect("store")
         .next()
         .expect("directory")
@@ -944,7 +945,7 @@ fn a_missing_file_argument_fails_before_any_request_or_session() {
         )
     );
     assert!(
-        !agent.join("sessions-rust").exists(),
+        !agent.join(SESSION_STORE_DIR).exists(),
         "no session was created"
     );
     for directory in [agent, cwd] {

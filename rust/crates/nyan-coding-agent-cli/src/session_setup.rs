@@ -7,9 +7,12 @@
 //! `--session` takes an exact id or a unique prefix; `--session-dir` moves the
 //! store. Each working directory has its own store, named by a hash of the path.
 //!
-//! The Rust preview keeps its own store, `sessions-rust` under the agent
-//! directory, in the Rust-native format. It neither reads nor writes the
-//! TypeScript durable store (`sessions-durable`) or the legacy JSONL tree.
+//! Sessions live in `sessions-journal` under the agent directory, in the
+//! Rust-native format. The directory is named for the storage design (an
+//! append-only journal), the way `sessions` (JSONL) and `sessions-durable`
+//! (SQLite) are, and carries neither the implementation language nor a format
+//! version: the version is in each file's header, so a format change migrates
+//! inside the directory. The code neither reads nor writes the other two trees.
 //! `--resume` (a picker) and `--fork` are not implemented and are refused.
 
 use std::path::{Path, PathBuf};
@@ -21,6 +24,9 @@ use nyan_coding_agent_session::{
 
 use crate::args::{Args, normalize_session_name};
 use crate::headless::new_session_id;
+
+/// The directory under the agent directory that holds Rust-native sessions.
+pub const SESSION_STORE_DIR: &str = "sessions-journal";
 
 /// FNV-1a over the path bytes: stable across platforms and releases, which a
 /// directory name must be.
@@ -98,7 +104,7 @@ pub fn open_session(args: &Args, agent_dir: &Path, cwd: &Path) -> Result<NativeS
     let base = args
         .session_dir
         .as_deref()
-        .map_or_else(|| agent_dir.join("sessions-rust"), PathBuf::from);
+        .map_or_else(|| agent_dir.join(SESSION_STORE_DIR), PathBuf::from);
     let root = base.join(cwd_hash(cwd));
     let store = FileSessionStore::new(&root);
     let known = store
@@ -213,7 +219,7 @@ mod tests {
         let cwd = root.join("project");
         let mut saved = open(&[], &agent, &cwd).expect("open");
         say(&mut saved, "kept");
-        assert!(agent.join("sessions-rust").is_dir());
+        assert!(agent.join(super::SESSION_STORE_DIR).is_dir());
         drop(saved);
 
         let other_agent = root.join("agent2");
