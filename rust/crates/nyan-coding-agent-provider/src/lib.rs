@@ -72,6 +72,8 @@ pub enum ProviderStopReason {
     Stop,
     /// The assistant requested one or more tools.
     ToolUse,
+    /// The response was cut off by the output token limit.
+    Length,
     /// The provider failed after producing a response.
     Error {
         /// Provider diagnostic.

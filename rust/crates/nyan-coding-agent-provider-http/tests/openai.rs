@@ -180,6 +180,31 @@ fn text_arrives_incrementally_and_the_request_is_well_formed() {
 }
 
 #[test]
+fn a_length_finish_is_not_reported_as_a_clean_stop() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve(
+        &runtime,
+        "200 OK",
+        vec![
+            (
+                0,
+                sse(r#"{"choices":[{"delta":{"content":"cut"},"finish_reason":"length"}]}"#),
+            ),
+            (0, sse("[DONE]")),
+        ],
+        false,
+    );
+    let stream = open(&runtime, &provider(&runtime, &server)).expect("open stream");
+    let events = drain(&runtime, stream).expect("drain");
+    assert_eq!(
+        events.last(),
+        Some(&ProviderStreamEvent::Finished {
+            reason: ProviderStopReason::Length
+        })
+    );
+}
+
+#[test]
 fn usage_is_reported_before_the_terminal_event() {
     let runtime = Runtime::new().expect("runtime");
     let server = serve(

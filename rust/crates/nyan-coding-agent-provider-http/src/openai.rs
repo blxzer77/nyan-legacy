@@ -335,6 +335,7 @@ impl Accumulator {
             Some("content_filter") => ProviderStopReason::Error {
                 message: "the response was stopped by the provider's content filter".to_owned(),
             },
+            Some("length") => ProviderStopReason::Length,
             _ if has_calls => ProviderStopReason::ToolUse,
             _ => ProviderStopReason::Stop,
         };

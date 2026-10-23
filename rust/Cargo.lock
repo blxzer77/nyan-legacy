@@ -581,6 +581,12 @@ version = "0.1.0"
 dependencies = [
  "nyan-coding-agent-core",
  "nyan-coding-agent-protocol",
+ "nyan-coding-agent-provider",
+ "nyan-coding-agent-provider-http",
+ "nyan-coding-agent-runtime",
+ "nyan-coding-agent-tools",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

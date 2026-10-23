@@ -537,6 +537,7 @@ fn record_stop_reason(assistant: &mut Message, reason: &ProviderStopReason) {
     match reason {
         ProviderStopReason::Stop => assistant.stop_reason = Some(StopReason::Stop),
         ProviderStopReason::ToolUse => assistant.stop_reason = Some(StopReason::ToolUse),
+        ProviderStopReason::Length => assistant.stop_reason = Some(StopReason::Length),
         ProviderStopReason::Aborted => assistant.stop_reason = Some(StopReason::Aborted),
         ProviderStopReason::Error { message } => {
             assistant.stop_reason = Some(StopReason::Error);
@@ -646,9 +647,9 @@ impl<'a> AgentRuntime<'a> {
                         code: "provider",
                         message,
                     },
-                    ProviderStopReason::Stop | ProviderStopReason::ToolUse => {
-                        AgentOutcome::Completed
-                    }
+                    ProviderStopReason::Stop
+                    | ProviderStopReason::ToolUse
+                    | ProviderStopReason::Length => AgentOutcome::Completed,
                 });
             }
 

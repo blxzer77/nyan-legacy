@@ -16,6 +16,15 @@ path = "src/main.rs"
 [dependencies]
 nyan-coding-agent-core = { path = "../nyan-coding-agent-core" }
 nyan-coding-agent-protocol = { path = "../nyan-coding-agent-protocol" }
+nyan-coding-agent-provider = { path = "../nyan-coding-agent-provider" }
+nyan-coding-agent-provider-http = { path = "../nyan-coding-agent-provider-http" }
+nyan-coding-agent-runtime = { path = "../nyan-coding-agent-runtime" }
+nyan-coding-agent-tools = { path = "../nyan-coding-agent-tools" }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "time", "net"] }
+
+[dev-dependencies]
+serde_json = "=1.0.154"
+tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "time", "net", "io-util"] }
 
 [lints]
 workspace = true
