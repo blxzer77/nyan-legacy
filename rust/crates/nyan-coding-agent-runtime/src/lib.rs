@@ -20,6 +20,7 @@ use nyan_coding_agent_provider::{
     ProviderError, ProviderModel, ProviderRegistry, ProviderRequest, ProviderStopReason,
     ProviderStreamEvent,
 };
+use nyan_coding_agent_session::{NativeSession, SessionRecordKind, SessionStoreError};
 use nyan_coding_agent_tools::{ToolError, ToolRegistry};
 
 /// Events emitted in deterministic order by one agent run.
@@ -354,6 +355,136 @@ impl Future for JoinToolFutures {
         } else {
             Poll::Pending
         }
+    }
+}
+
+/// Event sink that commits every finished message to a Rust-native session
+/// journal before forwarding the event.
+///
+/// The first persistence failure is retained and later events are still
+/// forwarded, so the caller can report the run outcome and the persistence
+/// failure together instead of silently losing either.
+pub struct SessionRecorder {
+    session: Arc<Mutex<NativeSession>>,
+    inner: Arc<dyn EventSink>,
+    failure: Mutex<Option<SessionStoreError>>,
+}
+
+impl std::fmt::Debug for SessionRecorder {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionRecorder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionRecorder {
+    /// Creates a recorder over a shared session and a downstream sink.
+    #[must_use]
+    pub fn new(session: Arc<Mutex<NativeSession>>, inner: Arc<dyn EventSink>) -> Self {
+        Self {
+            session,
+            inner,
+            failure: Mutex::new(None),
+        }
+    }
+
+    /// Takes the first persistence failure, if any.
+    #[must_use]
+    pub fn take_failure(&self) -> Option<SessionStoreError> {
+        self.failure
+            .lock()
+            .ok()
+            .and_then(|mut failure| failure.take())
+    }
+}
+
+impl EventSink for SessionRecorder {
+    fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::MessageEnd { message } = &event {
+            let kind = match message.role {
+                MessageRole::System => SessionRecordKind::Metadata,
+                MessageRole::User => SessionRecordKind::UserMessage,
+                MessageRole::Assistant => SessionRecordKind::AssistantMessage,
+                MessageRole::Tool => SessionRecordKind::ToolResult,
+            };
+            let result = match self.session.lock() {
+                Ok(mut session) => session.append_message(kind, message.clone()).map(|_| ()),
+                Err(_) => Err(SessionStoreError::Io {
+                    operation: "lock session recorder".to_owned(),
+                    message: "session mutex was poisoned".to_owned(),
+                }),
+            };
+            if let Err(error) = result
+                && let Ok(mut failure) = self.failure.lock()
+                && failure.is_none()
+            {
+                *failure = Some(error);
+            }
+        }
+        self.inner.emit(event);
+    }
+}
+
+/// Result of a run whose messages were committed to a session journal.
+#[derive(Debug)]
+pub struct PersistentRunResult {
+    /// The runtime result.
+    pub run: AgentRunResult,
+    /// The first persistence failure observed during the run, if any.
+    pub persistence_error: Option<SessionStoreError>,
+}
+
+impl AgentRuntime<'_> {
+    /// Runs one prompt against a persistent session.
+    ///
+    /// The runtime context is replaced by the session's committed transcript
+    /// before the run. A run-start marker is committed before any provider
+    /// request, every finished message is committed as it ends, and a
+    /// run-finish marker records the terminal outcome. A session that still has
+    /// an incomplete run from an earlier process is refused, because the owner
+    /// must decide how to settle that unknown outcome first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the session cannot admit the run or the
+    /// run-start marker cannot be committed.
+    pub async fn run_persistent(
+        &mut self,
+        session: Arc<Mutex<NativeSession>>,
+        prompt: Message,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<PersistentRunResult, SessionStoreError> {
+        {
+            let mut guard = session.lock().map_err(|_| SessionStoreError::Io {
+                operation: "lock session".to_owned(),
+                message: "session mutex was poisoned".to_owned(),
+            })?;
+            guard.begin_run(Vec::new())?;
+            self.context = AgentContext {
+                messages: guard.messages().to_vec(),
+            };
+        }
+        let recorder = Arc::new(SessionRecorder::new(Arc::clone(&session), sink));
+        let run = self.run(prompt, recorder.clone()).await;
+        let finish_payload = match &run.outcome {
+            AgentOutcome::Completed => b"completed".to_vec(),
+            AgentOutcome::Aborted => b"aborted".to_vec(),
+            AgentOutcome::Unknown { .. } => b"unknown".to_vec(),
+            AgentOutcome::Failed { code, .. } => format!("failed:{code}").into_bytes(),
+        };
+        let finish_error = session
+            .lock()
+            .map_err(|_| SessionStoreError::Io {
+                operation: "lock session".to_owned(),
+                message: "session mutex was poisoned".to_owned(),
+            })
+            .and_then(|mut guard| guard.finish_run(finish_payload))
+            .err();
+        Ok(PersistentRunResult {
+            run,
+            persistence_error: recorder.take_failure().or(finish_error),
+        })
     }
 }
 
@@ -1251,6 +1382,150 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { .. }))
         );
+    }
+
+    fn persistent_root(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nyan-runtime-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn persistent_request(root: &std::path::Path) -> nyan_coding_agent_session::SessionOpenRequest {
+        nyan_coding_agent_session::SessionOpenRequest {
+            descriptor: nyan_coding_agent_session::SessionDescriptor::persistent(
+                nyan_coding_agent_core::SessionId::new("persisted").expect("session id"),
+                "/tmp/project",
+            ),
+            mode: nyan_coding_agent_core::AgentMode::Print,
+            storage_root: Some(root.to_owned()),
+        }
+    }
+
+    #[test]
+    fn persistent_run_commits_messages_and_continues_after_reopen() {
+        let root = persistent_root("continue");
+        let store = nyan_coding_agent_session::FileSessionStore::new(&root);
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::from([
+                    vec![
+                        ProviderStreamEvent::TextDelta {
+                            text: "first answer".to_owned(),
+                        },
+                        ProviderStreamEvent::Finished {
+                            reason: ProviderStopReason::Stop,
+                        },
+                    ],
+                    vec![
+                        ProviderStreamEvent::TextDelta {
+                            text: "second answer".to_owned(),
+                        },
+                        ProviderStreamEvent::Finished {
+                            reason: ProviderStopReason::Stop,
+                        },
+                    ],
+                ])),
+                failures: Mutex::new(0),
+            },
+        };
+        let tools = Tools { echo: EchoTool };
+        let config = RuntimeConfig::new(
+            ProviderModel {
+                provider: "fake".to_owned(),
+                model: "test".to_owned(),
+            },
+            "/tmp/project",
+        );
+
+        let session = std::sync::Arc::new(Mutex::new(
+            nyan_coding_agent_session::NativeSession::open(&store, persistent_request(&root))
+                .expect("open session"),
+        ));
+        let mut runtime = AgentRuntime::new(&providers, &tools, config.clone());
+        let first = block_on(runtime.run_persistent(
+            session.clone(),
+            Message::text(MessageRole::User, "hello"),
+            Arc::new(EventLog::default()),
+        ))
+        .expect("first run");
+        assert_eq!(first.run.outcome, AgentOutcome::Completed);
+        assert!(first.persistence_error.is_none());
+        drop(runtime);
+        drop(session);
+
+        let reopened = std::sync::Arc::new(Mutex::new(
+            nyan_coding_agent_session::NativeSession::open(&store, persistent_request(&root))
+                .expect("reopen session"),
+        ));
+        {
+            let guard = reopened.lock().expect("session lock");
+            assert!(!guard.has_incomplete_run());
+            assert_eq!(guard.messages().len(), 2);
+            assert_eq!(guard.messages()[1].text, "first answer");
+        }
+        let mut runtime = AgentRuntime::new(&providers, &tools, config);
+        let second = block_on(runtime.run_persistent(
+            reopened.clone(),
+            Message::text(MessageRole::User, "again"),
+            Arc::new(EventLog::default()),
+        ))
+        .expect("second run");
+        assert_eq!(second.run.outcome, AgentOutcome::Completed);
+        assert_eq!(second.run.messages.len(), 4);
+        assert_eq!(reopened.lock().expect("session lock").messages().len(), 4);
+        drop(runtime);
+        drop(reopened);
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn persistent_run_refuses_a_session_with_an_incomplete_run() {
+        let root = persistent_root("incomplete");
+        let store = nyan_coding_agent_session::FileSessionStore::new(&root);
+        let mut crashed =
+            nyan_coding_agent_session::NativeSession::open(&store, persistent_request(&root))
+                .expect("open session");
+        crashed.begin_run(Vec::new()).expect("begin run");
+        drop(crashed);
+
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::new()),
+                failures: Mutex::new(0),
+            },
+        };
+        let tools = Tools { echo: EchoTool };
+        let mut runtime = AgentRuntime::new(
+            &providers,
+            &tools,
+            RuntimeConfig::new(
+                ProviderModel {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                },
+                "/tmp/project",
+            ),
+        );
+        let session = std::sync::Arc::new(Mutex::new(
+            nyan_coding_agent_session::NativeSession::open(&store, persistent_request(&root))
+                .expect("reopen session"),
+        ));
+        let error = block_on(runtime.run_persistent(
+            session.clone(),
+            Message::text(MessageRole::User, "hello"),
+            Arc::new(EventLog::default()),
+        ))
+        .expect_err("incomplete run must be refused");
+        assert_eq!(error.code(), "session_io");
+        assert_eq!(session.lock().expect("session lock").messages().len(), 0);
+        drop(runtime);
+        drop(session);
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 
     #[test]
