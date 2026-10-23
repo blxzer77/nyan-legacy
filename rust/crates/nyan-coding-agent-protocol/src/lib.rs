@@ -1,6 +1,9 @@
 //! Stable names for the Coding Agent's JSONL and RPC protocols.
 
-use nyan_coding_agent_core::AgentMode;
+use std::fmt::Write as _;
+
+use nyan_coding_agent_core::{AgentMode, Message, MessageRole, ToolCallId};
+use nyan_coding_agent_runtime::{AgentEvent, AgentOutcome};
 
 /// The JSONL-facing runtime mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,9 +292,364 @@ impl SessionEventName {
     }
 }
 
+/// Appends `value` to `out` as a JSON string literal.
+///
+/// Only the characters JSON requires are escaped. U+2028 and U+2029 are left
+/// as-is: the Coding Agent's JSONL framing splits records on LF only, and
+/// those separators are valid inside strings.
+pub fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            control if u32::from(control) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(control));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
+/// Builds one strict JSONL record: a single JSON object terminated by LF.
+#[derive(Debug)]
+pub struct JsonlRecord {
+    buffer: String,
+    fields: usize,
+}
+
+impl JsonlRecord {
+    /// Starts a record whose first field is `"type"`.
+    #[must_use]
+    pub fn new(record_type: &str) -> Self {
+        let mut buffer = String::from("{\"type\":");
+        push_json_string(&mut buffer, record_type);
+        Self { buffer, fields: 1 }
+    }
+
+    /// Adds a string field.
+    #[must_use]
+    pub fn string(mut self, name: &str, value: &str) -> Self {
+        self.key(name);
+        push_json_string(&mut self.buffer, value);
+        self
+    }
+
+    /// Adds a boolean field.
+    #[must_use]
+    pub fn boolean(mut self, name: &str, value: bool) -> Self {
+        self.key(name);
+        self.buffer.push_str(if value { "true" } else { "false" });
+        self
+    }
+
+    /// Adds a field whose value is already valid JSON.
+    ///
+    /// The caller owns the validity of `json`; use it only for values built by
+    /// this module's own encoders.
+    #[must_use]
+    pub fn raw(mut self, name: &str, json: &str) -> Self {
+        self.key(name);
+        self.buffer.push_str(json);
+        self
+    }
+
+    fn key(&mut self, name: &str) {
+        debug_assert!(self.fields > 0);
+        self.buffer.push(',');
+        push_json_string(&mut self.buffer, name);
+        self.buffer.push(':');
+        self.fields += 1;
+    }
+
+    /// Finishes the record, returning it with its terminating LF.
+    #[must_use]
+    pub fn finish(mut self) -> String {
+        self.buffer.push_str("}\n");
+        self.buffer
+    }
+}
+
+/// Encodes a message with the fields the Rust runtime currently carries.
+///
+/// Parity gap: the documented wire message also carries `usage`, `api`,
+/// `provider`, `model`, and `stopReason` on assistant messages. The Rust
+/// `Message` does not hold those yet, so they are omitted rather than invented.
+/// `timestamp` is supplied by the caller in Unix milliseconds.
+#[must_use]
+pub fn encode_message(message: &Message, timestamp_ms: u64) -> String {
+    let mut out = String::from("{\"role\":");
+    match message.role {
+        MessageRole::System => {
+            push_json_string(&mut out, "system");
+            out.push_str(",\"content\":");
+            push_json_string(&mut out, &message.text);
+        }
+        MessageRole::User => {
+            push_json_string(&mut out, "user");
+            out.push_str(",\"content\":");
+            push_json_string(&mut out, &message.text);
+        }
+        MessageRole::Assistant => {
+            push_json_string(&mut out, "assistant");
+            out.push_str(",\"content\":[");
+            let mut first = true;
+            if !message.text.is_empty() {
+                out.push_str("{\"type\":\"text\",\"text\":");
+                push_json_string(&mut out, &message.text);
+                out.push('}');
+                first = false;
+            }
+            for call in &message.tool_calls {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str("{\"type\":\"toolCall\",\"id\":");
+                push_json_string(&mut out, call.id.as_str());
+                out.push_str(",\"name\":");
+                push_json_string(&mut out, &call.name);
+                out.push_str(",\"arguments\":");
+                push_json_string(&mut out, &call.arguments);
+                out.push('}');
+            }
+            out.push(']');
+        }
+        MessageRole::Tool => {
+            push_json_string(&mut out, "toolResult");
+            out.push_str(",\"toolCallId\":");
+            push_json_string(
+                &mut out,
+                message.tool_call_id.as_ref().map_or("", ToolCallId::as_str),
+            );
+            out.push_str(",\"toolName\":");
+            push_json_string(&mut out, message.tool_name.as_deref().unwrap_or(""));
+            out.push_str(",\"content\":[{\"type\":\"text\",\"text\":");
+            push_json_string(&mut out, &message.text);
+            out.push_str("}],\"isError\":");
+            out.push_str(if message.is_error { "true" } else { "false" });
+        }
+    }
+    let _ = write!(out, ",\"timestamp\":{timestamp_ms}}}");
+    out
+}
+
+/// Maps one runtime event to its JSONL record, or `None` when the event has no
+/// documented wire form yet.
+///
+/// `RetryStart` and `RetryEnd` map to `auto_retry_start` and `auto_retry_end`.
+/// `AgentEnd` maps to `agent_end` followed by `agent_settled`, because the Rust
+/// runtime has no automatic work that outlives a run.
+#[must_use]
+pub fn event_to_jsonl(event: &AgentEvent, timestamp_ms: u64) -> Option<String> {
+    Some(match event {
+        AgentEvent::AgentStart => JsonlRecord::new("agent_start").finish(),
+        AgentEvent::TurnStart { .. } => JsonlRecord::new("turn_start").finish(),
+        AgentEvent::MessageStart { message } => JsonlRecord::new("message_start")
+            .raw("message", &encode_message(message, timestamp_ms))
+            .finish(),
+        AgentEvent::MessageEnd { message } => JsonlRecord::new("message_end")
+            .raw("message", &encode_message(message, timestamp_ms))
+            .finish(),
+        AgentEvent::MessageUpdate { .. } => return None,
+        AgentEvent::RetryStart { attempt } => JsonlRecord::new("auto_retry_start")
+            .raw("attempt", &attempt.to_string())
+            .finish(),
+        AgentEvent::RetryEnd { attempt, succeeded } => JsonlRecord::new("auto_retry_end")
+            .boolean("success", *succeeded)
+            .raw("attempt", &attempt.to_string())
+            .finish(),
+        AgentEvent::ToolExecutionStart {
+            call_id,
+            tool_name,
+            arguments,
+        } => JsonlRecord::new("tool_execution_start")
+            .string("toolCallId", call_id.as_str())
+            .string("toolName", tool_name)
+            .string("args", arguments)
+            .finish(),
+        AgentEvent::ToolExecutionUpdate {
+            call_id,
+            tool_name,
+            partial_result,
+        } => JsonlRecord::new("tool_execution_update")
+            .string("toolCallId", call_id.as_str())
+            .string("toolName", tool_name)
+            .raw("partialResult", &encode_tool_result(&partial_result.text))
+            .finish(),
+        AgentEvent::ToolExecutionEnd {
+            call_id,
+            tool_name,
+            result,
+        } => JsonlRecord::new("tool_execution_end")
+            .string("toolCallId", call_id.as_str())
+            .string("toolName", tool_name)
+            .raw("result", &encode_tool_result(&result.text))
+            .boolean("isError", result.is_error)
+            .finish(),
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+        } => {
+            let results = tool_results
+                .iter()
+                .map(|result| encode_message(result, timestamp_ms))
+                .collect::<Vec<_>>()
+                .join(",");
+            JsonlRecord::new("turn_end")
+                .raw("message", &encode_message(message, timestamp_ms))
+                .raw("toolResults", &format!("[{results}]"))
+                .finish()
+        }
+        AgentEvent::AgentEnd { outcome } => {
+            let aborted = matches!(outcome, AgentOutcome::Aborted);
+            let mut records = JsonlRecord::new("agent_end")
+                .raw("messages", "[]")
+                .boolean("willRetry", false)
+                .finish();
+            records.push_str(
+                &JsonlRecord::new("agent_settled")
+                    .boolean("aborted", aborted)
+                    .finish(),
+            );
+            records
+        }
+    })
+}
+
+/// Encodes a tool result in the documented `{content, details}` wire shape.
+#[must_use]
+pub fn encode_tool_result(text: &str) -> String {
+    let mut out = String::from("{\"content\":[{\"type\":\"text\",\"text\":");
+    push_json_string(&mut out, text);
+    out.push_str("}],\"details\":{}}");
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RpcCommandName, SessionEventName};
+    use super::{
+        JsonlRecord, RpcCommandName, SessionEventName, encode_message, encode_tool_result,
+        event_to_jsonl, push_json_string,
+    };
+
+    fn encoded(value: &str) -> String {
+        let mut out = String::new();
+        push_json_string(&mut out, value);
+        out
+    }
+
+    #[test]
+    fn json_strings_escape_exactly_what_json_requires() {
+        assert_eq!(encoded("plain"), "\"plain\"");
+        assert_eq!(encoded("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(encoded("line\nbreak\r\ttab"), "\"line\\nbreak\\r\\ttab\"");
+        assert_eq!(encoded("\u{01}\u{1f}"), "\"\\u0001\\u001f\"");
+        assert_eq!(encoded("\u{08}\u{0c}"), "\"\\b\\f\"");
+    }
+
+    #[test]
+    fn unicode_line_separators_stay_inside_the_record() {
+        let record = JsonlRecord::new("message_end")
+            .string("text", "a\u{2028}b\u{2029}c")
+            .finish();
+        assert_eq!(record.matches('\n').count(), 1);
+        assert!(record.ends_with("}\n"));
+        assert!(record.contains("a\u{2028}b\u{2029}c"));
+    }
+
+    #[test]
+    fn records_put_type_first_and_end_with_one_lf() {
+        let record = JsonlRecord::new("tool_execution_end")
+            .string("toolCallId", "call-1")
+            .boolean("isError", false)
+            .raw("result", &encode_tool_result("out\nput"))
+            .finish();
+        assert_eq!(
+            record,
+            concat!(
+                "{\"type\":\"tool_execution_end\",\"toolCallId\":\"call-1\",",
+                "\"isError\":false,\"result\":{\"content\":[{\"type\":\"text\",",
+                "\"text\":\"out\\nput\"}],\"details\":{}}}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn run_events_map_to_documented_records() {
+        use nyan_coding_agent_core::{Message, MessageRole, ToolCallId};
+        use nyan_coding_agent_runtime::{AgentEvent, AgentOutcome};
+
+        assert_eq!(
+            event_to_jsonl(&AgentEvent::AgentStart, 1).as_deref(),
+            Some("{\"type\":\"agent_start\"}\n")
+        );
+        assert_eq!(
+            event_to_jsonl(
+                &AgentEvent::MessageEnd {
+                    message: Message::text(MessageRole::User, "hi\n")
+                },
+                1_733_234_401_000
+            )
+            .as_deref(),
+            Some(concat!(
+                "{\"type\":\"message_end\",\"message\":{\"role\":\"user\",",
+                "\"content\":\"hi\\n\",\"timestamp\":1733234401000}}\n"
+            ))
+        );
+        let tool_result = Message::tool_result(
+            ToolCallId::new("call-1").expect("tool call id"),
+            "echo",
+            "out",
+            true,
+        );
+        let encoded = encode_message(&tool_result, 7);
+        assert_eq!(
+            encoded,
+            concat!(
+                "{\"role\":\"toolResult\",\"toolCallId\":\"call-1\",\"toolName\":\"echo\",",
+                "\"content\":[{\"type\":\"text\",\"text\":\"out\"}],\"isError\":true,",
+                "\"timestamp\":7}"
+            )
+        );
+        let end = event_to_jsonl(
+            &AgentEvent::AgentEnd {
+                outcome: AgentOutcome::Aborted,
+            },
+            1,
+        )
+        .expect("agent end");
+        assert_eq!(end.lines().count(), 2);
+        assert!(
+            end.lines()
+                .nth(1)
+                .expect("settled line")
+                .contains("\"aborted\":true")
+        );
+        assert!(
+            event_to_jsonl(
+                &AgentEvent::MessageUpdate {
+                    message: Message::text(MessageRole::Assistant, "x")
+                },
+                1
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn field_free_events_are_a_bare_type_object() {
+        assert_eq!(
+            JsonlRecord::new("agent_start").finish(),
+            "{\"type\":\"agent_start\"}\n"
+        );
+    }
 
     #[test]
     fn rpc_names_match_the_frozen_matrix() {
