@@ -7,12 +7,13 @@
 //! `--session` takes an exact id or a unique prefix; `--session-dir` moves the
 //! store. Each working directory has its own store, named by a hash of the path.
 //!
-//! Sessions live in `sessions-journal` under the agent directory, in the
-//! Rust-native format. The directory is named for the storage design (an
-//! append-only journal), the way `sessions` (JSONL) and `sessions-durable`
-//! (SQLite) are, and carries neither the implementation language nor a format
-//! version: the version is in each file's header, so a format change migrates
-//! inside the directory. The code neither reads nor writes the other two trees.
+//! Sessions live in `sessions` under the agent directory, in the Rust journal
+//! format: one store, not one per generation of the product. The older stores,
+//! legacy JSONL (the same tree, `*.jsonl` files) and `sessions-durable`, are
+//! import sources only; this code never reads or writes them. The TypeScript CLI
+//! lists only `*.jsonl` files, so the `.session` files here do not disturb it.
+//! The format version is in each file's header, not in the directory name.
+//!
 //! `--resume` (a picker) and `--fork` are not implemented and are refused.
 
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ use crate::args::{Args, normalize_session_name};
 use crate::headless::new_session_id;
 
 /// The directory under the agent directory that holds Rust-native sessions.
-pub const SESSION_STORE_DIR: &str = "sessions-journal";
+pub const SESSION_STORE_DIR: &str = "sessions";
 
 /// FNV-1a over the path bytes: stable across platforms and releases, which a
 /// directory name must be.
