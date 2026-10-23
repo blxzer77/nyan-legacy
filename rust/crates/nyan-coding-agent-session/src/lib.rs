@@ -492,18 +492,81 @@ impl FileSessionStore {
         if root.as_os_str().is_empty() {
             return Err(SessionStoreError::StorageRootRequired);
         }
-        let safe_id = request.descriptor.id.as_str().as_bytes().iter().fold(
-            String::new(),
-            |mut safe_id, byte| {
-                write!(&mut safe_id, "{byte:02x}").expect("writing to a String cannot fail");
-                safe_id
-            },
-        );
+        let safe_id = encode_session_id(&request.descriptor.id);
         Ok((
             root.join(format!("{safe_id}.session")),
             root.join(format!("{safe_id}.lock")),
         ))
     }
+}
+
+impl FileSessionStore {
+    /// Lists Rust-native session ids in a storage root, sorted by id.
+    ///
+    /// Missing roots are treated as an empty session directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the root cannot be read.
+    pub fn session_ids(
+        &self,
+        storage_root: Option<&Path>,
+    ) -> Result<Vec<SessionId>, SessionStoreError> {
+        let root = storage_root.unwrap_or(self.root.as_path());
+        if root.as_os_str().is_empty() {
+            return Err(SessionStoreError::StorageRootRequired);
+        }
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(SessionStoreError::Io {
+                    operation: "list sessions".to_owned(),
+                    message: error.to_string(),
+                });
+            }
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| SessionStoreError::Io {
+                operation: "list sessions".to_owned(),
+                message: error.to_string(),
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("session") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if let Some(id) = decode_session_id(stem) {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+}
+
+fn encode_session_id(id: &SessionId) -> String {
+    id.as_str()
+        .as_bytes()
+        .iter()
+        .fold(String::new(), |mut encoded, byte| {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+            encoded
+        })
+}
+
+fn decode_session_id(encoded: &str) -> Option<SessionId> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    SessionId::new(String::from_utf8(bytes).ok()?).ok()
 }
 
 impl SessionStore for FileSessionStore {
@@ -862,6 +925,59 @@ impl NativeSession {
         self.messages.push(message);
         Ok(sequence)
     }
+
+    /// Creates a new session containing the first `message_count` messages.
+    ///
+    /// The target request supplies the new session id and storage selection.
+    /// The source session remains unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a selection, lock, codec, or filesystem error when the fork
+    /// cannot be completed.
+    pub fn fork_into(
+        &self,
+        store: &FileSessionStore,
+        request: SessionOpenRequest,
+        message_count: usize,
+    ) -> Result<Self, SessionStoreError> {
+        if message_count > self.messages.len() {
+            return Err(SessionStoreError::Io {
+                operation: "fork session".to_owned(),
+                message: format!(
+                    "requested {message_count} messages but session contains {}",
+                    self.messages.len()
+                ),
+            });
+        }
+        let mut fork = Self::open(store, request)?;
+        for message in self.messages.iter().take(message_count) {
+            fork.append_message(record_kind_for_message(message), message.clone())?;
+        }
+        Ok(fork)
+    }
+
+    /// Creates a full copy of this session under the target request.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::fork_into`].
+    pub fn clone_into(
+        &self,
+        store: &FileSessionStore,
+        request: SessionOpenRequest,
+    ) -> Result<Self, SessionStoreError> {
+        self.fork_into(store, request, self.messages.len())
+    }
+}
+
+fn record_kind_for_message(message: &Message) -> SessionRecordKind {
+    match message.role {
+        MessageRole::System => SessionRecordKind::Metadata,
+        MessageRole::User => SessionRecordKind::UserMessage,
+        MessageRole::Assistant => SessionRecordKind::AssistantMessage,
+        MessageRole::Tool => SessionRecordKind::ToolResult,
+    }
 }
 
 fn read_records(file: &mut File, path: &Path) -> Result<Vec<SessionRecord>, SessionStoreError> {
@@ -944,9 +1060,13 @@ mod tests {
     }
 
     fn request(root: &std::path::Path) -> SessionOpenRequest {
+        request_for(root, "session-1")
+    }
+
+    fn request_for(root: &std::path::Path, id: &str) -> SessionOpenRequest {
         SessionOpenRequest {
             descriptor: SessionDescriptor::persistent(
-                SessionId::new("session-1").expect("session id"),
+                SessionId::new(id).expect("session id"),
                 "/tmp/project",
             ),
             mode: AgentMode::Print,
@@ -1086,6 +1206,58 @@ mod tests {
         assert_eq!(reopened.messages()[0].text, "hello");
         assert_eq!(reopened.messages()[1].text, "world");
         drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn session_selection_lists_native_ids() {
+        let root = test_root("selection");
+        let store = FileSessionStore::new(&root);
+        let first =
+            NativeSession::open(&store, request_for(&root, "first")).expect("first session");
+        drop(first);
+        let second =
+            NativeSession::open(&store, request_for(&root, "second")).expect("second session");
+        drop(second);
+        assert_eq!(
+            store.session_ids(Some(&root)).expect("list sessions"),
+            vec![
+                SessionId::new("first").expect("first id"),
+                SessionId::new("second").expect("second id")
+            ]
+        );
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn native_session_forks_and_clones_message_prefixes() {
+        let root = test_root("fork");
+        let store = FileSessionStore::new(&root);
+        let mut source = NativeSession::open(&store, request_for(&root, "source")).expect("source");
+        source
+            .append_message(
+                SessionRecordKind::UserMessage,
+                Message::text(MessageRole::User, "one"),
+            )
+            .expect("append one");
+        source
+            .append_message(
+                SessionRecordKind::AssistantMessage,
+                Message::text(MessageRole::Assistant, "two"),
+            )
+            .expect("append two");
+        let fork = source
+            .fork_into(&store, request_for(&root, "forked"), 1)
+            .expect("fork session");
+        assert_eq!(fork.messages().len(), 1);
+        assert_eq!(fork.messages()[0].text, "one");
+        drop(fork);
+        let clone = source
+            .clone_into(&store, request_for(&root, "cloned"))
+            .expect("clone session");
+        assert_eq!(clone.messages().len(), 2);
+        drop(clone);
+        drop(source);
         fs::remove_dir_all(root).expect("remove test root");
     }
 
