@@ -50,6 +50,11 @@
 			"@ny4n/server/unix": ["./packages/server/src/transports/unix/index.ts"],
 			"@ny4n/server/*": ["./packages/server/src/*"],
 			"typebox": ["./node_modules/typebox"],
+			// @anthropic-ai/sandbox-runtime 0.0.26 publishes Zod 3 declarations (`z.infer` on ZodObject).
+			// The installed package is zod 4.6.7 so the production tree is outside GHSA-mrhx-c7xc-m3w5.
+			// Point typechecking at zod/v3, the declaration shape those .d.ts files were emitted against.
+			// Node and Bun still resolve the package's default entry, which is the patched Zod 4 runtime.
+			"zod": ["./node_modules/zod/v3/index.d.ts"],
 			"@ny4n/tui": ["./packages/tui/src/index.ts"],
 			"@ny4n/tui/*": ["./packages/tui/src/*"]
 		}
