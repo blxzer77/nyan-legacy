@@ -47,6 +47,13 @@ impl OpenAiChatProvider {
         })
     }
 
+    /// Sends the conversation id in header `name` with every request.
+    #[must_use]
+    pub fn with_session_header(mut self, name: &str) -> Self {
+        self.transport.set_session_header(name);
+        self
+    }
+
     /// Sets how long a response may stay silent before the stream fails.
     #[must_use]
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
@@ -68,7 +75,9 @@ impl ModelProvider for OpenAiChatProvider {
             url: format!("{}/chat/completions", self.base_url),
             body: build_request_body(&request).to_string(),
             bearer: self.api_key.clone(),
-            headers: Vec::new(),
+            headers: self
+                .transport
+                .session_headers(request.session_id.as_deref()),
             accept: None,
         };
         self.transport

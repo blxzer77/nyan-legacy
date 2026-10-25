@@ -90,6 +90,13 @@ impl OpenAiResponsesProvider {
         self
     }
 
+    /// Sends the conversation id in header `name` with every request.
+    #[must_use]
+    pub fn with_session_header(mut self, name: &str) -> Self {
+        self.transport.set_session_header(name);
+        self
+    }
+
     /// Sets how long a response may stay silent before the stream fails.
     #[must_use]
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
@@ -124,11 +131,15 @@ impl ModelProvider for OpenAiResponsesProvider {
             url.push('?');
             url.push_str(query);
         }
-        let (bearer, headers) = match (self.key_header, &self.api_key) {
+        let (bearer, mut headers) = match (self.key_header, &self.api_key) {
             (Some(name), Some(key)) => (None, vec![(name.to_owned(), key.clone())]),
             (None, key) => (key.clone(), Vec::new()),
             (Some(_), None) => (None, Vec::new()),
         };
+        headers.extend(
+            self.transport
+                .session_headers(request.session_id.as_deref()),
+        );
         let post = Post {
             url,
             body: build_request_body(&request, self.instruction_role).to_string(),

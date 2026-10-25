@@ -42,6 +42,8 @@ pub struct ProviderRequest {
     pub tools: Vec<ToolSpec>,
     /// Cancellation owned by the current agent run.
     pub cancellation: CancellationToken,
+    /// The conversation's id, for providers that route or cache by conversation.
+    pub session_id: Option<String>,
 }
 
 /// A provider-requested stream update.
@@ -191,6 +193,7 @@ mod tests {
             messages: vec![Message::text(MessageRole::User, "hello")],
             tools: Vec::new(),
             cancellation: nyan_coding_agent_core::CancellationToken::new(),
+            session_id: None,
         };
         assert_eq!(request.messages[0].text, "hello");
         assert!(!request.cancellation.is_cancelled());

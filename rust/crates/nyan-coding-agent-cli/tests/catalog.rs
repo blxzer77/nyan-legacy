@@ -23,6 +23,12 @@ fn models_dev() -> Value {
                 "limit": {"context": 200000, "output": 64000},
                 "modalities": {"input": ["text", "image"], "output": ["text"]}},
         }},
+        "opencode-go": {"models": {
+            "go-resp": {"tool_call": true, "provider": {"npm": "@ai-sdk/openai"}},
+            "go-anth": {"tool_call": true, "provider": {"npm": "@ai-sdk/anthropic"}},
+            "go-goog": {"tool_call": true, "provider": {"npm": "@ai-sdk/google"}},
+            "go-chat": {"tool_call": true},
+        }},
         "fireworks-ai": {"models": {
             "accounts/fireworks/models/glm-5": {"tool_call": true, "limit": {"context": 8000, "output": 2000}},
             "accounts/fireworks/models/other": {"tool_call": true, "limit": {"context": 9000, "output": 3000}},
@@ -364,5 +370,92 @@ fn the_cache_is_the_typescript_file_so_a_map_it_wrote_is_usable_here() {
     let outcome = home.go(&["--list-models"], &[("GROQ_API_KEY", "k")], &[]);
     assert_eq!(outcome.code, 0, "{}", outcome.stderr);
     assert!(outcome.stdout.contains("llama-a"), "{}", outcome.stdout);
+    home.cleanup();
+}
+
+#[test]
+fn opencode_go_follows_the_catalog_for_each_models_api_and_sends_the_conversation_id() {
+    let runtime = Runtime::new().expect("runtime");
+    let cases: [(&str, &[u8], &str, &str); 4] = [
+        (
+            "go-resp",
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "POST /responses HTTP/1.1",
+            "authorization: bearer oc-key",
+        ),
+        (
+            "go-anth",
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "POST /v1/messages HTTP/1.1",
+            "x-api-key: oc-key",
+        ),
+        (
+            "go-goog",
+            b"data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n",
+            "POST /models/go-goog:streamGenerateContent?alt=sse HTTP/1.1",
+            "x-goog-api-key: oc-key",
+        ),
+        (
+            "go-chat",
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            "POST /chat/completions HTTP/1.1",
+            "authorization: bearer oc-key",
+        ),
+    ];
+    for (model, reply, request_line, auth) in cases {
+        let server = stub(&runtime, "text/event-stream", reply.to_vec());
+        let home = Home::new("opencode-go");
+        home.route("opencode-go", &format!("http://{}", server.address));
+        seed_cache(&home, now_ms());
+        let outcome = home.go(
+            &[
+                "-p",
+                "--session-id",
+                "oc-session-1",
+                "--model",
+                &format!("opencode-go/{model}"),
+                "hi",
+            ],
+            &[("OPENCODE_API_KEY", "oc-key")],
+            &[],
+        );
+        assert_eq!(outcome.code, 0, "{model}: {}", outcome.stderr);
+        let request = server.requests.lock().expect("lock")[0].clone();
+        let lower = request.to_ascii_lowercase();
+        assert!(request.starts_with(request_line), "{model}: {request}");
+        assert!(lower.contains(auth), "{model}: {request}");
+        assert!(
+            lower.contains("\r\nx-opencode-session: oc-session-1\r\n"),
+            "{model}: the conversation id must travel with the request: {request}"
+        );
+        home.cleanup();
+    }
+}
+
+#[test]
+fn a_provider_that_did_not_ask_for_the_conversation_id_does_not_get_it() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = stub(
+        &runtime,
+        "text/event-stream",
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            .to_vec(),
+    );
+    let home = Home::new("no-session-header");
+    home.route("groq", &format!("http://{}/v1", server.address));
+    let outcome = home.go(
+        &[
+            "-p",
+            "--session-id",
+            "private-id-9",
+            "--model",
+            "groq/m",
+            "hi",
+        ],
+        &[("GROQ_API_KEY", "k")],
+        &[],
+    );
+    assert_eq!(outcome.code, 0, "{}", outcome.stderr);
+    assert!(!server.requests.lock().expect("lock")[0].contains("private-id-9"));
     home.cleanup();
 }

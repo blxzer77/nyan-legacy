@@ -64,6 +64,13 @@ impl AnthropicMessagesProvider {
         self
     }
 
+    /// Sends the conversation id in header `name` with every request.
+    #[must_use]
+    pub fn with_session_header(mut self, name: &str) -> Self {
+        self.transport.set_session_header(name);
+        self
+    }
+
     /// Sets how long a response may stay silent before the stream fails.
     #[must_use]
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
@@ -85,13 +92,19 @@ impl ModelProvider for AnthropicMessagesProvider {
             url: format!("{}/v1/messages", self.base_url),
             body: build_request_body(&request, self.max_tokens).to_string(),
             bearer: None,
-            headers: vec![
+            headers: [
                 (
                     "x-api-key".to_owned(),
                     self.api_key.clone().unwrap_or_default(),
                 ),
                 ("anthropic-version".to_owned(), ANTHROPIC_VERSION.to_owned()),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                self.transport
+                    .session_headers(request.session_id.as_deref()),
+            )
+            .collect(),
             accept: None,
         };
         self.transport.start(

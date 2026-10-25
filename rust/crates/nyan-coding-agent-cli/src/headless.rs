@@ -212,11 +212,12 @@ pub async fn run_headless(
         HeadlessMode::Print => Arc::new(NullSink),
     };
 
-    let mut runtime = AgentRuntime::new(
-        providers,
-        tools,
-        RuntimeConfig::new(options.model.clone(), options.cwd.clone()),
-    );
+    let mut config = RuntimeConfig::new(options.model.clone(), options.cwd.clone());
+    config.session_id = session
+        .lock()
+        .ok()
+        .map(|guard| guard.session().descriptor.id.as_str().to_owned());
+    let mut runtime = AgentRuntime::new(providers, tools, config);
     if let Err(message) = prepare_session(&session, options.system_prompt.as_deref()) {
         write_err(&format!("Error: {message}\n"));
         return 1;

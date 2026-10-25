@@ -271,16 +271,14 @@ fn resolved(setup: ProviderSetup) -> Resolved {
 
 /// Mixed-API providers this build can call, because the catalog entry for the
 /// model says which wire API and URL it uses.
-const CATALOG_DRIVEN: &[&str] = &["fireworks"];
+const CATALOG_DRIVEN: &[&str] = &["fireworks", "opencode-go"];
 
 /// Why a mixed-API provider cannot be called yet.
 fn mixed_refusal(def: &MixedDef) -> String {
     let reason = match def.id {
         "openrouter" => "its model list comes from a live listing this build does not read yet",
         "github-copilot" => "it needs a GitHub OAuth login, which this build does not have yet",
-        "opencode" | "opencode-go" => {
-            "it requires a per-conversation routing header this build does not send yet"
-        }
+        "opencode" => "it is not in the supported provider list",
         "cloudflare-ai-gateway" => "its gateway authentication is not implemented yet",
         _ => "its models need the catalog to choose a wire API",
     };
@@ -525,33 +523,63 @@ pub fn build_provider(
     setup: ProviderSetup,
     handle: Handle,
 ) -> Result<SingleProvider, ProviderError> {
-    let provider: Box<dyn ModelProvider> =
-        match setup {
-            ProviderSetup::OpenAiCompletions { base_url, api_key } => Box::new(
-                OpenAiChatProvider::new(id, base_url, Some(api_key), handle)?,
-            ),
-            ProviderSetup::OpenAiResponses { base_url, api_key } => Box::new(
-                OpenAiResponsesProvider::new(id, base_url, Some(api_key), handle)?,
-            ),
-            ProviderSetup::Anthropic {
-                base_url,
-                api_key,
-                max_tokens,
-            } => {
-                let provider = AnthropicMessagesProvider::new(id, base_url, Some(api_key), handle)?;
-                Box::new(match max_tokens {
-                    Some(limit) => provider.with_max_tokens(limit),
-                    None => provider,
-                })
+    let session = session_header(id);
+    let provider: Box<dyn ModelProvider> = match setup {
+        ProviderSetup::OpenAiCompletions { base_url, api_key } => {
+            let provider = OpenAiChatProvider::new(id, base_url, Some(api_key), handle)?;
+            Box::new(match session {
+                Some(name) => provider.with_session_header(name),
+                None => provider,
+            })
+        }
+        ProviderSetup::OpenAiResponses { base_url, api_key } => {
+            let provider = OpenAiResponsesProvider::new(id, base_url, Some(api_key), handle)?;
+            Box::new(match session {
+                Some(name) => provider.with_session_header(name),
+                None => provider,
+            })
+        }
+        ProviderSetup::Anthropic {
+            base_url,
+            api_key,
+            max_tokens,
+        } => {
+            let mut provider = AnthropicMessagesProvider::new(id, base_url, Some(api_key), handle)?;
+            if let Some(limit) = max_tokens {
+                provider = provider.with_max_tokens(limit);
             }
-            ProviderSetup::Google { base_url, api_key } => Box::new(
-                GoogleGenerativeAiProvider::new(id, base_url, Some(api_key), handle)?,
-            ),
-            ProviderSetup::Vertex { base_url, auth } => {
-                Box::new(GoogleVertexProvider::new(id, base_url, Some(auth), handle)?)
+            if let Some(name) = session {
+                provider = provider.with_session_header(name);
             }
-        };
+            Box::new(provider)
+        }
+        ProviderSetup::Google { base_url, api_key } => {
+            let provider = GoogleGenerativeAiProvider::new(id, base_url, Some(api_key), handle)?;
+            Box::new(match session {
+                Some(name) => provider.with_session_header(name),
+                None => provider,
+            })
+        }
+        ProviderSetup::Vertex { base_url, auth } => {
+            Box::new(GoogleVertexProvider::new(id, base_url, Some(auth), handle)?)
+        }
+    };
     Ok(SingleProvider(provider))
+}
+
+/// The header a provider wants the conversation id in, if any.
+///
+/// `OpenCode` routes by conversation and requires `x-opencode-session` on every
+/// request, whichever wire API the model uses.
+#[must_use]
+pub const fn session_header(provider: &str) -> Option<&'static str> {
+    // `str` equality is not const, so compare bytes.
+    let name = provider.as_bytes();
+    if matches!(name, b"opencode-go" | b"opencode") {
+        Some("x-opencode-session")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

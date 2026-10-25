@@ -102,6 +102,7 @@ pub fn request(cancellation: CancellationToken) -> ProviderRequest {
                     .to_owned(),
         }],
         cancellation,
+        session_id: None,
     }
 }
 

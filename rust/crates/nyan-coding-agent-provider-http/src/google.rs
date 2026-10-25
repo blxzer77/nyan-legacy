@@ -70,6 +70,13 @@ impl GoogleGenerativeAiProvider {
         })
     }
 
+    /// Sends the conversation id in header `name` with every request.
+    #[must_use]
+    pub fn with_session_header(mut self, name: &str) -> Self {
+        self.transport.set_session_header(name);
+        self
+    }
+
     /// Sets how long a response may stay silent before the stream fails.
     #[must_use]
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
@@ -130,6 +137,10 @@ impl ModelProvider for GoogleGenerativeAiProvider {
                 .api_key
                 .iter()
                 .map(|key| ("x-goog-api-key".to_owned(), key.clone()))
+                .chain(
+                    self.transport
+                        .session_headers(request.session_id.as_deref()),
+                )
                 .collect(),
             accept: None,
         };

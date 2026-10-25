@@ -199,6 +199,8 @@ pub struct RuntimeConfig {
     pub max_retries: usize,
     /// Tool scheduling policy.
     pub tool_execution: ToolExecutionMode,
+    /// The conversation id sent with every provider request.
+    pub session_id: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -211,6 +213,7 @@ impl RuntimeConfig {
             max_turns: 64,
             max_retries: 2,
             tool_execution: ToolExecutionMode::Parallel,
+            session_id: None,
         }
     }
 }
@@ -685,6 +688,7 @@ impl<'a> AgentRuntime<'a> {
                     })
                     .collect(),
                 cancellation: self.cancellation.clone(),
+                session_id: self.config.session_id.clone(),
             };
             match provider.stream(request).await {
                 Ok(mut stream) => match self.consume_stream(&mut *stream, &**sink).await {
@@ -2170,6 +2174,67 @@ mod tests {
                 succeeded: false
             }
         )));
+    }
+
+    /// Records the conversation id every request carries.
+    struct SessionProbe {
+        seen: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl ModelProvider for SessionProbe {
+        fn id(&self) -> &'static str {
+            "probe"
+        }
+
+        fn stream(
+            &self,
+            request: ProviderRequest,
+        ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
+            self.seen.lock().expect("lock").push(request.session_id);
+            Box::pin(async {
+                Ok(Box::new(ImmediateStream {
+                    events: VecDeque::from([ProviderStreamEvent::Finished {
+                        reason: ProviderStopReason::Stop,
+                    }]),
+                    fail_first: false,
+                }) as Box<dyn ProviderStream>)
+            })
+        }
+    }
+
+    struct ProbeProviders(SessionProbe);
+
+    impl ProviderRegistry for ProbeProviders {
+        fn provider(
+            &self,
+            _id: &str,
+        ) -> Result<&dyn ModelProvider, nyan_coding_agent_core::CoreError> {
+            Ok(&self.0)
+        }
+    }
+
+    #[test]
+    fn every_provider_request_of_a_run_carries_the_configured_conversation_id() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let providers = ProbeProviders(SessionProbe {
+            seen: Arc::clone(&seen),
+        });
+        let tools = Tools { echo: EchoTool };
+        for configured in [Some("session-7".to_owned()), None] {
+            seen.lock().expect("lock").clear();
+            let mut config = RuntimeConfig::new(
+                ProviderModel {
+                    provider: "probe".to_owned(),
+                    model: "m".to_owned(),
+                },
+                "/tmp/project",
+            );
+            config.session_id = configured.clone();
+            let mut runtime = AgentRuntime::new(&providers, &tools, config);
+            let (result, _) = run_with_events(&mut runtime, Message::text(MessageRole::User, "hi"));
+            assert_eq!(result.outcome, AgentOutcome::Completed);
+            assert_eq!(*seen.lock().expect("lock"), [configured]);
+        }
     }
 
     #[test]

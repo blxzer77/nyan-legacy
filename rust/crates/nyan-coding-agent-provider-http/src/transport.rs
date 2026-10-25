@@ -83,6 +83,8 @@ pub(crate) struct Transport {
     client: reqwest::Client,
     handle: Handle,
     idle_timeout: Duration,
+    /// A header that carries the conversation id, when the provider wants one.
+    session_header: Option<String>,
 }
 
 impl Transport {
@@ -102,7 +104,22 @@ impl Transport {
             client,
             handle,
             idle_timeout: Duration::from_secs(120),
+            session_header: None,
         })
+    }
+
+    /// Makes every request carry the conversation id in header `name`.
+    pub(crate) fn set_session_header(&mut self, name: &str) {
+        self.session_header = Some(name.to_owned());
+    }
+
+    /// The header to add for `session_id`: none unless a header name was set and the
+    /// request has an id.
+    pub(crate) fn session_headers(&self, session_id: Option<&str>) -> Vec<(String, String)> {
+        match (&self.session_header, session_id) {
+            (Some(name), Some(id)) => vec![(name.clone(), id.to_owned())],
+            _ => Vec::new(),
+        }
     }
 
     pub(crate) fn set_idle_timeout(&mut self, idle_timeout: Duration) {

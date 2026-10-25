@@ -200,11 +200,8 @@ fn providers_that_cannot_be_called_correctly_are_refused_with_the_reason() {
         mixed,
         "Error: provider \"openrouter\" is not supported yet: its model list comes from a live listing this build does not read yet\n"
     );
-    let routed = ask("opencode/m", &[("OPENCODE_API_KEY", "k")]);
-    assert!(
-        routed.contains("requires a per-conversation routing header"),
-        "{routed}"
-    );
+    let zen = ask("opencode/m", &[("OPENCODE_API_KEY", "k")]);
+    assert!(zen.contains("not in the supported provider list"), "{zen}");
     let copilot = ask("github-copilot/m", &[]);
     assert!(copilot.contains("needs a GitHub OAuth login"), "{copilot}");
     let codex = ask("openai-codex/gpt-x", &[]);

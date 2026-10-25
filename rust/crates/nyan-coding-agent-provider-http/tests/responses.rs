@@ -169,6 +169,7 @@ fn history_is_sent_as_responses_items_with_the_system_prompt_first() {
         ],
         tools: Vec::<ToolSpec>::new(),
         cancellation: CancellationToken::new(),
+        session_id: None,
     };
     let stream = runtime
         .block_on(provider(&runtime, &server).stream(request))
