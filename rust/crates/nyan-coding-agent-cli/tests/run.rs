@@ -878,7 +878,13 @@ fn a_session_held_by_another_process_exits_one_before_any_request() {
         .find(|path| path.extension().is_some_and(|ext| ext == "session"))
         .expect("session file")
         .with_extension("lock");
-    std::fs::write(&lock, "").expect("create the lock");
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .expect("open the lock file");
+    holder.try_lock().expect("take the lock");
     let outcome = execute_with_agent(
         &["-p", "--model", "groq/m", "--session-id", "busy", "again"],
         "http://127.0.0.1:1/v1",
@@ -893,6 +899,7 @@ fn a_session_held_by_another_process_exits_one_before_any_request() {
         "{}",
         outcome.stderr
     );
+    drop(holder);
     for directory in [agent, cwd] {
         let _ = std::fs::remove_dir_all(directory);
     }

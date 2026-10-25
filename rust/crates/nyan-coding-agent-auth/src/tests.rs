@@ -166,27 +166,37 @@ fn the_credential_file_is_readable_by_its_owner_only() {
 }
 
 #[test]
-fn a_held_lock_blocks_a_write_and_a_stale_lock_does_not() {
+fn a_held_lock_blocks_a_write_and_a_leftover_lock_file_does_not() {
     let dir = temp("lock");
     let store = AuthStore::new(&dir).with_lock_wait(Duration::from_millis(100));
-    let lock = dir.join("auth.json.lock");
-    std::fs::write(&lock, "").expect("lock");
-    let error = store
-        .save_api_key("a", "1", &BTreeMap::new())
-        .expect_err("locked");
-    assert_eq!(error.code(), "auth_locked");
-    assert!(!dir.join("auth.json").exists(), "nothing was written");
-
-    let old = std::time::SystemTime::now() - Duration::from_secs(120);
-    std::fs::File::options()
-        .write(true)
-        .open(&lock)
-        .and_then(|file| file.set_modified(old))
-        .expect("age the lock");
+    let lock = dir.join("auth.json.flock");
+    // A lock file nobody holds, as a killed process leaves behind, blocks nothing.
+    std::fs::write(&lock, "").expect("leftover lock file");
     store
         .save_api_key("a", "1", &BTreeMap::new())
-        .expect("stale lock is broken");
-    assert!(!lock.exists(), "the lock is released after a write");
+        .expect("a leftover lock file is not a held lock");
+
+    // A lock that is held blocks the write until the holder lets go.
+    let holder = std::fs::File::options()
+        .write(true)
+        .open(&lock)
+        .expect("open lock");
+    holder.try_lock().expect("take the lock");
+    let error = store
+        .save_api_key("b", "2", &BTreeMap::new())
+        .expect_err("locked");
+    assert_eq!(error.code(), "auth_locked");
+    assert!(
+        !file_json(&store)
+            .as_object()
+            .expect("object")
+            .contains_key("b"),
+        "nothing was written while the lock was held"
+    );
+    drop(holder);
+    store
+        .save_api_key("b", "2", &BTreeMap::new())
+        .expect("the lock was released");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -214,15 +224,16 @@ fn concurrent_logins_for_different_providers_all_survive() {
         AuthStore::new(&dir).providers().expect("providers").len(),
         8
     );
-    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+    let mut leftovers: Vec<_> = std::fs::read_dir(&dir)
         .expect("dir")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
+    leftovers.sort();
     assert_eq!(
         leftovers,
-        ["auth.json"],
-        "no lock or temporary files remain"
+        ["auth.json", "auth.json.flock"],
+        "only the credential file and its lock file remain, no temporary files"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

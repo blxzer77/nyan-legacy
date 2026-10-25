@@ -669,7 +669,7 @@ fn encode_session_id(id: &SessionId) -> String {
 }
 
 fn decode_session_id(encoded: &str) -> Option<SessionId> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return None;
     }
     let bytes = (0..encoded.len())
@@ -708,26 +708,32 @@ impl SessionStore for FileSessionStore {
             operation: "create directory".to_owned(),
             message: error.to_string(),
         })?;
-        let lock_file = match OpenOptions::new()
-            .create_new(true)
+        // The lock is the operating system's, not the file's existence: the kernel drops
+        // it when the process dies, so a killed process never leaves a session locked.
+        // The lock file stays in place for the same reason; removing it would let a second
+        // process lock a new file while the first still holds the old one.
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
             .write(true)
             .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            .map_err(|error| SessionStoreError::Io {
+                operation: "open lock file".to_owned(),
+                message: error.to_string(),
+            })?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(SessionStoreError::Locked { path: lock_path });
             }
-            Err(error) => {
+            Err(std::fs::TryLockError::Error(error)) => {
                 return Err(SessionStoreError::Io {
-                    operation: "create lock".to_owned(),
+                    operation: "take lock".to_owned(),
                     message: error.to_string(),
                 });
             }
-        };
-        let lease = Arc::new(SessionLease {
-            lock_path,
-            _file: lock_file,
-        });
+        }
+        let lease = Arc::new(SessionLease { _file: lock_file });
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -753,7 +759,6 @@ impl SessionStore for FileSessionStore {
                     message: error.to_string(),
                 })?;
         } else if !contents.starts_with(RUST_SESSION_HEADER) {
-            let _ = fs::remove_file(&lease.lock_path);
             return Err(if contents.starts_with(b"NYANRS01\n") {
                 SessionStoreError::UnsupportedVersion { path: session_path }
             } else {
@@ -775,16 +780,10 @@ impl SessionStore for FileSessionStore {
     }
 }
 
+/// Holds the session's operating-system lock until the last handle is dropped.
 #[derive(Debug)]
 struct SessionLease {
-    lock_path: PathBuf,
     _file: File,
-}
-
-impl Drop for SessionLease {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_path);
-    }
 }
 
 /// An opened session and its ownership metadata.
@@ -1325,6 +1324,19 @@ mod tests {
         let reopened = store.open(request(&root)).expect("reopen session");
         assert_eq!(reopened.path(), Some(path.as_path()));
         drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn a_lock_file_nobody_holds_does_not_lock_the_session() {
+        let root = test_root("leftover-lock");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("session-1.lock"), b"left by an old version").expect("leftover");
+        let store = FileSessionStore::new(&root);
+        let opened = store
+            .open(request(&root))
+            .expect("open despite the leftover");
+        drop(opened);
         fs::remove_dir_all(root).expect("remove test root");
     }
 

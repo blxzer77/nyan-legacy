@@ -10,6 +10,7 @@
 //! "Could not find" error instead of succeeding. It also reports no diff details.
 
 use nyan_coding_agent_core::ExecutionContext;
+use nyan_coding_agent_fs::{FileMode, write_atomic};
 use serde_json::Value;
 
 use super::paths::resolve_to_cwd;
@@ -174,10 +175,17 @@ fn run(arguments: &Value, context: &ExecutionContext) -> Result<String, ToolErro
         };
         fail(format!("Could not edit file: {path}. {detail}."))
     })?;
-    let raw = String::from_utf8_lossy(&bytes);
+    // PARITY-DEVIATION(edit-non-utf8): the TypeScript tool decodes lossily and writes the
+    // replacement characters back, which silently destroys the file's other bytes. A
+    // file that is not valid UTF-8 is refused instead.
+    let Ok(raw) = String::from_utf8(bytes) else {
+        return Err(fail(format!(
+            "Could not edit file: {path}. The file is not valid UTF-8, and editing it would replace the bytes that are not."
+        )));
+    };
     let (bom, body) = raw
         .strip_prefix('\u{feff}')
-        .map_or(("", raw.as_ref()), |rest| ("\u{feff}", rest));
+        .map_or(("", raw.as_str()), |rest| ("\u{feff}", rest));
     let ending = detect_line_ending(body);
     let normalized = normalize_to_lf(body);
     let updated = apply_edits(&normalized, &edits, path)?;
@@ -186,8 +194,12 @@ fn run(arguments: &Value, context: &ExecutionContext) -> Result<String, ToolErro
     } else {
         updated
     };
-    std::fs::write(&absolute, format!("{bom}{restored}"))
-        .map_err(|error| super::io_error(&error, "open", &absolute))?;
+    write_atomic(
+        &absolute,
+        format!("{bom}{restored}").as_bytes(),
+        FileMode::Preserve,
+    )
+    .map_err(|error| super::io_error(&error, "open", &absolute))?;
     Ok(format!(
         "Successfully replaced {} block(s) in {path}.",
         edits.len()
@@ -224,6 +236,58 @@ mod tests {
             "Successfully replaced 2 block(s) in f.txt."
         );
         assert_eq!(after, "beta\nbeta\ndelta\n");
+    }
+
+    #[test]
+    fn a_file_that_is_not_valid_utf8_is_refused_and_keeps_every_byte() {
+        let dir = TempDir::new("edit-binary");
+        let original: &[u8] = b"keep\n\xff\xfe\x00 raw bytes\nreplace me\n";
+        std::fs::write(dir.path().join("f.bin"), original).expect("write fixture");
+        let error = call(
+            run,
+            dir.path(),
+            &json!({"path": "f.bin", "edits": [{"oldText": "replace me", "newText": "done"}]}),
+        )
+        .expect_err("refused");
+        assert_eq!(
+            error.to_string(),
+            "Could not edit file: f.bin. The file is not valid UTF-8, and editing it would replace the bytes that are not."
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("f.bin")).expect("read back"),
+            original
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_through_a_symlink_changes_the_target_and_keeps_the_link_and_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("edit-link");
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "before\n").expect("write fixture");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        std::os::unix::fs::symlink(&real, dir.path().join("link.txt")).expect("symlink");
+        call(
+            run,
+            dir.path(),
+            &json!({"path": "link.txt", "edits": [{"oldText": "before", "newText": "after"}]}),
+        )
+        .expect("edit");
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("link.txt"))
+                .expect("link")
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).expect("target"), "after\n");
+        assert_eq!(
+            std::fs::metadata(&real)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
     }
 
     #[test]

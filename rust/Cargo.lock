@@ -827,6 +827,7 @@ dependencies = [
 name = "nyan-coding-agent-auth"
 version = "0.1.0"
 dependencies = [
+ "nyan-coding-agent-fs",
  "serde_json",
 ]
 
@@ -850,6 +851,10 @@ dependencies = [
 
 [[package]]
 name = "nyan-coding-agent-core"
+version = "0.1.0"
+
+[[package]]
+name = "nyan-coding-agent-fs"
 version = "0.1.0"
 
 [[package]]
@@ -913,6 +918,7 @@ dependencies = [
  "globset",
  "ignore",
  "nyan-coding-agent-core",
+ "nyan-coding-agent-fs",
  "regex",
  "serde_json",
 ]

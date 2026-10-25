@@ -36,10 +36,10 @@ Future sizes are relative planning estimates (S, M, L, XL), not delivery dates. 
 Known gaps against the frozen contract (`compat/coding-agent/cli-surface.json`):
 
 - **Model layer:** no thinking blocks, image blocks, `toolcall_delta`, reasoning effort, prompt-cache control, or `usage.cost`; `Retry-After` is not read; Codex sends no `reasoning`.
-- **Sessions:** the lock file is never reclaimed after a crash, so a killed process leaves its session `Locked` for good; `--resume`, `--fork`, export, import, listing, the entry model behind `get_entries` and `get_tree`.
+- **Sessions:** `--resume`, `--fork`, export, import, listing, the entry model behind `get_entries` and `get_tree`.
 - **Behavior:** no steering or follow-up queues, no compaction, no thinking levels, no user shell commands, no tool hooks; 10 of the 23 event types missing.
 - **Resources:** no `settings.json`, `models.json`, trust, skills, prompt templates, themes, keybindings, `SYSTEM.md`, MCP, proxy or CA configuration.
-- **Tools:** `read` and `edit` write and read whole files (no atomic write, no device or size guard, no fuzzy match, no image input); no PowerShell tool, `tool_search`, or codemode.
+- **Tools:** `read` reads whole files with no device or size guard and no image input; `edit` has no fuzzy match or diff details; no PowerShell tool, `tool_search`, or codemode.
 - **Surfaces:** no RPC mode (exits 2), no interactive mode (exits 2), no subcommands except `login` and `logout`, no `--help` text parity, no extensions.
 
 ## Analysis
@@ -121,7 +121,7 @@ What the model sees and what comes back, for every wire API.
 
 ### RS4: sessions and persistence (L)
 
-- **Crash safety first:** an operating-system advisory lock that the kernel releases when the process dies (`File::try_lock` is stable since Rust 1.89, above our 1.85, so this waits on decision #54 or uses a reviewed crate); one atomic-replace helper shared by `auth.json`, settings, and session metadata, with the Windows retry loop for access-denied and sharing violations; a session directory key from a normalized cwd identity (Windows case folding, `\\?\` removal) with a sidecar that records the real cwd.
+- **Crash safety first:** an operating-system advisory lock that the kernel releases when the process dies (`File::try_lock` is stable since Rust 1.89, so the workspace `rust-version` is 1.89 under the recommendation of decision #54); one atomic-replace helper shared by `auth.json`, settings, and the file tools, with the Windows retry loop for access-denied and sharing violations; a session directory key from a normalized cwd identity (Windows case folding, `\\?\` removal) with a sidecar that records the real cwd.
 - **Entry model that matches RPC:** entry ids, parent links, labels, `get_entries`, `get_tree` (linear, per the TypeScript contract), `get_fork_messages`, `fork`, `clone`, `switch_session`, `set_session_name`, `get_session_stats`; `--resume` listing, `--fork`, `--export`, and import.
 - **Recovery:** resume of an interrupted run, with the choice between refusing (today) and synthesizing results for orphan tool calls decided against the TypeScript behavior; session metadata appended again at the tail after compaction, because recovery reads the tail; unknown outcomes surfaced, never reported as success.
 - **Legacy import:** an explicit command for the legacy JSONL store; the durable SQLite store waits on decision #59.
@@ -227,11 +227,11 @@ Not used: either project's engine, plugin kernel, MCP client, SSE parser (Rebon-
 
 ## Next slices
 
-Reversible work that does not wait on a decision, in order:
+Reversible work that does not wait on a decision, in order. Done 2026-10-26: the operating-system lock for sessions and `auth.json`, the atomic-replace crate `nyan-coding-agent-fs` used by `write`, `edit`, and `auth.json`, and `edit` refusing non-UTF-8 files (`PARITY-DEVIATION(edit-non-utf8)`).
 
-1. T0: push the commits through a branch and pull request; read the first Windows runner result.
-2. RS4: advisory lock (behind the decision #54 choice), atomic-replace helper, apply it to `auth.json` and the session store.
-3. RS7: atomic `edit` and `write`; `read` guards; `edit` refuses non-UTF-8 files.
+1. T0: open a pull request from `rust-core-preview` so the Windows runner runs; `rust.yml` is not on `origin/main` yet, so `workflow_dispatch` cannot start it and only a pull request does. Needs the owner's go-ahead to open the PR.
+2. RS7: `read` guards (devices, FIFOs, size, UTF-16 BOM).
+3. RS4: cwd-identity session keys and the entry model behind `get_entries` and `get_tree`.
 4. RS3: `Retry-After` and the error classes; then content blocks and the v3 codec.
 5. T1: differential harness skeleton with one wire API, so RS3 has its gate.
 
@@ -258,7 +258,7 @@ Do not close or reinterpret these entries without an owner decision. Work contin
 
 | # | Question | Recommendation | Blocks |
 | --- | --- | --- | --- |
-| 54 | Which `rust-version`? Today 1.85. Rust 1.89 stabilizes `File::try_lock`, which gives a crash-safe session lock with no new dependency; `ratatui` 0.30 needs 1.88; GPUI needs the latest stable | Raise the workspace to 1.89 when RS4 starts; keep any GPUI crate in its own workspace | RS4 lock |
+| 54 | Which `rust-version`? Today 1.85. Rust 1.89 stabilizes `File::try_lock`, which gives a crash-safe session lock with no new dependency; `ratatui` 0.30 needs 1.88; GPUI needs the latest stable | Raise the workspace to 1.89 when RS4 starts; keep any GPUI crate in its own workspace. Applied on 2026-10-26 as a reversible step (`rust-version = "1.89"`); awaiting confirmation | RS4 lock |
 | 55 | Front-end: terminal UI (decision #48, `ratatui` and `crossterm`), GPUI desktop app, or both? GPUI cannot be the terminal mode, so choosing it alone removes the terminal interactive mode, themes, keybindings, and terminal extension components from the contract | Decide at gate G-UI after a spike; the terminal UI stays required for parity, and GPUI is an addition. #48 stays in force until then | RS11 |
 | 56 | Extension boundary after the TypeScript runtime is retired: out-of-process bridge to the user's `node`, a plugin protocol for any language, an embedded runtime, or MCP only? | Typed JSONL protocol with an optional bridge for existing TypeScript extensions; no Node on the ordinary path (#46) | RS9 |
 | 57 | Codemode (TypeScript runs model-written JavaScript against injected tools): drop it, embed an engine, or run it through the bridge? | Defer to RS9; do not embed an engine in the core | RS7, RS9 |
@@ -288,4 +288,5 @@ Do not close or reinterpret these entries without an owner decision. Work contin
 | --- | --- | --- |
 | 2026-10-23 | RS0 contract frozen | `compat/coding-agent/cli-surface.json` at `24424b129` |
 | 2026-10-23 | RS1 workspace and crate boundaries | `rust/` workspace; fmt, clippy, test on Linux; Windows clippy for the pure crates |
+| 2026-10-26 | RS4 crash-safe locks: the session and `auth.json` locks are operating-system locks the kernel drops when the process dies, with a test that kills the holder; the old create-new lock files left a session locked for good after a crash and the old `auth.json` stale-lock timer could steal a lock held during a slow refresh. Atomic file replacement (`nyan-coding-agent-fs`): readers never see a torn file under concurrent writers, symlinks and modes are kept, Windows rename retry. `rust-version` is 1.89 | 345 passing tests; mutation checks recorded for each; Linux only, the Windows runner has not executed them |
 | 2026-10-23 – 10-26 | RS2 runtime foundation, journal sessions, six wire APIs, `auth.json` and Codex OAuth, models.dev catalog, built-in tools, print and JSON modes, `login`, signals, retry backoff, deletion of the out-of-scope adapters | 36 local commits ending at `b506c86e2`; 332 passing tests; loopback servers only, no real provider or credential was used; the Windows runner has not executed any of it |

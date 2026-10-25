@@ -234,10 +234,10 @@ pub fn parse_authorization_input(input: &str) -> (Option<String>, Option<String>
     if let Some((code, state)) = value.split_once('#') {
         return (Some(code.to_owned()), Some(state.to_owned()));
     }
-    if value.contains("code=") {
-        if let Ok(url) = reqwest::Url::parse(&format!("http://pasted.invalid/?{value}")) {
-            return from_query(&url);
-        }
+    if value.contains("code=")
+        && let Ok(url) = reqwest::Url::parse(&format!("http://pasted.invalid/?{value}"))
+    {
+        return from_query(&url);
     }
     (Some(value.to_owned()), None)
 }

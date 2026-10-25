@@ -7,23 +7,26 @@
 //! malformed file is reported and never overwritten, because only its owner can
 //! say whether the content is recoverable.
 //!
-//! Writes are read-modify-write under a lock file, then a temporary file in the
-//! same directory is renamed over `auth.json`, so a crash leaves either the old
-//! file or the new one. On Unix the file is created with mode 0600; on Windows
+//! Writes are read-modify-write under an operating-system lock on
+//! `auth.json.flock`, then a temporary file in the same directory is renamed over
+//! `auth.json`, so a crash leaves either the old file or the new one. The kernel
+//! drops the lock when the process dies, so a killed process never leaves a lock
+//! behind; the lock file itself stays in place and is never a signal of a held
+//! lock. The TypeScript CLI locks `auth.json.lock` with its own protocol, so the
+//! two CLIs do not exclude each other; each still replaces the file atomically. On Unix the file is created with mode 0600; on Windows
 //! it inherits the access rules of the user's profile directory.
 
+use nyan_coding_agent_fs::{FileMode, write_atomic};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
 const FILE_NAME: &str = "auth.json";
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 const LOCK_POLL: Duration = Duration::from_millis(25);
-const LOCK_STALE: Duration = Duration::from_secs(30);
 /// A refresh makes a network call while holding the lock, so waiters wait longer.
 const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(45);
 
@@ -172,14 +175,9 @@ pub struct AuthStore {
     lock_wait: Duration,
 }
 
+/// Holds the credential write lock until it is dropped or the process ends.
 struct WriteLock {
-    path: PathBuf,
-}
-
-impl Drop for WriteLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    _file: fs::File,
 }
 
 impl AuthStore {
@@ -367,39 +365,31 @@ impl AuthStore {
     }
 
     fn lock(&self, wait: Duration) -> Result<WriteLock, AuthError> {
-        let path = self.path.with_extension("json.lock");
+        let path = self.path.with_extension("json.flock");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| io_error("open the credential lock file", &error))?;
         let started = std::time::Instant::now();
         loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(WriteLock { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age > LOCK_STALE);
-                    if stale {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(WriteLock { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {
                     if started.elapsed() >= wait {
                         return Err(AuthError::Locked { path });
                     }
                     std::thread::sleep(LOCK_POLL);
                 }
-                Err(error) => return Err(io_error("take the credential write lock", &error)),
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(io_error("take the credential write lock", &error));
+                }
             }
         }
     }
 
     fn write(&self, entries: &Map<String, Value>) -> Result<(), AuthError> {
-        let temporary = self
-            .path
-            .with_extension(format!("json.tmp-{}", std::process::id()));
         let mut text =
             serde_json::to_string_pretty(&Value::Object(entries.clone())).map_err(|error| {
                 AuthError::Io {
@@ -408,25 +398,8 @@ impl AuthStore {
                 }
             })?;
         text.push('\n');
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let result = options
-            .open(&temporary)
-            .and_then(|mut file| {
-                file.write_all(text.as_bytes())?;
-                file.sync_all()
-            })
-            .and_then(|()| fs::rename(&temporary, &self.path));
-        if let Err(error) = result {
-            let _ = fs::remove_file(&temporary);
-            return Err(io_error("write the credential file", &error));
-        }
-        Ok(())
+        write_atomic(&self.path, text.as_bytes(), FileMode::Exactly(0o600))
+            .map_err(|error| io_error("write the credential file", &error))
     }
 }
 

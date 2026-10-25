@@ -141,7 +141,7 @@ fn choose_provider(rest: &[String], env: &Environment) -> Result<&'static str, S
 }
 
 fn format_tokens(count: u64) -> String {
-    if count >= 1_000_000 && count % 1_000_000 == 0 {
+    if count >= 1_000_000 && count.is_multiple_of(1_000_000) {
         format!("{}M", count / 1_000_000)
     } else if count >= 1_000 {
         format!("{}K", count / 1_000)

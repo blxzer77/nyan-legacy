@@ -1,6 +1,7 @@
 //! The `write` tool, ported from `core/tools/write.ts`.
 
 use nyan_coding_agent_core::ExecutionContext;
+use nyan_coding_agent_fs::{FileMode, write_atomic};
 use serde_json::Value;
 
 use super::paths::resolve_to_cwd;
@@ -25,7 +26,8 @@ fn run(arguments: &Value, context: &ExecutionContext) -> Result<String, ToolErro
     if let Some(parent) = absolute.parent() {
         std::fs::create_dir_all(parent).map_err(|error| io_error(&error, "mkdir", parent))?;
     }
-    std::fs::write(&absolute, data).map_err(|error| io_error(&error, "open", &absolute))?;
+    write_atomic(&absolute, data.as_bytes(), FileMode::Preserve)
+        .map_err(|error| io_error(&error, "open", &absolute))?;
     Ok(format!("Successfully wrote to {path}"))
 }
 
