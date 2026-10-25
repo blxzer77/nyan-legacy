@@ -43,7 +43,7 @@ pub struct CatalogModel {
     pub name: String,
     /// The wire API the model is called through.
     pub api: WireApi,
-    /// Base URL; may hold `{NAME}` placeholders. Empty when the user supplies it (Azure).
+    /// Base URL; may hold `{NAME}` placeholders.
     pub base_url: String,
     /// Whether the model reasons.
     pub reasoning: bool,

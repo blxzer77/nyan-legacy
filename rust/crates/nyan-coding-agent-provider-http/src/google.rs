@@ -142,7 +142,6 @@ impl ModelProvider for GoogleGenerativeAiProvider {
                         .session_headers(request.session_id.as_deref()),
                 )
                 .collect(),
-            accept: None,
         };
         self.transport
             .start(post, request.cancellation.clone(), GoogleStream::default())
@@ -174,7 +173,6 @@ impl ModelProvider for GoogleVertexProvider {
             body: build_request_body(&request).to_string(),
             bearer,
             headers,
-            accept: None,
         };
         self.transport
             .start(post, request.cancellation.clone(), GoogleStream::default())

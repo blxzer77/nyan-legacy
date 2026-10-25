@@ -151,7 +151,6 @@ impl ModelProvider for OpenAiCodexProvider {
                 body: build_request_body(&request).to_string(),
                 bearer: Some(credentials.access_token),
                 headers,
-                accept: None,
             };
             transport
                 .start(

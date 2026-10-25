@@ -78,7 +78,6 @@ impl ModelProvider for OpenAiChatProvider {
             headers: self
                 .transport
                 .session_headers(request.session_id.as_deref()),
-            accept: None,
         };
         self.transport
             .start(post, request.cancellation.clone(), Accumulator::default())

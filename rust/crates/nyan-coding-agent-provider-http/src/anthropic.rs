@@ -105,7 +105,6 @@ impl ModelProvider for AnthropicMessagesProvider {
                     .session_headers(request.session_id.as_deref()),
             )
             .collect(),
-            accept: None,
         };
         self.transport.start(
             post,

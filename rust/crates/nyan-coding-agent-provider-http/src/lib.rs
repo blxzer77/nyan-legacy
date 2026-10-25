@@ -4,24 +4,18 @@
 //! futures they return are executor-neutral.
 
 pub mod anthropic;
-pub mod bedrock;
 pub mod codex;
 pub mod codex_auth;
 pub mod cpa;
-pub mod eventstream;
 pub mod google;
-pub mod mistral;
 pub mod models_dev;
 pub mod openai;
 pub mod responses;
-pub mod sigv4;
 pub mod sse;
 pub(crate) mod transport;
 
 pub use anthropic::AnthropicMessagesProvider;
-pub use bedrock::{BedrockAuth, BedrockConverseProvider};
 pub use codex::{CodexAuthSource, CodexCredentials, OpenAiCodexProvider};
 pub use google::{GoogleGenerativeAiProvider, GoogleVertexProvider, VertexAuth};
-pub use mistral::MistralConversationsProvider;
 pub use openai::OpenAiChatProvider;
 pub use responses::OpenAiResponsesProvider;

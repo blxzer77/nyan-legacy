@@ -1,7 +1,7 @@
 //! `OpenAI` Responses streaming provider (`openai-responses`).
 //!
 //! This is the wire API the `CLIProxyAPI` catalog registers every model with, at
-//! `{root}/backend-api/codex`, and the one `OpenAI`, xAI, and Meta use. Requests
+//! `{root}/backend-api/codex`, and the one `OpenAI` and xAI use. Requests
 //! are stateless (`store: false`): the whole context is sent each time.
 //!
 //! Not implemented yet, and therefore absent from the requests and the replies:
@@ -31,12 +31,6 @@ pub struct OpenAiResponsesProvider {
     base_url: String,
     api_key: Option<String>,
     instruction_role: &'static str,
-    /// Sends the key in this header instead of as a bearer token (Azure: `api-key`).
-    key_header: Option<&'static str>,
-    /// A query string appended to the URL, without the leading `?`.
-    query: Option<String>,
-    /// Maps a model id to the deployment name the server expects.
-    deployments: BTreeMap<String, String>,
     transport: Transport,
 }
 
@@ -57,37 +51,8 @@ impl OpenAiResponsesProvider {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key,
             instruction_role: "developer",
-            key_header: None,
-            query: None,
-            deployments: BTreeMap::new(),
             transport: Transport::new(handle)?,
         })
-    }
-
-    /// Creates an Azure `OpenAI` provider: the key travels in `api-key`, the URL
-    /// carries `api-version`, and `base_url` is the resource's `/openai/v1` root.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProviderError::Request`] when the HTTP client cannot be built.
-    pub fn azure(
-        id: impl Into<String>,
-        base_url: &str,
-        api_key: Option<String>,
-        api_version: &str,
-        handle: Handle,
-    ) -> Result<Self, ProviderError> {
-        let mut provider = Self::new(id, normalize_azure_base_url(base_url), api_key, handle)?;
-        provider.key_header = Some("api-key");
-        provider.query = Some(format!("api-version={api_version}"));
-        Ok(provider)
-    }
-
-    /// Maps model ids to deployment names; an unmapped id is sent as is.
-    #[must_use]
-    pub fn with_deployments(mut self, deployments: BTreeMap<String, String>) -> Self {
-        self.deployments = deployments;
-        self
     }
 
     /// Sends the conversation id in header `name` with every request.
@@ -122,30 +87,14 @@ impl ModelProvider for OpenAiResponsesProvider {
         &self,
         request: ProviderRequest,
     ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
-        let mut request = request;
-        if let Some(deployment) = self.deployments.get(&request.model.model) {
-            request.model.model.clone_from(deployment);
-        }
-        let mut url = format!("{}/responses", self.base_url);
-        if let Some(query) = &self.query {
-            url.push('?');
-            url.push_str(query);
-        }
-        let (bearer, mut headers) = match (self.key_header, &self.api_key) {
-            (Some(name), Some(key)) => (None, vec![(name.to_owned(), key.clone())]),
-            (None, key) => (key.clone(), Vec::new()),
-            (Some(_), None) => (None, Vec::new()),
-        };
-        headers.extend(
-            self.transport
-                .session_headers(request.session_id.as_deref()),
-        );
+        let headers = self
+            .transport
+            .session_headers(request.session_id.as_deref());
         let post = Post {
-            url,
+            url: format!("{}/responses", self.base_url),
             body: build_request_body(&request, self.instruction_role).to_string(),
-            bearer,
+            bearer: self.api_key.clone(),
             headers,
-            accept: None,
         };
         self.transport.start(
             post,
@@ -153,32 +102,6 @@ impl ModelProvider for OpenAiResponsesProvider {
             ResponsesStream::default(),
         )
     }
-}
-
-/// Reduces an Azure resource URL to its `/openai/v1` root.
-///
-/// A bare Azure host, `/openai`, and a pasted `/openai/v1/responses` URL all
-/// become `{origin}/openai/v1`; any other URL is only stripped of trailing
-/// slashes, so a custom gateway keeps its own path.
-#[must_use]
-pub fn normalize_azure_base_url(input: &str) -> String {
-    let trimmed = input.trim().trim_end_matches('/');
-    let Ok(url) = reqwest::Url::parse(trimmed) else {
-        return trimmed.to_owned();
-    };
-    let host = url.host_str().unwrap_or_default();
-    let azure_host = [
-        ".openai.azure.com",
-        ".cognitiveservices.azure.com",
-        ".ai.azure.com",
-    ]
-    .iter()
-    .any(|suffix| host.ends_with(suffix));
-    let path = url.path().trim_end_matches('/');
-    if azure_host && matches!(path, "" | "/openai" | "/openai/v1/responses") {
-        return format!("{}/openai/v1", url.origin().ascii_serialization());
-    }
-    trimmed.to_owned()
 }
 
 /// Builds the Responses request body.

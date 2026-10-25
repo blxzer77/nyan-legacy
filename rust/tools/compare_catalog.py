@@ -27,7 +27,7 @@ for f in sorted(glob.glob(base+'*.json')):
     same=set(ts)&set(rs)
     row=[len(set(ts)-set(rs)),len(set(rs)-set(ts)),
       sum(1 for i in same if ts[i]['api']!=rs[i][0]),
-      sum(1 for i in same if (ts[i].get('baseUrl') or '')!=rs[i][1] and pid!='azure'),
+      sum(1 for i in same if (ts[i].get('baseUrl') or '')!=rs[i][1]),
       sum(1 for i in same if ts[i].get('contextWindow')!=rs[i][2]),
       sum(1 for i in same if ts[i].get('maxTokens')!=rs[i][3]),
       sum(1 for i in same if abs((ts[i].get('cost') or {}).get('input',0)-rs[i][6])>1e-9 or abs((ts[i].get('cost') or {}).get('output',0)-rs[i][7])>1e-9)]
