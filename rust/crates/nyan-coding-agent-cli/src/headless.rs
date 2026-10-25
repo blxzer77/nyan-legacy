@@ -10,10 +10,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use nyan_coding_agent_core::{Message, MessageRole, StopReason, now_ms};
+use nyan_coding_agent_core::{CancellationToken, Message, MessageRole, StopReason, now_ms};
 use nyan_coding_agent_protocol::{event_to_jsonl, session_header_jsonl};
 use nyan_coding_agent_provider::{ProviderModel, ProviderRegistry};
-use nyan_coding_agent_runtime::{AgentEvent, AgentRuntime, EventSink, RuntimeConfig};
+use nyan_coding_agent_runtime::{AgentEvent, AgentRuntime, EventSink, RetrySleep, RuntimeConfig};
 use nyan_coding_agent_session::{NativeSession, SessionRecordKind, SessionStoreError};
 use nyan_coding_agent_tools::ToolRegistry;
 
@@ -39,6 +39,10 @@ pub struct HeadlessOptions {
     pub model: ProviderModel,
     /// The system prompt, placed first in every request.
     pub system_prompt: Option<String>,
+    /// Cancelled by the process on an interrupt; the run then ends as aborted.
+    pub cancellation: CancellationToken,
+    /// How the run waits between provider retries.
+    pub retry_sleep: Option<RetrySleep>,
 }
 
 /// A session shared between the run and the code that reports on it afterwards.
@@ -217,7 +221,9 @@ pub async fn run_headless(
         .lock()
         .ok()
         .map(|guard| guard.session().descriptor.id.as_str().to_owned());
-    let mut runtime = AgentRuntime::new(providers, tools, config);
+    config.retry_sleep = options.retry_sleep.clone();
+    let mut runtime =
+        AgentRuntime::new(providers, tools, config).with_cancellation(options.cancellation.clone());
     if let Err(message) = prepare_session(&session, options.system_prompt.as_deref()) {
         write_err(&format!("Error: {message}\n"));
         return 1;
@@ -225,6 +231,9 @@ pub async fn run_headless(
     let mut last_answer: Option<Message> = None;
     let mut persistence_failed = false;
     for text in &options.messages {
+        if options.cancellation.is_cancelled() {
+            break;
+        }
         let outcome = runtime
             .run_persistent(
                 Arc::clone(&session),
@@ -267,7 +276,7 @@ mod tests {
     use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
 
-    use nyan_coding_agent_core::{BoxFuture, CoreError};
+    use nyan_coding_agent_core::{BoxFuture, CancellationToken, CoreError};
     use nyan_coding_agent_provider::{
         ModelProvider, ProviderError, ProviderModel, ProviderRegistry, ProviderRequest,
         ProviderStopReason, ProviderStream, ProviderStreamEvent,
@@ -421,6 +430,8 @@ mod tests {
                     model: "m".to_owned(),
                 },
                 system_prompt: None,
+                cancellation: CancellationToken::new(),
+                retry_sleep: None,
             },
             &provider,
             &NoTools,

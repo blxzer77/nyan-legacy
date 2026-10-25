@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use nyan_coding_agent_session::NativeSession;
 
-use nyan_coding_agent_core::VERSION;
+use nyan_coding_agent_core::{CancellationToken, VERSION};
 use nyan_coding_agent_protocol::{RpcCommandName, SessionEventName};
 use nyan_coding_agent_provider::ProviderModel;
 use nyan_coding_agent_tools::builtin::BuiltinTools;
@@ -19,6 +19,7 @@ use crate::app_mode::{AppMode, resolve_app_mode};
 use crate::args::{Args, DiagnosticKind, ListModels, parse_args};
 use crate::headless::{HeadlessMode, HeadlessOptions, SharedWriter, run_headless};
 use crate::initial_message::{build_prompts, read_file_arguments};
+use crate::interrupt;
 use crate::login::{run_list_models, run_login, run_logout};
 use crate::providers::{ProviderSetup, build_provider, resolve_model, resolve_provider};
 use crate::session_setup::open_session;
@@ -317,18 +318,32 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
             return 1;
         }
     };
-    runtime.block_on(run_headless(
+    let cancellation = CancellationToken::new();
+    let interrupted = match runtime.block_on(async { interrupt::install(cancellation.clone()) }) {
+        Ok(interrupted) => interrupted,
+        Err(error) => {
+            write_to(
+                err,
+                &format!("Error: failed to install the signal handlers: {error}\n"),
+            );
+            return 1;
+        }
+    };
+    let code = runtime.block_on(run_headless(
         HeadlessOptions {
             mode,
             messages,
             cwd: env.cwd.clone(),
             model,
             system_prompt: Some(system_prompt),
+            cancellation,
+            retry_sleep: Some(interrupt::cancellable_sleep()),
         },
         &providers,
         &BuiltinTools::only(&tools),
         Arc::new(Mutex::new(session)),
         out.clone(),
         err.clone(),
-    ))
+    ));
+    interrupted.exit_code().unwrap_or(code)
 }

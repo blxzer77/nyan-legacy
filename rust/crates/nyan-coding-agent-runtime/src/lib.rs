@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use nyan_coding_agent_core::{
     BoxFuture, CancellationToken, CoreError, ExecutionContext, Message, MessageRole, StopReason,
@@ -57,17 +58,25 @@ pub enum AgentEvent {
         /// Final message value.
         message: Message,
     },
-    /// A retryable provider failure is being retried.
+    /// A retryable provider failure will be retried after a delay.
     RetryStart {
         /// One-based retry number.
         attempt: usize,
+        /// The most retries that will be made.
+        max_attempts: usize,
+        /// How long the runtime waits before trying again.
+        delay_ms: u64,
+        /// Why the previous attempt failed.
+        error_message: String,
     },
     /// A provider retry attempt has ended.
     RetryEnd {
-        /// One-based retry number.
+        /// Number of retries made so far.
         attempt: usize,
         /// Whether the retry produced a complete stream.
         succeeded: bool,
+        /// Why the retries stopped, when they failed.
+        final_error: Option<String>,
     },
     /// A tool call has begun.
     ToolExecutionStart {
@@ -84,6 +93,8 @@ pub enum AgentEvent {
         call_id: ToolCallId,
         /// Registered tool name.
         tool_name: String,
+        /// Opaque JSON arguments of the call.
+        arguments: String,
         /// Partial result.
         partial_result: ToolResult,
     },
@@ -95,6 +106,8 @@ pub enum AgentEvent {
         tool_name: String,
         /// Model-facing result.
         result: Message,
+        /// How long the tool ran, measured with a monotonic clock; absent when it never ran.
+        duration_ms: Option<u64>,
     },
     /// A turn has finished, including its tool results.
     TurnEnd {
@@ -186,6 +199,35 @@ pub enum ToolExecutionMode {
     Parallel,
 }
 
+/// Waits for a duration, returning early when the token is cancelled.
+///
+/// The runtime does not choose an executor, so whoever builds it supplies the timer.
+#[derive(Clone)]
+pub struct RetrySleep(Arc<dyn Fn(Duration, CancellationToken) -> BoxFuture<()> + Send + Sync>);
+
+impl RetrySleep {
+    /// Wraps a sleep function.
+    pub fn new(
+        sleep: impl Fn(Duration, CancellationToken) -> BoxFuture<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(sleep))
+    }
+}
+
+impl std::fmt::Debug for RetrySleep {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RetrySleep")
+    }
+}
+
+impl PartialEq for RetrySleep {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RetrySleep {}
+
 /// Configuration for one runtime instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
@@ -197,6 +239,12 @@ pub struct RuntimeConfig {
     pub max_turns: usize,
     /// Maximum fresh provider attempts after a retryable failure.
     pub max_retries: usize,
+    /// The wait before the first retry; each later retry waits twice as long.
+    pub retry_base_delay: Duration,
+    /// The longest wait before one retry.
+    pub retry_max_delay: Duration,
+    /// How the runtime waits between retries; without one it retries at once.
+    pub retry_sleep: Option<RetrySleep>,
     /// Tool scheduling policy.
     pub tool_execution: ToolExecutionMode,
     /// The conversation id sent with every provider request.
@@ -211,7 +259,10 @@ impl RuntimeConfig {
             model,
             cwd: cwd.into(),
             max_turns: 64,
-            max_retries: 2,
+            max_retries: 3,
+            retry_base_delay: Duration::from_secs(2),
+            retry_max_delay: Duration::from_secs(60),
+            retry_sleep: None,
             tool_execution: ToolExecutionMode::Parallel,
             session_id: None,
         }
@@ -362,18 +413,24 @@ where
     }
 }
 
+/// How long a tool ran, filled in by its future when it finishes.
+type RanFor = Arc<Mutex<Option<Duration>>>;
+
 struct PendingTool {
     call: ToolCall,
     future: BoxFuture<Result<ToolResult, ToolError>>,
+    ran_for: RanFor,
 }
+
+type Completed = (ToolCall, Result<ToolResult, ToolError>, Option<Duration>);
 
 struct JoinToolFutures {
     pending: Vec<Option<PendingTool>>,
-    results: Vec<Option<(ToolCall, Result<ToolResult, ToolError>)>>,
+    results: Vec<Option<Completed>>,
 }
 
 impl Future for JoinToolFutures {
-    type Output = Vec<(ToolCall, Result<ToolResult, ToolError>)>;
+    type Output = Vec<Completed>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -385,7 +442,8 @@ impl Future for JoinToolFutures {
             match pending.future.as_mut().poll(context) {
                 Poll::Ready(result) => {
                     let call = pending.call.clone();
-                    this.results[index] = Some((call, result));
+                    let ran_for = pending.ran_for.lock().ok().and_then(|cell| *cell);
+                    this.results[index] = Some((call, result, ran_for));
                     this.pending[index] = None;
                 }
                 Poll::Pending => all_ready = false,
@@ -591,6 +649,13 @@ impl<'a> AgentRuntime<'a> {
         self.context = context;
     }
 
+    /// Replaces the cancellation token, so the process can cancel the run from a signal handler.
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
     /// Returns a shared cancellation token owned by this runtime.
     #[must_use]
     pub fn cancellation(&self) -> CancellationToken {
@@ -667,6 +732,17 @@ impl<'a> AgentRuntime<'a> {
         })
     }
 
+    /// The wait before retry number `attempt`: the base doubled each time, capped.
+    fn retry_delay(&self, attempt: usize) -> Duration {
+        let doublings = u32::try_from(attempt.saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .min(32);
+        self.config
+            .retry_base_delay
+            .saturating_mul(2_u32.saturating_pow(doublings))
+            .min(self.config.retry_max_delay)
+    }
+
     async fn request_assistant(
         &mut self,
         sink: &Arc<dyn EventSink>,
@@ -690,46 +766,57 @@ impl<'a> AgentRuntime<'a> {
                 cancellation: self.cancellation.clone(),
                 session_id: self.config.session_id.clone(),
             };
-            match provider.stream(request).await {
+            let (failure, retryable) = match provider.stream(request).await {
                 Ok(mut stream) => match self.consume_stream(&mut *stream, &**sink).await {
                     Ok(result) => {
                         if retry_index > 0 {
                             sink.emit(AgentEvent::RetryEnd {
                                 attempt: retry_index,
                                 succeeded: true,
+                                final_error: None,
                             });
                         }
                         return Ok(result);
                     }
-                    Err(failure)
-                        if failure.is_retryable() && retry_index < self.config.max_retries =>
-                    {
-                        let attempt = retry_index + 1;
-                        sink.emit(AgentEvent::RetryStart { attempt });
-                    }
+                    // A stream that already showed text to the user is not retried.
                     Err(failure) => {
-                        if retry_index > 0 {
-                            sink.emit(AgentEvent::RetryEnd {
-                                attempt: retry_index,
-                                succeeded: false,
-                            });
-                        }
-                        return Err(failure.error);
+                        let retryable = failure.is_retryable();
+                        (failure.error, retryable)
                     }
                 },
-                Err(error) if error.is_retryable() && retry_index < self.config.max_retries => {
-                    let attempt = retry_index + 1;
-                    sink.emit(AgentEvent::RetryStart { attempt });
-                }
                 Err(error) => {
-                    if retry_index > 0 {
-                        sink.emit(AgentEvent::RetryEnd {
-                            attempt: retry_index,
-                            succeeded: false,
-                        });
-                    }
-                    return Err(error.into());
+                    let retryable = error.is_retryable();
+                    (error.into(), retryable)
                 }
+            };
+            if !retryable || retry_index >= self.config.max_retries {
+                if retry_index > 0 {
+                    sink.emit(AgentEvent::RetryEnd {
+                        attempt: retry_index,
+                        succeeded: false,
+                        final_error: Some(failure.to_string()),
+                    });
+                }
+                return Err(failure);
+            }
+            let attempt = retry_index + 1;
+            let delay = self.retry_delay(attempt);
+            sink.emit(AgentEvent::RetryStart {
+                attempt,
+                max_attempts: self.config.max_retries,
+                delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                error_message: failure.to_string(),
+            });
+            if let Some(sleep) = &self.config.retry_sleep {
+                (sleep.0)(delay, self.cancellation.clone()).await;
+            }
+            if self.cancellation.is_cancelled() {
+                sink.emit(AgentEvent::RetryEnd {
+                    attempt,
+                    succeeded: false,
+                    final_error: Some("Retry cancelled".to_owned()),
+                });
+                return Err(RuntimeError::Core(CoreError::Cancelled));
             }
         }
         Err(RuntimeError::UnterminatedProviderStream)
@@ -891,6 +978,7 @@ impl<'a> AgentRuntime<'a> {
                 tool_name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
+            let mut ran_for: Option<Duration> = None;
             let (text, is_error) = match self.tools.tool(&call.name) {
                 Some(tool) => {
                     let accepting_updates = Arc::new(Mutex::new(true));
@@ -899,6 +987,7 @@ impl<'a> AgentRuntime<'a> {
                         let sink = Arc::clone(sink);
                         let call_id = call.id.clone();
                         let tool_name = call.name.clone();
+                        let arguments = call.arguments.clone();
                         Arc::new(move |partial_result| {
                             if let Ok(active) = accepting_updates.lock()
                                 && *active
@@ -906,11 +995,13 @@ impl<'a> AgentRuntime<'a> {
                                 sink.emit(AgentEvent::ToolExecutionUpdate {
                                     call_id: call_id.clone(),
                                     tool_name: tool_name.clone(),
+                                    arguments: arguments.clone(),
                                     partial_result,
                                 });
                             }
                         })
                     };
+                    let started = Instant::now();
                     let execution = tool
                         .execute(
                             call.arguments.clone(),
@@ -921,6 +1012,7 @@ impl<'a> AgentRuntime<'a> {
                             .with_update_sink(update_sink),
                         )
                         .await;
+                    ran_for = Some(started.elapsed());
                     if let Ok(mut active) = accepting_updates.lock() {
                         *active = false;
                     }
@@ -933,7 +1025,7 @@ impl<'a> AgentRuntime<'a> {
                                 "tool execution cancelled",
                                 true,
                             );
-                            self.emit_tool_result(call, result, &**sink);
+                            self.emit_tool_result(call, result, &**sink, ran_for);
                             return Err(RuntimeError::Core(CoreError::Cancelled));
                         }
                         Err(ToolError::UnknownOutcome { operation, message }) => {
@@ -943,7 +1035,7 @@ impl<'a> AgentRuntime<'a> {
                                 format!("unknown outcome for {operation}: {message}"),
                                 true,
                             );
-                            self.emit_tool_result(call, result, &**sink);
+                            self.emit_tool_result(call, result, &**sink, ran_for);
                             return Err(RuntimeError::UnknownOutcome { operation, message });
                         }
                         Err(error) => (error.to_string(), true),
@@ -952,7 +1044,7 @@ impl<'a> AgentRuntime<'a> {
                 None => (format!("unknown tool: {}", call.name), true),
             };
             let result = Message::tool_result(call.id.clone(), &call.name, text, is_error);
-            self.emit_tool_result(call, result.clone(), &**sink);
+            self.emit_tool_result(call, result.clone(), &**sink, ran_for);
             results.push(result);
             if self.cancellation.is_cancelled() {
                 return Err(RuntimeError::Core(CoreError::Cancelled));
@@ -974,9 +1066,11 @@ impl<'a> AgentRuntime<'a> {
                 tool_name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
+            let ran_for: RanFor = Arc::new(Mutex::new(None));
             pending.push(PendingTool {
                 call: call.clone(),
-                future: self.prepare_tool_future(call, sink),
+                future: self.prepare_tool_future(call, sink, Arc::clone(&ran_for)),
+                ran_for,
             });
         }
 
@@ -986,8 +1080,8 @@ impl<'a> AgentRuntime<'a> {
         }
         .await;
         let mut results = Vec::with_capacity(completed.len());
-        for (call, execution) in completed {
-            let result = self.finalize_tool_execution(&call, execution, &**sink)?;
+        for (call, execution, ran_for) in completed {
+            let result = self.finalize_tool_execution(&call, execution, &**sink, ran_for)?;
             results.push(result);
             if self.cancellation.is_cancelled() {
                 return Err(RuntimeError::Core(CoreError::Cancelled));
@@ -1000,6 +1094,7 @@ impl<'a> AgentRuntime<'a> {
         &self,
         call: &ToolCall,
         sink: &Arc<dyn EventSink>,
+        ran_for: RanFor,
     ) -> BoxFuture<Result<ToolResult, ToolError>> {
         let Some(tool) = self.tools.tool(&call.name) else {
             let name = call.name.clone();
@@ -1011,6 +1106,7 @@ impl<'a> AgentRuntime<'a> {
             let sink = Arc::clone(sink);
             let call_id = call.id.clone();
             let tool_name = call.name.clone();
+            let arguments = call.arguments.clone();
             Arc::new(move |partial_result| {
                 if let Ok(active) = accepting_updates.lock()
                     && *active
@@ -1018,6 +1114,7 @@ impl<'a> AgentRuntime<'a> {
                     sink.emit(AgentEvent::ToolExecutionUpdate {
                         call_id: call_id.clone(),
                         tool_name: tool_name.clone(),
+                        arguments: arguments.clone(),
                         partial_result,
                     });
                 }
@@ -1029,7 +1126,11 @@ impl<'a> AgentRuntime<'a> {
                 .with_update_sink(update_sink),
         );
         Box::pin(async move {
+            let started = Instant::now();
             let result = execution.await;
+            if let Ok(mut cell) = ran_for.lock() {
+                *cell = Some(started.elapsed());
+            }
             if let Ok(mut active) = accepting_updates.lock() {
                 *active = false;
             }
@@ -1042,12 +1143,13 @@ impl<'a> AgentRuntime<'a> {
         call: &ToolCall,
         execution: Result<ToolResult, ToolError>,
         sink: &dyn EventSink,
+        ran_for: Option<Duration>,
     ) -> Result<Message, RuntimeError> {
         match execution {
             Ok(result) => {
                 let result =
                     Message::tool_result(call.id.clone(), &call.name, result.text, result.is_error);
-                self.emit_tool_result(call, result.clone(), sink);
+                self.emit_tool_result(call, result.clone(), sink, ran_for);
                 Ok(result)
             }
             Err(ToolError::Cancelled) => {
@@ -1057,7 +1159,7 @@ impl<'a> AgentRuntime<'a> {
                     "tool execution cancelled",
                     true,
                 );
-                self.emit_tool_result(call, result, sink);
+                self.emit_tool_result(call, result, sink, ran_for);
                 Err(RuntimeError::Core(CoreError::Cancelled))
             }
             Err(ToolError::UnknownOutcome { operation, message }) => {
@@ -1067,24 +1169,32 @@ impl<'a> AgentRuntime<'a> {
                     format!("unknown outcome for {operation}: {message}"),
                     true,
                 );
-                self.emit_tool_result(call, result, sink);
+                self.emit_tool_result(call, result, sink, ran_for);
                 Err(RuntimeError::UnknownOutcome { operation, message })
             }
             Err(error) => {
                 let result =
                     Message::tool_result(call.id.clone(), &call.name, error.to_string(), true);
-                self.emit_tool_result(call, result.clone(), sink);
+                self.emit_tool_result(call, result.clone(), sink, ran_for);
                 Ok(result)
             }
         }
     }
 
-    fn emit_tool_result(&mut self, call: &ToolCall, result: Message, sink: &dyn EventSink) {
+    fn emit_tool_result(
+        &mut self,
+        call: &ToolCall,
+        result: Message,
+        sink: &dyn EventSink,
+        ran_for: Option<Duration>,
+    ) {
         self.context.messages.push(result.clone());
         sink.emit(AgentEvent::ToolExecutionEnd {
             call_id: call.id.clone(),
             tool_name: call.name.clone(),
             result: result.clone(),
+            duration_ms: ran_for
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
         });
         sink.emit(AgentEvent::MessageStart {
             message: result.clone(),
@@ -1149,6 +1259,7 @@ impl<'a> AgentRuntime<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::{Duration, RetrySleep};
     use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::Pin;
@@ -2089,7 +2200,8 @@ mod tests {
             event,
             AgentEvent::RetryEnd {
                 attempt: 1,
-                succeeded: true
+                succeeded: true,
+                final_error: None
             }
         )));
     }
@@ -2125,16 +2237,21 @@ mod tests {
             run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
 
         assert_eq!(result.outcome, AgentOutcome::Completed);
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::RetryStart { attempt: 1 }))
-        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RetryStart {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 2000,
+                ..
+            }
+        )));
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::RetryEnd {
                 attempt: 1,
-                succeeded: true
+                succeeded: true,
+                final_error: None
             }
         )));
     }
@@ -2171,9 +2288,180 @@ mod tests {
             event,
             AgentEvent::RetryEnd {
                 attempt: 1,
-                succeeded: false
+                succeeded: false,
+                final_error: Some(_)
             }
         )));
+    }
+
+    /// A sleep that records each requested wait instead of waiting.
+    fn recording_sleep(waits: &Arc<Mutex<Vec<Duration>>>) -> RetrySleep {
+        let waits = Arc::clone(waits);
+        RetrySleep::new(move |delay, _cancellation| {
+            waits.lock().expect("lock").push(delay);
+            Box::pin(async {})
+        })
+    }
+
+    fn failing_runtime_config(failures: usize) -> (Providers, RuntimeConfig) {
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::from([vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: "ok".to_owned(),
+                    },
+                    ProviderStreamEvent::Finished {
+                        reason: ProviderStopReason::Stop,
+                    },
+                ]])),
+                failures: Mutex::new(failures),
+            },
+        };
+        let config = RuntimeConfig::new(
+            ProviderModel {
+                provider: "fake".to_owned(),
+                model: "test".to_owned(),
+            },
+            "/tmp/project",
+        );
+        (providers, config)
+    }
+
+    #[test]
+    fn retries_wait_with_a_doubling_delay_capped_at_the_maximum() {
+        let (providers, mut config) = failing_runtime_config(4);
+        config.max_retries = 4;
+        config.retry_base_delay = Duration::from_millis(100);
+        config.retry_max_delay = Duration::from_millis(350);
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        config.retry_sleep = Some(recording_sleep(&waits));
+        let tools = Tools { echo: EchoTool };
+        let mut runtime = AgentRuntime::new(&providers, &tools, config);
+        let (result, events) =
+            run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
+
+        assert_eq!(result.outcome, AgentOutcome::Completed);
+        assert_eq!(
+            *waits.lock().expect("lock"),
+            [100, 200, 350, 350].map(Duration::from_millis)
+        );
+        let announced = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::RetryStart {
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                    error_message,
+                } => Some((*attempt, *max_attempts, *delay_ms, error_message.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let message = announced[0].3.clone();
+        assert!(message.contains("temporary provider failure"), "{message}");
+        assert_eq!(
+            announced
+                .iter()
+                .map(|a| (a.0, a.1, a.2))
+                .collect::<Vec<_>>(),
+            [(1, 4, 100), (2, 4, 200), (3, 4, 350), (4, 4, 350)]
+        );
+    }
+
+    #[test]
+    fn cancelling_during_the_retry_wait_ends_the_retry_and_aborts_the_run() {
+        let (providers, mut config) = failing_runtime_config(1);
+        config.retry_sleep = Some(RetrySleep::new(|_delay, cancellation| {
+            cancellation.cancel();
+            Box::pin(async {})
+        }));
+        let tools = Tools { echo: EchoTool };
+        let mut runtime = AgentRuntime::new(&providers, &tools, config);
+        let (result, events) =
+            run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
+
+        assert_eq!(result.outcome, AgentOutcome::Aborted);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RetryEnd {
+                attempt: 1,
+                succeeded: false,
+                final_error: Some(reason)
+            } if reason == "Retry cancelled"
+        )));
+    }
+
+    #[test]
+    fn tool_events_carry_the_arguments_and_how_long_a_tool_ran() {
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            let providers = Providers {
+                provider: FakeProvider {
+                    responses: Mutex::new(VecDeque::from([
+                        vec![
+                            ProviderStreamEvent::ToolCall(
+                                nyan_coding_agent_provider::ToolCallRequest {
+                                    id: "call-1".to_owned(),
+                                    name: "echo".to_owned(),
+                                    arguments: "{\"x\":1}".to_owned(),
+                                },
+                            ),
+                            ProviderStreamEvent::ToolCall(
+                                nyan_coding_agent_provider::ToolCallRequest {
+                                    id: "call-2".to_owned(),
+                                    name: "missing".to_owned(),
+                                    arguments: "{}".to_owned(),
+                                },
+                            ),
+                            ProviderStreamEvent::Finished {
+                                reason: ProviderStopReason::ToolUse,
+                            },
+                        ],
+                        vec![
+                            ProviderStreamEvent::TextDelta {
+                                text: "done".to_owned(),
+                            },
+                            ProviderStreamEvent::Finished {
+                                reason: ProviderStopReason::Stop,
+                            },
+                        ],
+                    ])),
+                    failures: Mutex::new(0),
+                },
+            };
+            let tools = Tools { echo: EchoTool };
+            let mut config = RuntimeConfig::new(
+                ProviderModel {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                },
+                "/tmp/project",
+            );
+            config.tool_execution = mode;
+            let mut runtime = AgentRuntime::new(&providers, &tools, config);
+            let (_result, events) =
+                run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
+
+            let updates = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ToolExecutionUpdate { arguments, .. } => Some(arguments.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(updates, ["{\"x\":1}"], "{mode:?}");
+            let durations = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ToolExecutionEnd {
+                        tool_name,
+                        duration_ms,
+                        ..
+                    } => Some((tool_name.as_str(), duration_ms.is_some())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(durations, [("echo", true), ("missing", false)], "{mode:?}");
+        }
     }
 
     /// Records the conversation id every request carries.

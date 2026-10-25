@@ -307,3 +307,39 @@ fn a_request_cancelled_before_it_starts_never_connects() {
     assert!(matches!(result, Err(ProviderError::Cancelled)));
     assert_eq!(*server.captured.lock().expect("captured lock"), "");
 }
+
+#[test]
+fn cancellation_ends_a_request_the_server_never_answers() {
+    let runtime = Runtime::new().expect("runtime");
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    // Accepts the connection and then says nothing, not even response headers.
+    runtime.spawn(async move {
+        let _held = listener.accept().await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let provider = OpenAiChatProvider::new(
+        "loopback",
+        format!("http://{address}/v1"),
+        Some("secret-key".to_owned()),
+        runtime.handle().clone(),
+    )
+    .expect("build provider");
+    let cancellation = CancellationToken::new();
+    let trigger = cancellation.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        trigger.cancel();
+    });
+    let started = std::time::Instant::now();
+    let result = runtime.block_on(provider.stream(request(cancellation)));
+    canceller.join().expect("canceller");
+    assert!(matches!(result, Err(ProviderError::Cancelled)));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}

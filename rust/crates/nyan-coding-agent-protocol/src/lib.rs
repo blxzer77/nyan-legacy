@@ -632,41 +632,10 @@ pub fn event_to_jsonl(event: &AgentEvent) -> String {
                 .raw("assistantMessageEvent", &assistant_event_json(event))
                 .finish()
         }
-        AgentEvent::RetryStart { attempt } => JsonlRecord::new("auto_retry_start")
-            .raw("attempt", &attempt.to_string())
-            .finish(),
-        AgentEvent::RetryEnd { attempt, succeeded } => JsonlRecord::new("auto_retry_end")
-            .boolean("success", *succeeded)
-            .raw("attempt", &attempt.to_string())
-            .finish(),
-        AgentEvent::ToolExecutionStart {
-            call_id,
-            tool_name,
-            arguments,
-        } => JsonlRecord::new("tool_execution_start")
-            .string("toolCallId", call_id.as_str())
-            .string("toolName", tool_name)
-            .raw("args", &arguments_json(arguments))
-            .finish(),
-        AgentEvent::ToolExecutionUpdate {
-            call_id,
-            tool_name,
-            partial_result,
-        } => JsonlRecord::new("tool_execution_update")
-            .string("toolCallId", call_id.as_str())
-            .string("toolName", tool_name)
-            .raw("partialResult", &encode_tool_result(&partial_result.text))
-            .finish(),
-        AgentEvent::ToolExecutionEnd {
-            call_id,
-            tool_name,
-            result,
-        } => JsonlRecord::new("tool_execution_end")
-            .string("toolCallId", call_id.as_str())
-            .string("toolName", tool_name)
-            .raw("result", &encode_tool_result(&result.text))
-            .boolean("isError", result.is_error)
-            .finish(),
+        AgentEvent::RetryStart { .. } | AgentEvent::RetryEnd { .. } => retry_event_jsonl(event),
+        AgentEvent::ToolExecutionStart { .. }
+        | AgentEvent::ToolExecutionUpdate { .. }
+        | AgentEvent::ToolExecutionEnd { .. } => tool_event_jsonl(event),
         AgentEvent::TurnEnd {
             message,
             tool_results,
@@ -699,6 +668,78 @@ pub fn event_to_jsonl(event: &AgentEvent) -> String {
             );
             records
         }
+    }
+}
+
+fn retry_event_jsonl(event: &AgentEvent) -> String {
+    match event {
+        AgentEvent::RetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => JsonlRecord::new("auto_retry_start")
+            .raw("attempt", &attempt.to_string())
+            .raw("maxAttempts", &max_attempts.to_string())
+            .raw("delayMs", &delay_ms.to_string())
+            .string("errorMessage", error_message)
+            .finish(),
+        AgentEvent::RetryEnd {
+            attempt,
+            succeeded,
+            final_error,
+        } => {
+            let mut record = JsonlRecord::new("auto_retry_end")
+                .boolean("success", *succeeded)
+                .raw("attempt", &attempt.to_string());
+            if let Some(error) = final_error {
+                record = record.string("finalError", error);
+            }
+            record.finish()
+        }
+        _ => unreachable!("retry_event_jsonl is only called for its own events"),
+    }
+}
+
+fn tool_event_jsonl(event: &AgentEvent) -> String {
+    match event {
+        AgentEvent::ToolExecutionStart {
+            call_id,
+            tool_name,
+            arguments,
+        } => JsonlRecord::new("tool_execution_start")
+            .string("toolCallId", call_id.as_str())
+            .string("toolName", tool_name)
+            .raw("args", &arguments_json(arguments))
+            .finish(),
+        AgentEvent::ToolExecutionUpdate {
+            call_id,
+            tool_name,
+            arguments,
+            partial_result,
+        } => JsonlRecord::new("tool_execution_update")
+            .string("toolCallId", call_id.as_str())
+            .string("toolName", tool_name)
+            .raw("args", &arguments_json(arguments))
+            .raw("partialResult", &encode_tool_result(&partial_result.text))
+            .finish(),
+        AgentEvent::ToolExecutionEnd {
+            call_id,
+            tool_name,
+            result,
+            duration_ms,
+        } => {
+            let mut record = JsonlRecord::new("tool_execution_end")
+                .string("toolCallId", call_id.as_str())
+                .string("toolName", tool_name)
+                .raw("result", &encode_tool_result(&result.text))
+                .boolean("isError", result.is_error);
+            if let Some(duration) = duration_ms {
+                record = record.raw("durationMs", &duration.to_string());
+            }
+            record.finish()
+        }
+        _ => unreachable!("tool_event_jsonl is only called for its own events"),
     }
 }
 
@@ -918,6 +959,81 @@ mod tests {
             Some("{\"type\":\"agent_settled\",\"aborted\":true}")
         );
         assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn retry_events_carry_the_documented_fields() {
+        use nyan_coding_agent_runtime::AgentEvent;
+
+        assert_eq!(
+            event_to_jsonl(&AgentEvent::RetryStart {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 2000,
+                error_message: "529 \"overloaded\"".to_owned(),
+            }),
+            concat!(
+                "{\"type\":\"auto_retry_start\",\"attempt\":1,\"maxAttempts\":3,",
+                "\"delayMs\":2000,\"errorMessage\":\"529 \\\"overloaded\\\"\"}\n"
+            )
+        );
+        assert_eq!(
+            event_to_jsonl(&AgentEvent::RetryEnd {
+                attempt: 2,
+                succeeded: true,
+                final_error: None,
+            }),
+            "{\"type\":\"auto_retry_end\",\"success\":true,\"attempt\":2}\n"
+        );
+        assert_eq!(
+            event_to_jsonl(&AgentEvent::RetryEnd {
+                attempt: 3,
+                succeeded: false,
+                final_error: Some("gave up".to_owned()),
+            }),
+            concat!(
+                "{\"type\":\"auto_retry_end\",\"success\":false,\"attempt\":3,",
+                "\"finalError\":\"gave up\"}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn tool_events_carry_args_and_the_duration_only_when_the_tool_ran() {
+        use nyan_coding_agent_core::{ToolCallId, ToolResult};
+        use nyan_coding_agent_runtime::AgentEvent;
+
+        let call_id = ToolCallId::new("c1").expect("id");
+        let update = event_to_jsonl(&AgentEvent::ToolExecutionUpdate {
+            call_id: call_id.clone(),
+            tool_name: "bash".to_owned(),
+            arguments: "{\"command\":\"ls\"}".to_owned(),
+            partial_result: ToolResult {
+                text: "part".to_owned(),
+                is_error: false,
+            },
+        });
+        assert_eq!(
+            update,
+            concat!(
+                "{\"type\":\"tool_execution_update\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",",
+                "\"args\":{\"command\":\"ls\"},",
+                "\"partialResult\":{\"content\":[{\"type\":\"text\",\"text\":\"part\"}],\"details\":{}}}\n"
+            )
+        );
+        let result = Message::tool_result(call_id, "bash", "done", false);
+        for (duration_ms, tail) in [(Some(42), ",\"durationMs\":42}\n"), (None, "}\n")] {
+            let end = event_to_jsonl(&AgentEvent::ToolExecutionEnd {
+                call_id: ToolCallId::new("c1").expect("id"),
+                tool_name: "bash".to_owned(),
+                result: result.clone(),
+                duration_ms,
+            });
+            let expected = format!(
+                "{{\"type\":\"tool_execution_end\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"details\":{{}}}},\"isError\":false{tail}"
+            );
+            assert_eq!(end, expected);
+        }
     }
 
     #[test]

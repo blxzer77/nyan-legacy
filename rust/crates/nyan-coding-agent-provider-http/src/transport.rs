@@ -125,7 +125,7 @@ impl Transport {
             if cancellation.is_cancelled() {
                 return Err(ProviderError::Cancelled);
             }
-            let admission = handle.spawn(async move {
+            let mut admission = handle.spawn(async move {
                 let mut builder = client
                     .post(post.url)
                     .header("content-type", "application/json")
@@ -148,7 +148,19 @@ impl Transport {
                 let text = response.text().await.unwrap_or_default();
                 Err(status_error(status.as_u16(), &text))
             });
-            let response = admission.await.map_err(|error| ProviderError::Request {
+            // Waiting for the response headers can take as long as the server likes, so
+            // the wait itself watches for cancellation.
+            let admitted = loop {
+                match tokio::time::timeout(CANCELLATION_POLL, &mut admission).await {
+                    Ok(joined) => break joined,
+                    Err(_) if cancellation.is_cancelled() => {
+                        admission.abort();
+                        return Err(ProviderError::Cancelled);
+                    }
+                    Err(_) => {}
+                }
+            };
+            let response = admitted.map_err(|error| ProviderError::Request {
                 message: format!("the request task failed: {error}"),
                 retryable: false,
             })??;

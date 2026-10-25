@@ -6,6 +6,7 @@ pub mod catalog_access;
 pub mod codex;
 pub mod headless;
 pub mod initial_message;
+pub mod interrupt;
 pub mod login;
 pub mod providers;
 pub mod run;
