@@ -28,17 +28,7 @@ Rust owns the ordinary runtime. Built-in behavior and the fast path do not start
 
 The parity evidence is black-box where possible. The same prompts, tool fixtures, provider fixtures, session cases, signals, and protocol requests run against the TypeScript and Rust CLIs; outputs are normalized only for unstable fields such as timestamps and generated identifiers. The contract records stdout, stderr, exit codes, event discriminants, state transitions, persistence, cancellation, and recovery, not just final assistant text.
 
-The Rust line is divided into these stages:
-
-- **RS0 — surface inventory and parity contract:** enumerate the current CLI and freeze the compatibility matrix.
-- **RS1 — Cargo workspace and core boundaries:** establish Rust crates, errors, events, storage ports, provider/tool ports, and independent checks.
-- **RS2 — Agent runtime parity:** implement model turns, tool loops, streaming, abort, retry, subprocess ownership, and stable outcomes with fake providers.
-- **RS3 — session and persistence parity:** implement versioned durable state, locks, continuation, fork/clone behavior, export, restart recovery, and legacy-session reading or migration.
-- **RS4 — CLI and protocol parity:** implement interactive, print, JSONL, and RPC surfaces with stable flags, exit codes, stdout/stderr ownership, and signal behavior.
-- **RS5 — provider and resource parity:** implement providers, models, auth, tools, MCP, skills, prompt templates, settings, trust, and built-in resources.
-- **RS6 — extension compatibility:** decide and verify the native Rust extension boundary and any optional out-of-process compatibility bridge.
-- **RS7 — preview and parity gate:** run differential, recovery, terminal, multi-platform, startup, memory, and performance checks while publishing the Rust preview separately.
-- **RS8 — cutover:** switch the default executable only after the owner accepts the complete parity and rollback evidence.
+The stage list was re-cut on 2026-10-26 so that the headless core is finished before any front-end. The authoritative stages, exit gates, and dependencies are in [ROADMAP.md](../../../../ROADMAP.md): RS0 contract and RS1 workspace (done), RS2 runtime foundation (done), RS3 model layer, RS4 sessions, RS5 agent behavior, RS6 configuration and resources, RS7 tools and MCP, RS8 session API and surfaces, RS9 extension boundary, RS10 hardening and headless preview, RS11 front-end, RS12 cutover. The sections under Verification below keep the stage names they were written under (RS3 sessions, RS4 CLI and protocol, RS5 providers and tools); read them as an evidence log, not as the current stage definitions.
 
 ## Alternatives considered
 
