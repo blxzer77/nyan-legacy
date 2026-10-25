@@ -93,6 +93,45 @@ pub struct SessionOpenRequest {
     pub storage_root: Option<PathBuf>,
 }
 
+/// Stable identity for one entry in a Rust-native session journal.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionEntryId(String);
+
+impl SessionEntryId {
+    fn from_sequence(sequence: u64) -> Self {
+        Self(format!("{sequence:016x}"))
+    }
+
+    /// Returns the stable entry id.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SessionEntryId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A linear projection of one journal record for session APIs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionEntry {
+    /// Stable id derived from the journal sequence.
+    pub id: SessionEntryId,
+    /// The preceding entry, or `None` for the first record.
+    pub parent_id: Option<SessionEntryId>,
+    /// Journal sequence that owns this entry.
+    pub sequence: u64,
+    /// Persisted record category.
+    pub kind: SessionRecordKind,
+    /// Original record payload, retained for export and future entry kinds.
+    pub payload: Vec<u8>,
+    /// Decoded message for message-bearing record kinds.
+    pub message: Option<Message>,
+}
+
 /// A persisted journal record category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionRecordKind {
@@ -1089,6 +1128,49 @@ impl SessionJournal {
         decode_message(&record.payload)
     }
 
+    /// Projects all journal records into linear session entries.
+    ///
+    /// The current Rust journal has no branch records, so `parent_id` points to
+    /// the preceding sequence. Keeping this projection here lets the future
+    /// session API add branches without changing journal framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when a message payload is invalid.
+    pub fn entries(&mut self) -> Result<Vec<SessionEntry>, SessionStoreError> {
+        let records = self.records()?;
+        let mut parent_id = None;
+        let mut entries = Vec::with_capacity(records.len());
+        for record in records {
+            let id = SessionEntryId::from_sequence(record.sequence);
+            let message = if matches!(
+                record.kind,
+                SessionRecordKind::SystemPrompt
+                    | SessionRecordKind::UserMessage
+                    | SessionRecordKind::AssistantMessage
+                    | SessionRecordKind::ToolResult
+            ) {
+                Some(Self::decode_message_record(&record).map_err(|error| {
+                    SessionStoreError::MessageDecode {
+                        message: error.to_string(),
+                    }
+                })?)
+            } else {
+                None
+            };
+            entries.push(SessionEntry {
+                id: id.clone(),
+                parent_id,
+                sequence: record.sequence,
+                kind: record.kind,
+                payload: record.payload,
+                message,
+            });
+            parent_id = Some(id);
+        }
+        Ok(entries)
+    }
+
     /// Replays all user, assistant, and tool-result messages in journal order.
     ///
     /// Metadata and run-marker records remain available through [`Self::records`]
@@ -1200,6 +1282,81 @@ impl NativeSession {
     #[must_use]
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Returns the linear entry projection used by session APIs.
+    ///
+    /// Ephemeral sessions synthesize entries from their in-memory messages.
+    /// Persistent sessions decode the committed journal so metadata and run
+    /// markers remain visible to callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store or message decode error when persistent records cannot be read.
+    pub fn get_entries(&mut self) -> Result<Vec<SessionEntry>, SessionStoreError> {
+        if let Some(journal) = &mut self.journal {
+            return journal.entries();
+        }
+        Ok(self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(sequence, message)| {
+                let sequence = u64::try_from(sequence).unwrap_or(u64::MAX);
+                SessionEntry {
+                    id: SessionEntryId::from_sequence(sequence),
+                    parent_id: sequence.checked_sub(1).map(SessionEntryId::from_sequence),
+                    sequence,
+                    kind: record_kind_for_message(message),
+                    payload: Vec::new(),
+                    message: Some(message.clone()),
+                }
+            })
+            .collect())
+    }
+
+    /// Returns the current linear tree projection.
+    ///
+    /// Branching is intentionally not synthesized: the current journal has one
+    /// parent chain, and a future branch entry will extend this same API.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store or message decode error when persistent records cannot be read.
+    pub fn get_tree(&mut self) -> Result<Vec<SessionEntry>, SessionStoreError> {
+        self.get_entries()
+    }
+
+    /// Returns provider messages through an entry on the current linear branch.
+    ///
+    /// Non-message entries are navigation points and do not add context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the entry cannot be read or does not exist.
+    pub fn get_fork_messages(
+        &mut self,
+        entry_id: &SessionEntryId,
+    ) -> Result<Vec<Message>, SessionStoreError> {
+        let entries = self.get_entries()?;
+        let mut found = false;
+        let mut messages = Vec::new();
+        for entry in entries {
+            if let Some(message) = entry.message {
+                messages.push(message);
+            }
+            if entry.id == *entry_id {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(SessionStoreError::Io {
+                operation: "find session entry".to_owned(),
+                message: format!("entry {entry_id} does not exist"),
+            });
+        }
+        Ok(messages)
     }
 
     /// Returns the display name, if one was set.
@@ -1407,9 +1564,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        FileSessionStore, NativeSession, SessionDescriptor, SessionFormat, SessionJournal,
-        SessionOpenRequest, SessionRecord, SessionRecordKind, SessionStore, SessionStoreError,
-        decode_message, encode_message,
+        FileSessionStore, NativeSession, SessionDescriptor, SessionEntryId, SessionFormat,
+        SessionJournal, SessionOpenRequest, SessionRecord, SessionRecordKind, SessionStore,
+        SessionStoreError, decode_message, encode_message,
     };
     use nyan_coding_agent_core::{
         AgentMode, ContentBlock, Message, MessageRole, SessionId, StopReason, ToolCall, ToolCallId,
@@ -1621,6 +1778,70 @@ mod tests {
             SessionJournal::decode_message_record(&records[0]).expect("decode record"),
             message
         );
+        drop(journal);
+        drop(opened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn session_entries_are_linear_and_fork_messages_stop_at_the_selected_entry() {
+        let root = test_root("entries");
+        let store = FileSessionStore::new(&root);
+        let mut session = NativeSession::open(&store, request(&root)).expect("open");
+        session
+            .append_message(
+                SessionRecordKind::UserMessage,
+                Message::text(MessageRole::User, "one"),
+            )
+            .expect("append user");
+        session
+            .append_message(
+                SessionRecordKind::AssistantMessage,
+                Message::text(MessageRole::Assistant, "two"),
+            )
+            .expect("append assistant");
+        session.set_name("checkpoint").expect("name");
+
+        let entries = session.get_entries().expect("entries");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].parent_id, None);
+        assert_eq!(entries[1].parent_id.as_ref(), Some(&entries[0].id));
+        assert_eq!(entries[2].parent_id.as_ref(), Some(&entries[1].id));
+        assert_eq!(
+            entries[0].message.as_ref().map(|m| m.text.as_str()),
+            Some("one")
+        );
+        assert_eq!(entries[2].kind, SessionRecordKind::SessionName);
+        assert_eq!(session.get_tree().expect("tree"), entries);
+        let fork = session
+            .get_fork_messages(&entries[1].id)
+            .expect("fork messages");
+        assert_eq!(
+            fork.iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        let missing = SessionEntryId::from_sequence(99);
+        assert!(session.get_fork_messages(&missing).is_err());
+        drop(session);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn entry_projection_surfaces_invalid_message_payloads() {
+        let root = test_root("entry-corrupt-message");
+        let store = FileSessionStore::new(&root);
+        let opened = store.open(request(&root)).expect("open");
+        let mut journal = opened.journal().expect("journal");
+        journal
+            .append(SessionRecord::new(
+                SessionRecordKind::UserMessage,
+                b"not a message".to_vec(),
+            ))
+            .expect("append");
+        let error = journal.entries().expect_err("invalid message");
+        assert!(matches!(error, SessionStoreError::MessageDecode { .. }));
         drop(journal);
         drop(opened);
         fs::remove_dir_all(root).expect("remove test root");
