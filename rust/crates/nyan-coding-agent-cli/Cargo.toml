@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 nyan-coding-agent-auth = { path = "../nyan-coding-agent-auth" }
 nyan-coding-agent-core = { path = "../nyan-coding-agent-core" }
+nyan-coding-agent-models = { path = "../nyan-coding-agent-models" }
 nyan-coding-agent-protocol = { path = "../nyan-coding-agent-protocol" }
 nyan-coding-agent-session = { path = "../nyan-coding-agent-session" }
 nyan-coding-agent-provider = { path = "../nyan-coding-agent-provider" }

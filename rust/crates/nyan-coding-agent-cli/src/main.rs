@@ -81,6 +81,7 @@ fn main() {
         stdout_is_tty: std::io::stdout().is_terminal(),
         cwd,
         base_urls: std::collections::BTreeMap::new(),
+        models_dev_url: nyan_coding_agent_models::cache::MODELS_DEV_URL.to_owned(),
         read_stdin: Box::new(read_piped_stdin),
         prompt: Box::new(prompt_user),
     };

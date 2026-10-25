@@ -28,10 +28,12 @@ use nyan_coding_agent_provider_http::{
 };
 use tokio::runtime::Handle;
 
-use crate::args::Args;
-use crate::provider_table::{
-    MIXED_API_PROVIDERS, PROVIDERS, ProviderDef, UNSUPPORTED_API_PROVIDERS,
+use nyan_coding_agent_models::table::{
+    MIXED_API_PROVIDERS, MixedDef, PROVIDERS, ProviderDef, UNSUPPORTED_API_PROVIDERS,
 };
+
+use crate::args::Args;
+use crate::catalog_access::{Access, load};
 use crate::run::Environment;
 use crate::settings::read_default_model;
 
@@ -42,26 +44,7 @@ pub const CPA_BASE_URL_SETTING: &str = "CLIPROXYAPI_BASE_URL";
 /// Where a local `CLIProxyAPI` listens by default.
 pub const DEFAULT_CPA_BASE_URL: &str = "http://127.0.0.1:8317";
 
-/// The wire APIs this build speaks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Api {
-    /// `OpenAI` chat completions and its many compatibles.
-    OpenAiCompletions,
-    /// `OpenAI` Responses.
-    OpenAiResponses,
-    /// Azure `OpenAI` Responses.
-    AzureOpenAiResponses,
-    /// Anthropic Messages.
-    AnthropicMessages,
-    /// Google Generative AI.
-    GoogleGenerativeAi,
-    /// Google Vertex AI.
-    GoogleVertex,
-    /// Mistral Conversations.
-    MistralConversations,
-    /// Amazon Bedrock `ConverseStream`.
-    BedrockConverse,
-}
+pub use nyan_coding_agent_models::WireApi as Api;
 
 /// A provider ready to be built: its endpoint and credential.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +80,8 @@ pub enum ProviderSetup {
         base_url: String,
         /// API key.
         api_key: String,
+        /// The model's output limit, when the catalog knows it.
+        max_tokens: Option<u64>,
     },
     /// Google Generative AI.
     Google {
@@ -234,23 +219,22 @@ fn api_key_for(
         })
 }
 
-/// The provider's base URL, with `{NAME}` placeholders filled from the
-/// environment or the stored credential's settings.
-fn base_url_for(def: &ProviderDef, env: &Environment, store: &AuthStore) -> Result<String, String> {
-    if let Some(url) = env.base_urls.get(def.id) {
-        return Ok(url.clone());
-    }
-    let template = def
-        .base_url
-        .ok_or_else(|| format!("provider \"{}\" has no base URL configured", def.id))?;
-    let stored = stored_api_key(store, def.id).ok().flatten();
+/// Fills `{NAME}` placeholders in a base URL from the environment or the stored
+/// credential's settings.
+fn expand_template(
+    template: &str,
+    provider: &str,
+    env: &Environment,
+    store: &AuthStore,
+) -> Result<String, String> {
+    let stored = stored_api_key(store, provider).ok().flatten();
     let mut url = String::new();
     let mut rest = template;
     while let Some(start) = rest.find('{') {
         let end = rest[start..]
             .find('}')
             .map(|offset| start + offset)
-            .ok_or_else(|| format!("malformed base URL template for \"{}\"", def.id))?;
+            .ok_or_else(|| format!("malformed base URL template for \"{provider}\""))?;
         let name = &rest[start + 1..end];
         let value = env_value(env, name)
             .or_else(|| {
@@ -259,10 +243,7 @@ fn base_url_for(def: &ProviderDef, env: &Environment, store: &AuthStore) -> Resu
                     .and_then(|credential| credential.env.get(name).cloned())
             })
             .ok_or_else(|| {
-                format!(
-                    "provider \"{}\" needs {name}: set it in the environment",
-                    def.id
-                )
+                format!("provider \"{provider}\" needs {name}: set it in the environment")
             })?;
         url.push_str(&rest[..start]);
         url.push_str(&value);
@@ -270,6 +251,17 @@ fn base_url_for(def: &ProviderDef, env: &Environment, store: &AuthStore) -> Resu
     }
     url.push_str(rest);
     Ok(url)
+}
+
+/// The provider's base URL: the injected override, else the table's with placeholders filled.
+fn base_url_for(def: &ProviderDef, env: &Environment, store: &AuthStore) -> Result<String, String> {
+    if let Some(url) = env.base_urls.get(def.id) {
+        return Ok(url.clone());
+    }
+    let template = def
+        .base_url
+        .ok_or_else(|| format!("provider \"{}\" has no base URL configured", def.id))?;
+    expand_template(template, def.id, env, store)
 }
 
 fn azure_setup(args: &Args, env: &Environment, store: &AuthStore) -> Result<ProviderSetup, String> {
@@ -349,7 +341,41 @@ fn vertex_setup(
     })
 }
 
-/// Resolves the endpoint and credential for `provider`.
+/// A resolved provider and anything to tell the user about how.
+#[derive(Debug)]
+pub struct Resolved {
+    /// The endpoint and credential.
+    pub setup: ProviderSetup,
+    /// Lines for stderr.
+    pub notes: Vec<String>,
+}
+
+fn resolved(setup: ProviderSetup) -> Resolved {
+    Resolved {
+        setup,
+        notes: Vec::new(),
+    }
+}
+
+/// Mixed-API providers this build can call, because the catalog entry for the
+/// model says which wire API and URL it uses.
+const CATALOG_DRIVEN: &[&str] = &["fireworks"];
+
+/// Why a mixed-API provider cannot be called yet.
+fn mixed_refusal(def: &MixedDef) -> String {
+    let reason = match def.id {
+        "openrouter" => "its model list comes from a live listing this build does not read yet",
+        "github-copilot" => "it needs a GitHub OAuth login, which this build does not have yet",
+        "opencode" | "opencode-go" => {
+            "it requires a per-conversation routing header this build does not send yet"
+        }
+        "cloudflare-ai-gateway" => "its gateway authentication is not implemented yet",
+        _ => "its models need the catalog to choose a wire API",
+    };
+    format!("provider \"{}\" is not supported yet: {reason}", def.id)
+}
+
+/// Resolves the endpoint and credential for `provider` serving `model`.
 ///
 /// # Errors
 ///
@@ -357,30 +383,32 @@ fn vertex_setup(
 /// credential, or its settings are unusable.
 pub fn resolve_provider(
     provider: &str,
+    model: &str,
     args: &Args,
     env: &Environment,
     agent_dir: &Path,
-) -> Result<ProviderSetup, String> {
+) -> Result<Resolved, String> {
     let store = AuthStore::new(agent_dir);
     match provider {
         CPA_PROVIDER => {
             let connection = cpa_connection(args.api_key.as_deref(), env, agent_dir)?;
-            Ok(ProviderSetup::OpenAiResponses {
+            Ok(resolved(ProviderSetup::OpenAiResponses {
                 base_url: connection.endpoints.inference_base_url,
                 api_key: connection.api_key,
-            })
+            }))
         }
-        "azure" => azure_setup(args, env, &store),
-        "amazon-bedrock" => bedrock_setup(env),
-        "google-vertex" => vertex_setup(args, env, &store),
+        "azure" => azure_setup(args, env, &store).map(resolved),
+        "amazon-bedrock" => bedrock_setup(env).map(resolved),
+        "google-vertex" => vertex_setup(args, env, &store).map(resolved),
         _ => {
             if let Some(def) = provider_def(provider) {
-                return simple_setup(def, args, env, &store);
+                return simple_setup(def, model, args, env, &store, agent_dir);
             }
-            if MIXED_API_PROVIDERS.contains(&provider) {
-                return Err(format!(
-                    "provider \"{provider}\" serves models over different wire APIs, and choosing the right one needs the model catalog, which this build does not have yet"
-                ));
+            if let Some(def) = MIXED_API_PROVIDERS.iter().find(|def| def.id == provider) {
+                if CATALOG_DRIVEN.contains(&provider) {
+                    return catalog_setup(def, model, args, env, &store, agent_dir);
+                }
+                return Err(mixed_refusal(def));
             }
             if let Some((_, api)) = UNSUPPORTED_API_PROVIDERS
                 .iter()
@@ -398,12 +426,66 @@ pub fn resolve_provider(
     }
 }
 
-fn simple_setup(
-    def: &ProviderDef,
+/// A mixed-API provider: the catalog entry for the model picks the wire API and URL.
+fn catalog_setup(
+    def: &MixedDef,
+    model: &str,
     args: &Args,
     env: &Environment,
     store: &AuthStore,
+    agent_dir: &Path,
+) -> Result<Resolved, String> {
+    let api_key = api_key_for(def.id, def.env_keys, args, env, store)?;
+    let loaded = load(env, agent_dir, Access::RefreshIfStale)?;
+    let entry = loaded.catalog.find(def.id, model).ok_or_else(|| {
+        format!(
+            "model \"{model}\" is not in the catalog for provider \"{}\"; `nyan --list-models` shows what is",
+            def.id
+        )
+    })?;
+    let base_url = match env.base_urls.get(def.id) {
+        Some(url) => url.clone(),
+        None => expand_template(&entry.base_url, def.id, env, store)?,
+    };
+    Ok(Resolved {
+        setup: setup_for_api(entry.api, base_url, api_key, Some(entry.max_tokens))?,
+        notes: loaded.notes,
+    })
+}
+
+fn setup_for_api(
+    api: Api,
+    base_url: String,
+    api_key: String,
+    max_tokens: Option<u64>,
 ) -> Result<ProviderSetup, String> {
+    Ok(match api {
+        Api::OpenAiCompletions => ProviderSetup::OpenAiCompletions { base_url, api_key },
+        Api::OpenAiResponses => ProviderSetup::OpenAiResponses { base_url, api_key },
+        Api::AnthropicMessages => ProviderSetup::Anthropic {
+            base_url,
+            api_key,
+            max_tokens,
+        },
+        Api::GoogleGenerativeAi => ProviderSetup::Google { base_url, api_key },
+        Api::MistralConversations => ProviderSetup::Mistral { base_url, api_key },
+        Api::AzureOpenAiResponses | Api::GoogleVertex | Api::BedrockConverse => {
+            return Err("this provider needs its own settings".to_owned());
+        }
+    })
+}
+
+/// A single-API provider. The model's output limit, which Anthropic requires on
+/// every request, is read from the cache when there is one; a request never
+/// waits for the network just to learn it.
+fn simple_setup(
+    def: &ProviderDef,
+    model: &str,
+    args: &Args,
+    env: &Environment,
+    store: &AuthStore,
+    agent_dir: &Path,
+) -> Result<Resolved, String> {
     let env_keys: &[&str] = if def.id == "anthropic" {
         &["ANTHROPIC_API_KEY"]
     } else {
@@ -414,16 +496,46 @@ fn simple_setup(
         return Err("this Anthropic credential is an OAuth token, which this build does not support yet; use an API key".to_owned());
     }
     let base_url = base_url_for(def, env, store)?;
-    Ok(match def.api {
-        Api::OpenAiCompletions => ProviderSetup::OpenAiCompletions { base_url, api_key },
-        Api::OpenAiResponses => ProviderSetup::OpenAiResponses { base_url, api_key },
-        Api::AnthropicMessages => ProviderSetup::Anthropic { base_url, api_key },
-        Api::GoogleGenerativeAi => ProviderSetup::Google { base_url, api_key },
-        Api::MistralConversations => ProviderSetup::Mistral { base_url, api_key },
-        Api::AzureOpenAiResponses | Api::GoogleVertex | Api::BedrockConverse => {
-            return Err(format!("provider \"{}\" needs its own settings", def.id));
+    let max_tokens = if def.api == Api::AnthropicMessages {
+        load(env, agent_dir, Access::CacheOnly)
+            .ok()
+            .and_then(|loaded| {
+                loaded
+                    .catalog
+                    .find(def.id, model)
+                    .map(|entry| entry.max_tokens)
+            })
+    } else {
+        None
+    };
+    Ok(resolved(setup_for_api(
+        def.api, base_url, api_key, max_tokens,
+    )?))
+}
+
+/// Whether `provider` has a credential this build could use, without making a request.
+#[must_use]
+pub fn credential_available(provider: &str, env: &Environment, agent_dir: &Path) -> bool {
+    let store = AuthStore::new(agent_dir);
+    let no_flags = crate::args::parse_args(&[]);
+    match provider {
+        CPA_PROVIDER => cpa_connection(None, env, agent_dir).is_ok(),
+        "azure" => azure_setup(&no_flags, env, &store).is_ok(),
+        "amazon-bedrock" => bedrock_setup(env).is_ok(),
+        "google-vertex" => vertex_setup(&no_flags, env, &store).is_ok(),
+        other => {
+            let env_keys: &[&str] = if other == "anthropic" {
+                &["ANTHROPIC_API_KEY"]
+            } else if let Some(def) = provider_def(other) {
+                def.env_keys
+            } else if let Some(def) = MIXED_API_PROVIDERS.iter().find(|def| def.id == other) {
+                def.env_keys
+            } else {
+                return false;
+            };
+            api_key_for(other, env_keys, &no_flags, env, &store).is_ok()
         }
-    })
+    }
 }
 
 /// Chooses the model: `--model`, else the saved default.
@@ -523,9 +635,17 @@ pub fn build_provider(
                 OpenAiResponsesProvider::azure(id, &base_url, Some(api_key), &api_version, handle)?
                     .with_deployments(deployments),
             ),
-            ProviderSetup::Anthropic { base_url, api_key } => Box::new(
-                AnthropicMessagesProvider::new(id, base_url, Some(api_key), handle)?,
-            ),
+            ProviderSetup::Anthropic {
+                base_url,
+                api_key,
+                max_tokens,
+            } => {
+                let provider = AnthropicMessagesProvider::new(id, base_url, Some(api_key), handle)?;
+                Box::new(match max_tokens {
+                    Some(limit) => provider.with_max_tokens(limit),
+                    None => provider,
+                })
+            }
             ProviderSetup::Google { base_url, api_key } => Box::new(
                 GoogleGenerativeAiProvider::new(id, base_url, Some(api_key), handle)?,
             ),
@@ -570,6 +690,7 @@ mod tests {
             stdout_is_tty: false,
             cwd: Path::new("/tmp").to_path_buf(),
             base_urls: BTreeMap::new(),
+            models_dev_url: "http://127.0.0.1:1/api.json".to_owned(),
             read_stdin: Box::new(|| None),
             prompt: Box::new(|_, _| None),
         }
@@ -578,10 +699,12 @@ mod tests {
     fn resolve(provider: &str, variables: &[(&str, &str)]) -> Result<ProviderSetup, String> {
         resolve_provider(
             provider,
+            "some-model",
             &parse_args(&[]),
             &environment(variables),
             Path::new("/nonexistent-agent-dir"),
         )
+        .map(|resolved| resolved.setup)
     }
 
     #[test]
@@ -621,7 +744,7 @@ mod tests {
 
     #[test]
     fn every_generated_provider_resolves_with_its_documented_environment_key() {
-        for def in crate::provider_table::PROVIDERS {
+        for def in nyan_coding_agent_models::table::PROVIDERS {
             if matches!(def.id, "amazon-bedrock" | "google-vertex") {
                 continue;
             }
@@ -637,7 +760,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("{}: {error}", def.id));
             let (ProviderSetup::OpenAiCompletions { base_url, api_key }
             | ProviderSetup::OpenAiResponses { base_url, api_key }
-            | ProviderSetup::Anthropic { base_url, api_key }
+            | ProviderSetup::Anthropic {
+                base_url, api_key, ..
+            }
             | ProviderSetup::Google { base_url, api_key }
             | ProviderSetup::Mistral { base_url, api_key }) = setup
             else {
@@ -654,7 +779,7 @@ mod tests {
 
 #[cfg(test)]
 mod template_tests {
-    use super::{ProviderSetup, resolve_provider};
+    use super::{ProviderSetup, Resolved, resolve_provider};
     use crate::args::parse_args;
     use crate::run::Environment;
     use std::collections::BTreeMap;
@@ -671,6 +796,7 @@ mod template_tests {
             stdout_is_tty: false,
             cwd: Path::new("/tmp").to_path_buf(),
             base_urls: BTreeMap::new(),
+            models_dev_url: "http://127.0.0.1:1/api.json".to_owned(),
             read_stdin: Box::new(|| None),
             prompt: Box::new(|_, _| None),
         }
@@ -680,15 +806,20 @@ mod template_tests {
     fn a_url_template_is_filled_from_the_environment_or_refused_by_name() {
         let args = parse_args(&[]);
         let dir = Path::new("/nonexistent-agent-dir");
-        let Ok(ProviderSetup::OpenAiCompletions { base_url, .. }) = resolve_provider(
+        let Ok(Resolved {
+            setup: ProviderSetup::OpenAiCompletions { base_url, .. },
+            ..
+        }) = resolve_provider(
             "cloudflare-workers-ai",
+            "m",
             &args,
             &env(&[
                 ("CLOUDFLARE_API_KEY", "k"),
                 ("CLOUDFLARE_ACCOUNT_ID", "acct123"),
             ]),
             dir,
-        ) else {
+        )
+        else {
             panic!("must resolve");
         };
         assert_eq!(
@@ -697,6 +828,7 @@ mod template_tests {
         );
         let missing = resolve_provider(
             "cloudflare-workers-ai",
+            "m",
             &args,
             &env(&[("CLOUDFLARE_API_KEY", "k")]),
             dir,

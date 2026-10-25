@@ -102,6 +102,7 @@ fn execute_with_stdin(
         stdout_is_tty: tty,
         cwd,
         base_urls: std::collections::BTreeMap::from([("groq".to_owned(), base_url.to_owned())]),
+        models_dev_url: "http://127.0.0.1:1/api.json".to_owned(),
         read_stdin: Box::new(move || stdin.clone()),
         prompt: Box::new(|_, _| None),
     };
@@ -652,6 +653,7 @@ fn system_prompt_flags_and_project_context_shape_the_first_message() {
                 "groq".to_owned(),
                 format!("http://{address}/v1"),
             )]),
+            models_dev_url: "http://127.0.0.1:1/api.json".to_owned(),
             read_stdin: Box::new(|| None),
             prompt: Box::new(|_, _| None),
         };

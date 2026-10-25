@@ -9,6 +9,7 @@ pub mod cpa;
 pub mod eventstream;
 pub mod google;
 pub mod mistral;
+pub mod models_dev;
 pub mod openai;
 pub mod responses;
 pub mod sigv4;

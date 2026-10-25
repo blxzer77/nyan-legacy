@@ -2,10 +2,10 @@
 
 pub mod app_mode;
 pub mod args;
+pub mod catalog_access;
 pub mod headless;
 pub mod initial_message;
 pub mod login;
-pub mod provider_table;
 pub mod providers;
 pub mod run;
 pub mod session_setup;

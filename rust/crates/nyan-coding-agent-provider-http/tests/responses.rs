@@ -121,6 +121,10 @@ fn text_streams_and_the_request_is_a_stateless_responses_call() {
             .to_ascii_lowercase()
             .contains("user-agent: nyan-coding-agent/")
     );
+    assert!(
+        !captured.to_ascii_lowercase().contains("accept-encoding"),
+        "an event stream is not requested compressed: {captured}"
+    );
     let body = body_of(&server);
     assert_eq!(body["model"], "test-model");
     assert_eq!(body["stream"], true);

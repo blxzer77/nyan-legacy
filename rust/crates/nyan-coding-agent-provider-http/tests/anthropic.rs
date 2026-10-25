@@ -346,3 +346,36 @@ fn history_replays_tool_use_and_error_results_as_anthropic_blocks() {
     assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu_9");
     assert_eq!(body["messages"][2]["content"][0]["is_error"], true);
 }
+
+#[test]
+fn max_tokens_is_the_default_unless_the_caller_sets_the_models_limit() {
+    let runtime = Runtime::new().expect("runtime");
+    let sent = |limit: Option<u64>| {
+        let server = serve(
+            &runtime,
+            "200 OK",
+            vec![(
+                0,
+                event(
+                    "message_delta",
+                    json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+                ),
+            )],
+            false,
+        );
+        let mut provider = provider(&runtime, &server);
+        if let Some(limit) = limit {
+            provider = provider.with_max_tokens(limit);
+        }
+        let stream = runtime
+            .block_on(provider.stream(request(CancellationToken::new())))
+            .expect("stream");
+        drain(&runtime, stream).expect("events");
+        let captured = server.captured.lock().expect("lock").clone();
+        let body: serde_json::Value =
+            serde_json::from_str(captured.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+        body["max_tokens"].clone()
+    };
+    assert_eq!(sent(None), 16_384);
+    assert_eq!(sent(Some(64_000)), 64_000);
+}

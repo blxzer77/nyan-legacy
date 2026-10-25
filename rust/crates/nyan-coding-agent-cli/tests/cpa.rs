@@ -405,7 +405,11 @@ fn list_models_shows_the_logged_in_catalog_and_filters_by_search() {
     assert_eq!(all.code, 0, "{}", all.stderr);
     let lines: Vec<&str> = all.stdout.lines().collect();
     assert_eq!(lines.len(), 4, "{}", all.stdout);
-    assert!(lines[1].starts_with("cliproxyapi   gpt-a"), "{}", lines[1]);
+    assert!(
+        lines[1].starts_with("cliproxyapi             gpt-a"),
+        "{}",
+        lines[1]
+    );
     assert!(
         lines[1].contains("500K")
             && lines[1].contains("128K")

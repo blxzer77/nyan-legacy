@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates rust/crates/nyan-coding-agent-cli/src/provider_table.rs.
+"""Generates rust/crates/nyan-coding-agent-models/src/table.rs.
 
 Source of truth: packages/ai/src/providers/*.ts (id, name, baseUrl),
 packages/ai/src/env-api-keys.ts (API-key variables), and the hydrated model
@@ -46,7 +46,7 @@ for path in sorted(glob.glob(os.path.join(providers, "data", "*.json"))):
     apis = {api for api, _ in combos} - NON_CHAT
     envs = [env_map[pid]] if pid in env_map else []
     if len(apis) > 1:
-        mixed.append((pid, sorted(apis)))
+        mixed.append((pid, name, envs))
     elif not apis:
         other.append((pid, ["(no chat models)"]))
     elif apis <= set(API):
@@ -64,7 +64,7 @@ out = [
     "#![cfg_attr(rustfmt, rustfmt::skip)]",
     "#![allow(clippy::enum_glob_use)]",
     "",
-    "use crate::providers::Api::{self, *};",
+    "use crate::WireApi::{self, *};",
     "",
     "/// A provider that uses one wire API for all of its models.",
     "#[derive(Debug)]",
@@ -74,7 +74,7 @@ out = [
     "    /// Display name.",
     "    pub name: &'static str,",
     "    /// The wire API every model of the provider uses.",
-    "    pub api: Api,",
+    "    pub api: WireApi,",
     "    /// The fixed base URL, when the provider has one.",
     "    pub base_url: Option<&'static str>,",
     "    /// Environment variables that can hold the API key, strongest first.",
@@ -88,11 +88,29 @@ for pid, name, api, url, envs in supported:
     url_text = f'Some("{url}")' if url else "None"
     env_text = ", ".join(f'"{e}"' for e in envs)
     out.append(f'    ProviderDef {{ id: "{pid}", name: "{name}", api: {api}, base_url: {url_text}, env_keys: &[{env_text}] }},')
-out += ["];", "", "/// Providers whose models use different wire APIs; choosing one needs the model catalog.", "pub const MIXED_API_PROVIDERS: &[&str] = &["]
-out += [f'    "{pid}",' for pid, _ in mixed]
+out += [
+    "];",
+    "",
+    "/// A provider whose models use different wire APIs; the API comes from the model catalog.",
+    "#[derive(Debug)]",
+    "pub struct MixedDef {",
+    "    /// Provider id.",
+    "    pub id: &'static str,",
+    "    /// Display name.",
+    "    pub name: &'static str,",
+    "    /// Environment variables that can hold the API key, strongest first.",
+    "    pub env_keys: &'static [&'static str],",
+    "}",
+    "",
+    "/// Providers whose models use different wire APIs.",
+    "pub const MIXED_API_PROVIDERS: &[MixedDef] = &[",
+]
+for pid, name, envs in mixed:
+    env_text = ", ".join(f'"{e}"' for e in envs)
+    out.append(f'    MixedDef {{ id: "{pid}", name: "{name}", env_keys: &[{env_text}] }},')
 out += ["];", "", "/// Providers whose wire API this build does not implement.", "pub const UNSUPPORTED_API_PROVIDERS: &[(&str, &str)] = &["]
 out += [f'    ("{pid}", "{apis[0]}"),' for pid, apis in other]
 out += ["];", ""]
-dest = os.path.join(root, "rust/crates/nyan-coding-agent-cli/src/provider_table.rs")
+dest = os.path.join(root, "rust/crates/nyan-coding-agent-models/src/table.rs")
 open(dest, "w").write("\n".join(out))
 print(f"{len(supported)} single-API, {len(mixed)} mixed, {len(other)} unsupported -> {dest}")

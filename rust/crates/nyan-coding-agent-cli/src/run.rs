@@ -51,6 +51,8 @@ pub struct Environment {
     /// This is the injection point tests use to reach a loopback server and
     /// where a `models.json` override will land; the executable passes none.
     pub base_urls: BTreeMap<String, String>,
+    /// Where the model data is fetched from.
+    pub models_dev_url: String,
     /// Reads piped stdin: `None` when stdin is a terminal or holds only whitespace.
     pub read_stdin: StdinReader,
     /// Asks the user one question (`secret` hides the answer); `None` when input has ended.
@@ -65,6 +67,7 @@ impl std::fmt::Debug for Environment {
             .field("stdout_is_tty", &self.stdout_is_tty)
             .field("cwd", &self.cwd)
             .field("base_urls", &self.base_urls)
+            .field("models_dev_url", &self.models_dev_url)
             .finish_non_exhaustive()
     }
 }
@@ -225,8 +228,13 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         Ok(model) => model,
         Err(message) => return fail(err, &message),
     };
-    let setup = match resolve_provider(&model.provider, &parsed, env, &agent) {
-        Ok(setup) => setup,
+    let setup = match resolve_provider(&model.provider, &model.model, &parsed, env, &agent) {
+        Ok(resolved) => {
+            for note in &resolved.notes {
+                write_to(err, &format!("{note}\n"));
+            }
+            resolved.setup
+        }
         Err(message) => return fail(err, &message),
     };
     let tools = match select_tools(&parsed) {

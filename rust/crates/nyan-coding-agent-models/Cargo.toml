@@ -1,0 +1,13 @@
+[package]
+name = "nyan-coding-agent-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = "=1.0.154"
+
+[lints]
+workspace = true

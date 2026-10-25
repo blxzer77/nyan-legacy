@@ -34,6 +34,8 @@ pub struct Home {
     pub cwd: PathBuf,
     /// Provider id to loopback base URL.
     pub base_urls: Mutex<BTreeMap<String, String>>,
+    /// Where the model data is fetched from.
+    pub models_dev_url: Mutex<String>,
 }
 
 impl Home {
@@ -52,6 +54,7 @@ impl Home {
             agent,
             cwd,
             base_urls: Mutex::new(BTreeMap::new()),
+            models_dev_url: Mutex::new("http://127.0.0.1:1/api.json".to_owned()),
         }
     }
 
@@ -80,6 +83,7 @@ impl Home {
             stdout_is_tty: false,
             cwd: self.cwd.clone(),
             base_urls: self.base_urls.lock().expect("lock").clone(),
+            models_dev_url: self.models_dev_url.lock().expect("lock").clone(),
             read_stdin: Box::new(|| None),
             prompt: Box::new(move |message, _secret| {
                 asked_for_prompt
@@ -116,6 +120,11 @@ impl Home {
 }
 
 impl Home {
+    /// Points later runs at a loopback models.dev stand-in.
+    pub fn serve_models_dev(&self, url: &str) {
+        url.clone_into(&mut self.models_dev_url.lock().expect("lock"));
+    }
+
     /// Routes `provider` to a loopback `base_url` for later runs.
     pub fn route(&self, provider: &str, base_url: &str) {
         self.base_urls

@@ -173,6 +173,7 @@ pub async fn fetch_catalog(
     let task = handle.spawn(async move {
         let client = reqwest::Client::builder()
             .user_agent(concat!("nyan-coding-agent/", env!("CARGO_PKG_VERSION")))
+            .gzip(false)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|error| CatalogError::Transport {

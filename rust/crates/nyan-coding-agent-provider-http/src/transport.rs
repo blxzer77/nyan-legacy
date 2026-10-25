@@ -89,6 +89,9 @@ impl Transport {
     pub(crate) fn new(handle: Handle) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .user_agent(concat!("nyan-coding-agent/", env!("CARGO_PKG_VERSION")))
+            // A compressed event stream can be buffered by the server or the client
+            // until a block fills, which delays text; model requests ask for none.
+            .gzip(false)
             .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| ProviderError::Request {

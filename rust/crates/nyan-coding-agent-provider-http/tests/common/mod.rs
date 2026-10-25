@@ -26,6 +26,17 @@ pub fn serve(
     chunks: Vec<(u64, Vec<u8>)>,
     hold_open: bool,
 ) -> Server {
+    serve_with_headers(runtime, status, "", chunks, hold_open)
+}
+
+/// Like [`serve`], with extra response header lines (each ending in `\r\n`).
+pub fn serve_with_headers(
+    runtime: &Runtime,
+    status: &'static str,
+    extra_headers: &'static str,
+    chunks: Vec<(u64, Vec<u8>)>,
+    hold_open: bool,
+) -> Server {
     let listener = runtime
         .block_on(TcpListener::bind("127.0.0.1:0"))
         .expect("bind loopback");
@@ -61,7 +72,7 @@ pub fn serve(
         }
         *sink.lock().expect("captured lock") = String::from_utf8_lossy(&received).into_owned();
         let head = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+            "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\n{extra_headers}connection: close\r\n\r\n"
         );
         let _ = socket.write_all(head.as_bytes()).await;
         for (delay, bytes) in chunks {

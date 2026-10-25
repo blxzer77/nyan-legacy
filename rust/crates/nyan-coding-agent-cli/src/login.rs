@@ -14,15 +14,19 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use nyan_coding_agent_auth::{AuthStore, Credential};
-use nyan_coding_agent_provider_http::cpa::{CatalogModel, fetch_catalog, resolve_endpoints};
+use nyan_coding_agent_auth::AuthStore;
+use nyan_coding_agent_models::catalog::catalog_providers;
+use nyan_coding_agent_provider_http::cpa::{fetch_catalog, resolve_endpoints};
 use tokio::runtime::Handle;
 
+use crate::catalog_access::{Access, load};
 use crate::headless::SharedWriter;
-use crate::provider_table::PROVIDERS;
-use crate::providers::{CPA_BASE_URL_SETTING, CPA_PROVIDER, DEFAULT_CPA_BASE_URL, cpa_connection};
+use crate::providers::{
+    CPA_BASE_URL_SETTING, CPA_PROVIDER, DEFAULT_CPA_BASE_URL, cpa_connection, credential_available,
+};
 use crate::run::Environment;
 use crate::settings::{DefaultModel, read_default_model, write_default_model};
+use nyan_coding_agent_models::table::PROVIDERS;
 
 /// The providers `nyan login` can set up: id and display name.
 ///
@@ -40,6 +44,40 @@ pub fn login_providers() -> Vec<(&'static str, &'static str)> {
     );
     providers[2..].sort_by_key(|(id, _)| *id);
     providers
+}
+
+/// A model as the login menu and `--list-models` show it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Listed {
+    id: String,
+    context_window: u64,
+    max_tokens: u64,
+    reasoning: bool,
+    image_input: bool,
+}
+
+impl From<&nyan_coding_agent_provider_http::cpa::CatalogModel> for Listed {
+    fn from(model: &nyan_coding_agent_provider_http::cpa::CatalogModel) -> Self {
+        Self {
+            id: model.id.clone(),
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            reasoning: model.reasoning,
+            image_input: model.image_input,
+        }
+    }
+}
+
+impl From<&nyan_coding_agent_models::catalog::CatalogModel> for Listed {
+    fn from(model: &nyan_coding_agent_models::catalog::CatalogModel) -> Self {
+        Self {
+            id: model.id.clone(),
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            reasoning: model.reasoning,
+            image_input: model.image_input,
+        }
+    }
 }
 
 fn say(writer: &SharedWriter, text: &str) {
@@ -164,6 +202,23 @@ fn login_api_key(
         out,
         &format!("Stored the {name} API key. It has not been checked against the provider.\n"),
     );
+    // The provider's own model list, when the catalog has one; otherwise ask for an id.
+    match load(env, agent_dir, Access::RefreshIfStale) {
+        Ok(loaded) => {
+            for note in &loaded.notes {
+                say(out, &format!("{note}\n"));
+            }
+            let listed: Vec<Listed> = loaded
+                .catalog
+                .for_provider(provider)
+                .map(Listed::from)
+                .collect();
+            if !listed.is_empty() {
+                return choose_default(env, agent_dir, out, provider, &listed);
+            }
+        }
+        Err(message) => say(out, &format!("Could not load the model list: {message}\n")),
+    }
     let model = (env.prompt)(
         &format!("Default model id for {provider} (blank to skip): "),
         false,
@@ -243,7 +298,8 @@ fn login_cpa(
                         endpoints.models_url
                     ),
                 );
-                return choose_default(env, agent_dir, out, &models);
+                let listed: Vec<Listed> = models.iter().map(Listed::from).collect();
+                return choose_default(env, agent_dir, out, CPA_PROVIDER, &listed);
             }
             Err(error) => {
                 say(
@@ -263,17 +319,18 @@ fn choose_default(
     env: &Environment,
     agent_dir: &Path,
     out: &SharedWriter,
-    models: &[CatalogModel],
+    provider: &str,
+    models: &[Listed],
 ) -> Result<(), String> {
     if models.is_empty() {
         say(
             out,
-            "The proxy returned no models, so no default model was saved.\n",
+            "No models were listed, so no default model was saved.\n",
         );
         return Ok(());
     }
     if let Some(current) = read_default_model(agent_dir)?
-        && current.provider == CPA_PROVIDER
+        && current.provider == provider
         && models.iter().any(|model| model.id == current.model)
     {
         say(
@@ -307,7 +364,9 @@ fn choose_default(
         if answer.is_empty() {
             say(
                 out,
-                "No default model saved; pass --model cliproxyapi/<id> to choose one per run.\n",
+                &format!(
+                    "No default model saved; pass --model {provider}/<id> to choose one per run.\n"
+                ),
             );
             return Ok(());
         }
@@ -320,14 +379,11 @@ fn choose_default(
             write_default_model(
                 agent_dir,
                 &DefaultModel {
-                    provider: CPA_PROVIDER.to_owned(),
+                    provider: provider.to_owned(),
                     model: model.id.clone(),
                 },
             )?;
-            say(
-                out,
-                &format!("Default model: {CPA_PROVIDER}/{}\n", model.id),
-            );
+            say(out, &format!("Default model: {provider}/{}\n", model.id));
             return Ok(());
         }
         say(out, &format!("\"{answer}\" is not in the list.\n"));
@@ -386,36 +442,63 @@ pub fn run_list_models(
     out: &SharedWriter,
     err: &SharedWriter,
 ) -> i32 {
-    let outcome = (|| {
-        let store = AuthStore::new(agent_dir);
-        let runtime = runtime()?;
-        let mut rows: Vec<(String, CatalogModel)> = Vec::new();
-        for provider in store.providers().map_err(|error| error.to_string())? {
-            if provider != CPA_PROVIDER {
-                continue;
-            }
-            if !matches!(store.credential(&provider), Ok(Some(Credential::ApiKey(_)))) {
-                continue;
-            }
+    let mut rows: Vec<(String, Listed)> = Vec::new();
+    let mut failure: Option<String> = None;
+
+    if credential_available(CPA_PROVIDER, env, agent_dir) {
+        let fetched = runtime().and_then(|runtime| {
             let connection = cpa_connection(None, env, agent_dir)?;
-            let models = runtime
+            runtime
                 .block_on(fetch_catalog(
                     runtime.handle(),
                     &connection.endpoints.models_url,
                     &connection.api_key,
                 ))
-                .map_err(|error| format!("{provider}: {error}"))?;
-            rows.extend(models.into_iter().map(|model| (provider.clone(), model)));
+                .map_err(|error| format!("{CPA_PROVIDER}: {error}"))
+        });
+        match fetched {
+            Ok(models) => rows.extend(
+                models
+                    .iter()
+                    .map(|model| (CPA_PROVIDER.to_owned(), Listed::from(model))),
+            ),
+            Err(message) => failure = Some(message),
         }
-        Ok::<_, String>(rows)
-    })();
-    let rows = match outcome {
-        Ok(rows) => rows,
-        Err(message) => {
+    }
+
+    let wanted: Vec<&str> = catalog_providers()
+        .into_iter()
+        .filter(|provider| credential_available(provider, env, agent_dir))
+        .collect();
+    if !wanted.is_empty() {
+        match load(env, agent_dir, Access::RefreshIfStale) {
+            Ok(loaded) => {
+                for note in &loaded.notes {
+                    say(err, &format!("{note}\n"));
+                }
+                for provider in wanted {
+                    rows.extend(
+                        loaded
+                            .catalog
+                            .for_provider(provider)
+                            .map(|model| (provider.to_owned(), Listed::from(model))),
+                    );
+                }
+            }
+            Err(message) => {
+                failure =
+                    Some(failure.map_or(message.clone(), |first| format!("{first}\n{message}")));
+            }
+        }
+    }
+
+    if let Some(message) = &failure {
+        if rows.is_empty() {
             say(err, &format!("Error: {message}\n"));
             return 1;
         }
-    };
+        say(err, &format!("Warning: {message}\n"));
+    }
     let needle = search.map(str::to_lowercase);
     let rows: Vec<_> = rows
         .into_iter()
@@ -438,12 +521,12 @@ pub fn run_list_models(
         return 0;
     }
     let mut table = String::from(
-        "provider      model                          context  max-out  thinking  images\n",
+        "provider                model                          context  max-out  thinking  images\n",
     );
     for (provider, model) in rows {
         let _ = writeln!(
             table,
-            "{provider:<13} {:<30} {:<8} {:<8} {:<9} {}",
+            "{provider:<23} {:<30} {:<8} {:<8} {:<9} {}",
             model.id,
             format_tokens(model.context_window),
             format_tokens(model.max_tokens),

@@ -28,8 +28,12 @@ pub struct AnthropicMessagesProvider {
     id: String,
     base_url: String,
     api_key: Option<String>,
+    max_tokens: u64,
     transport: Transport,
 }
+
+/// The output limit sent when the caller does not know the model's own.
+pub const DEFAULT_MAX_TOKENS: u64 = 16_384;
 
 impl AnthropicMessagesProvider {
     /// Creates a provider that posts to `{base_url}/v1/messages`.
@@ -47,8 +51,17 @@ impl AnthropicMessagesProvider {
             id: id.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key,
+            max_tokens: DEFAULT_MAX_TOKENS,
             transport: Transport::new(handle)?,
         })
+    }
+
+    /// Sets `max_tokens`, which the Messages API requires on every request;
+    /// callers pass the model's output limit.
+    #[must_use]
+    pub fn with_max_tokens(mut self, max_tokens: u64) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     /// Sets how long a response may stay silent before the stream fails.
@@ -70,7 +83,7 @@ impl ModelProvider for AnthropicMessagesProvider {
     ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
         let post = Post {
             url: format!("{}/v1/messages", self.base_url),
-            body: build_request_body(&request).to_string(),
+            body: build_request_body(&request, self.max_tokens).to_string(),
             bearer: None,
             headers: vec![
                 (
@@ -91,7 +104,7 @@ impl ModelProvider for AnthropicMessagesProvider {
 
 /// Builds an Anthropic Messages request.
 #[must_use]
-pub fn build_request_body(request: &ProviderRequest) -> Value {
+pub fn build_request_body(request: &ProviderRequest, max_tokens: u64) -> Value {
     let mut system = Vec::new();
     let mut messages = Vec::new();
     for message in &request.messages {
@@ -137,7 +150,7 @@ pub fn build_request_body(request: &ProviderRequest) -> Value {
     }
     let mut body = json!({
         "model": request.model.model,
-        "max_tokens": 16_384,
+        "max_tokens": max_tokens,
         "stream": true,
         "messages": messages,
     });
