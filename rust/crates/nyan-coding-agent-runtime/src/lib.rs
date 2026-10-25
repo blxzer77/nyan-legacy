@@ -328,6 +328,12 @@ impl RuntimeError {
             Self::Provider(error) => match error {
                 ProviderError::Authentication { .. } => "auth",
                 ProviderError::ModelUnavailable { .. } => "model",
+                ProviderError::RateLimited { .. } => "rate_limit",
+                ProviderError::Overloaded { .. } => "overloaded",
+                ProviderError::ContextOverflow { .. } => "context_overflow",
+                ProviderError::MediaTooLarge { .. } => "media_too_large",
+                ProviderError::ToolPairing { .. } => "tool_pairing",
+                ProviderError::Connection { .. } => "connection",
                 ProviderError::Request { .. } => "provider",
                 ProviderError::Stream { .. } => "stream",
                 ProviderError::Cancelled => "cancelled",
@@ -2332,6 +2338,56 @@ mod tests {
             "/tmp/project",
         );
         (providers, config)
+    }
+
+    #[test]
+    fn provider_error_classes_have_stable_runtime_codes() {
+        let cases = [
+            (
+                ProviderError::RateLimited {
+                    message: "busy".to_owned(),
+                    retryable: true,
+                    retry_after: None,
+                },
+                "rate_limit",
+            ),
+            (
+                ProviderError::Overloaded {
+                    message: "busy".to_owned(),
+                    retryable: true,
+                    retry_after: None,
+                },
+                "overloaded",
+            ),
+            (
+                ProviderError::ContextOverflow {
+                    message: "too long".to_owned(),
+                },
+                "context_overflow",
+            ),
+            (
+                ProviderError::MediaTooLarge {
+                    message: "too large".to_owned(),
+                },
+                "media_too_large",
+            ),
+            (
+                ProviderError::ToolPairing {
+                    message: "bad pair".to_owned(),
+                },
+                "tool_pairing",
+            ),
+            (
+                ProviderError::Connection {
+                    message: "offline".to_owned(),
+                    retryable: true,
+                },
+                "connection",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(RuntimeError::Provider(error).code(), code);
+        }
     }
 
     #[test]

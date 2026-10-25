@@ -221,7 +221,7 @@ fn http_statuses_map_to_stable_error_kinds() {
             }
             (
                 "retryable",
-                ProviderError::Request {
+                ProviderError::RateLimited {
                     retryable: true, ..
                 },
             )

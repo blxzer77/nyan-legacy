@@ -107,6 +107,46 @@ pub enum ProviderError {
         /// Provider diagnostic.
         message: String,
     },
+    /// The provider asked the caller to slow down.
+    RateLimited {
+        /// Provider diagnostic.
+        message: String,
+        /// Whether retrying is safe.
+        retryable: bool,
+        /// Server-requested delay before retrying.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The provider is temporarily overloaded.
+    Overloaded {
+        /// Provider diagnostic.
+        message: String,
+        /// Whether retrying is safe.
+        retryable: bool,
+        /// Server-requested delay before retrying.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The request exceeds the model context window.
+    ContextOverflow {
+        /// Provider diagnostic.
+        message: String,
+    },
+    /// The provider rejected the media payload or its size.
+    MediaTooLarge {
+        /// Provider diagnostic.
+        message: String,
+    },
+    /// The request contains an invalid tool-call/result pairing.
+    ToolPairing {
+        /// Provider diagnostic.
+        message: String,
+    },
+    /// The transport could not establish or keep the connection.
+    Connection {
+        /// Provider diagnostic.
+        message: String,
+        /// Whether a fresh request may be attempted safely.
+        retryable: bool,
+    },
     /// The provider returned an error.
     Request {
         /// Provider diagnostic.
@@ -132,6 +172,12 @@ impl std::fmt::Display for ProviderError {
         match self {
             Self::Authentication { message }
             | Self::ModelUnavailable { message }
+            | Self::RateLimited { message, .. }
+            | Self::Overloaded { message, .. }
+            | Self::ContextOverflow { message }
+            | Self::MediaTooLarge { message }
+            | Self::ToolPairing { message }
+            | Self::Connection { message, .. }
             | Self::Request { message, .. }
             | Self::Stream { message, .. } => formatter.write_str(message),
             Self::Cancelled => formatter.write_str("provider request cancelled"),
@@ -146,9 +192,15 @@ impl ProviderError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
-            Self::Request { retry_after, .. } => *retry_after,
+            Self::RateLimited { retry_after, .. }
+            | Self::Overloaded { retry_after, .. }
+            | Self::Request { retry_after, .. } => *retry_after,
             Self::Authentication { .. }
             | Self::ModelUnavailable { .. }
+            | Self::ContextOverflow { .. }
+            | Self::MediaTooLarge { .. }
+            | Self::ToolPairing { .. }
+            | Self::Connection { .. }
             | Self::Stream { .. }
             | Self::Cancelled => None,
         }
@@ -158,8 +210,17 @@ impl ProviderError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::Request { retryable, .. } | Self::Stream { retryable, .. } => *retryable,
-            Self::Authentication { .. } | Self::ModelUnavailable { .. } | Self::Cancelled => false,
+            Self::RateLimited { retryable, .. }
+            | Self::Overloaded { retryable, .. }
+            | Self::Request { retryable, .. }
+            | Self::Stream { retryable, .. }
+            | Self::Connection { retryable, .. } => *retryable,
+            Self::Authentication { .. }
+            | Self::ModelUnavailable { .. }
+            | Self::ContextOverflow { .. }
+            | Self::MediaTooLarge { .. }
+            | Self::ToolPairing { .. }
+            | Self::Cancelled => false,
         }
     }
 }
@@ -226,6 +287,22 @@ mod tests {
         assert!(
             !super::ProviderError::Authentication {
                 message: "missing credential".to_owned(),
+            }
+            .is_retryable()
+        );
+        assert_eq!(
+            super::ProviderError::RateLimited {
+                message: "slow down".to_owned(),
+                retryable: true,
+                retry_after: Some(std::time::Duration::from_secs(2)),
+            }
+            .retry_after(),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert!(
+            super::ProviderError::Connection {
+                message: "offline".to_owned(),
+                retryable: true,
             }
             .is_retryable()
         );

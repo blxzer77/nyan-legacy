@@ -198,10 +198,9 @@ impl ProviderStream for ChannelStream {
 }
 
 fn transport_error(error: &reqwest::Error) -> ProviderError {
-    ProviderError::Request {
+    ProviderError::Connection {
         message: format!("request failed: {error}"),
         retryable: error.is_connect() || error.is_timeout() || error.is_request(),
-        retry_after: None,
     }
 }
 
@@ -309,17 +308,33 @@ fn status_error_with_retry_after(
         message.clone_into(&mut detail);
     }
     let message = format!("HTTP {status}: {detail}");
-    // A spent quota does not come back by trying again.
-    let spent = status == 429 && is_spent_quota(&format!("{body} {detail}"));
+    let classification_text = format!("{body} {detail}");
+    if is_context_overflow(&classification_text) {
+        return ProviderError::ContextOverflow { message };
+    }
+    if status == 413 || is_media_too_large(&classification_text) {
+        return ProviderError::MediaTooLarge { message };
+    }
+    if is_tool_pairing(&classification_text) {
+        return ProviderError::ToolPairing { message };
+    }
+    // A spent quota does not come back by trying again, but it remains a
+    // rate-limit class so callers can distinguish it from authentication.
+    let spent = status == 429 && is_spent_quota(&classification_text);
     match status {
-        429 if spent => ProviderError::Request {
+        429 => ProviderError::RateLimited {
             message,
-            retryable: false,
+            retryable: !spent,
             retry_after,
         },
         401 | 403 => ProviderError::Authentication { message },
         404 => ProviderError::ModelUnavailable { message },
-        408 | 409 | 425 | 429 | 500..=599 => ProviderError::Request {
+        500..=599 => ProviderError::Overloaded {
+            message,
+            retryable: true,
+            retry_after,
+        },
+        408 | 409 | 425 => ProviderError::Request {
             message,
             retryable: true,
             retry_after,
@@ -330,6 +345,48 @@ fn status_error_with_retry_after(
             retry_after,
         },
     }
+}
+
+fn is_context_overflow(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "context length",
+        "context window",
+        "maximum context",
+        "prompt is too long",
+        "too many tokens",
+        "token limit",
+        "input is too long",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn is_media_too_large(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "payload too large",
+        "request entity too large",
+        "media too large",
+        "image too large",
+        "file too large",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn is_tool_pairing(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("tool") || lower.contains("function_call"))
+        && [
+            "pair",
+            "tool_call_id",
+            "tool_use_id",
+            "must be followed",
+            "missing tool",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 /// Whether a 429 body says the account is out of quota or budget, not just busy.
@@ -509,7 +566,7 @@ mod tests {
         let error = status_error(429, r#"{"error":{"message":"slow down"}}"#);
         assert_eq!(
             error,
-            ProviderError::Request {
+            ProviderError::RateLimited {
                 message: "HTTP 429: slow down".to_owned(),
                 retryable: true,
                 retry_after: None,
@@ -542,11 +599,23 @@ mod tests {
 
         assert_eq!(
             status_error_with_retry_after(503, "busy", Some(Duration::from_secs(7))),
-            ProviderError::Request {
+            ProviderError::Overloaded {
                 message: "HTTP 503: busy".to_owned(),
                 retryable: true,
                 retry_after: Some(Duration::from_secs(7)),
             }
         );
+        assert!(matches!(
+            status_error(400, "maximum context length exceeded"),
+            ProviderError::ContextOverflow { .. }
+        ));
+        assert!(matches!(
+            status_error(413, "image too large"),
+            ProviderError::MediaTooLarge { .. }
+        ));
+        assert!(matches!(
+            status_error(400, "tool_use_id must be followed by a tool result"),
+            ProviderError::ToolPairing { .. }
+        ));
     }
 }

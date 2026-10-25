@@ -381,11 +381,19 @@ fn http_statuses_map_to_the_same_error_kinds_as_the_chat_provider() {
             ProviderError::Authentication { message } if expect_auth => {
                 assert!(message.ends_with(": nope"), "{message}");
             }
+            ProviderError::RateLimited {
+                message,
+                retryable: got,
+                ..
+            } if !expect_auth && retryable => {
+                assert_eq!(got, retryable, "{status}");
+                assert!(message.ends_with(": nope"), "{message}");
+            }
             ProviderError::Request {
                 message,
                 retryable: got,
                 ..
-            } if !expect_auth => {
+            } if !expect_auth && !retryable => {
                 assert_eq!(got, retryable, "{status}");
                 assert!(message.ends_with(": nope"), "{message}");
             }
