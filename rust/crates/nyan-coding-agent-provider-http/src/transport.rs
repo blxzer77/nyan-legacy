@@ -54,12 +54,27 @@ pub(crate) trait StreamProtocol: Send + 'static {
     fn finish(self) -> Finished;
 }
 
+/// Splits response bytes into frames. SSE and the AWS event stream both become
+/// [`SseEvent`]s so a protocol sees one shape.
+pub(crate) trait FrameDecoder: Send + 'static {
+    /// Feeds one chunk and returns the frames it completed.
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, ProviderError>;
+}
+
+impl FrameDecoder for SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, ProviderError> {
+        Ok(SseDecoder::push(self, chunk))
+    }
+}
+
 /// One POST request.
 pub(crate) struct Post {
     pub url: String,
     pub body: String,
     pub bearer: Option<String>,
     pub headers: Vec<(String, String)>,
+    /// The `accept` header; `text/event-stream` when `None`.
+    pub accept: Option<&'static str>,
 }
 
 /// The HTTP client, runtime handle, and idle timeout one provider uses.
@@ -98,6 +113,17 @@ impl Transport {
         cancellation: CancellationToken,
         protocol: P,
     ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
+        self.start_framed(post, cancellation, protocol, SseDecoder::new())
+    }
+
+    /// Like [`Transport::start`] with a protocol-specific frame decoder.
+    pub(crate) fn start_framed<P: StreamProtocol, D: FrameDecoder>(
+        &self,
+        post: Post,
+        cancellation: CancellationToken,
+        protocol: P,
+        decoder: D,
+    ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
         let client = self.client.clone();
         let handle = self.handle.clone();
         let idle_timeout = self.idle_timeout;
@@ -109,7 +135,7 @@ impl Transport {
                 let mut builder = client
                     .post(post.url)
                     .header("content-type", "application/json")
-                    .header("accept", "text/event-stream")
+                    .header("accept", post.accept.unwrap_or("text/event-stream"))
                     .body(post.body);
                 for (name, value) in post.headers {
                     builder = builder.header(name, value);
@@ -133,7 +159,14 @@ impl Transport {
                 retryable: false,
             })??;
             let (sender, receiver) = mpsc::channel(64);
-            handle.spawn(pump(response, sender, cancellation, idle_timeout, protocol));
+            handle.spawn(pump(
+                response,
+                sender,
+                cancellation,
+                idle_timeout,
+                protocol,
+                decoder,
+            ));
             Ok(Box::new(ChannelStream {
                 receiver: Arc::new(Mutex::new(receiver)),
             }) as Box<dyn ProviderStream>)
@@ -223,14 +256,14 @@ async fn send_error(sender: &mpsc::Sender<EventResult>, message: &str, retryable
         .await;
 }
 
-async fn pump<P: StreamProtocol>(
+async fn pump<P: StreamProtocol, D: FrameDecoder>(
     mut response: reqwest::Response,
     sender: mpsc::Sender<EventResult>,
     cancellation: CancellationToken,
     idle_timeout: Duration,
     mut protocol: P,
+    mut decoder: D,
 ) {
-    let mut decoder = SseDecoder::new();
     let mut idle = Duration::ZERO;
     let mut done = false;
     'read: loop {
@@ -260,7 +293,14 @@ async fn pump<P: StreamProtocol>(
             }
         };
         idle = Duration::ZERO;
-        for event in decoder.push(&chunk) {
+        let frames = match decoder.push(&chunk) {
+            Ok(frames) => frames,
+            Err(error) => {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+        };
+        for event in frames {
             match protocol.apply(&event) {
                 Ok(Applied::Nothing) => {}
                 Ok(Applied::Text(text)) => {

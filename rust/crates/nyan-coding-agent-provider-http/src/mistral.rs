@@ -71,6 +71,7 @@ impl ModelProvider for MistralConversationsProvider {
             body: build_request_body(&request).to_string(),
             bearer: self.api_key.clone(),
             headers: Vec::new(),
+            accept: None,
         };
         self.transport
             .start(post, request.cancellation.clone(), MistralStream::default())

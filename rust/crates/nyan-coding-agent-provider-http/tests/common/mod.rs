@@ -110,3 +110,43 @@ pub fn drain(
         }
     }
 }
+
+/// Builds one AWS event-stream message with string headers.
+pub fn eventstream_message(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+    use nyan_coding_agent_provider_http::eventstream::crc32;
+    let mut header_bytes = Vec::new();
+    for (name, value) in headers {
+        header_bytes.push(u8::try_from(name.len()).expect("short name"));
+        header_bytes.extend_from_slice(name.as_bytes());
+        header_bytes.push(7);
+        header_bytes.extend_from_slice(
+            &u16::try_from(value.len())
+                .expect("short value")
+                .to_be_bytes(),
+        );
+        header_bytes.extend_from_slice(value.as_bytes());
+    }
+    let total = 12 + header_bytes.len() + payload.len() + 4;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&u32::try_from(total).expect("size").to_be_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(header_bytes.len())
+            .expect("size")
+            .to_be_bytes(),
+    );
+    let prelude_crc = crc32(&bytes);
+    bytes.extend_from_slice(&prelude_crc.to_be_bytes());
+    bytes.extend_from_slice(&header_bytes);
+    bytes.extend_from_slice(payload);
+    let message_crc = crc32(&bytes);
+    bytes.extend_from_slice(&message_crc.to_be_bytes());
+    bytes
+}
+
+/// One Converse event frame.
+pub fn converse_event(kind: &str, payload: &serde_json::Value) -> Vec<u8> {
+    eventstream_message(
+        &[(":message-type", "event"), (":event-type", kind)],
+        payload.to_string().as_bytes(),
+    )
+}

@@ -117,6 +117,7 @@ impl ModelProvider for GoogleGenerativeAiProvider {
             body: build_request_body(&request).to_string(),
             bearer: None,
             headers: Vec::new(),
+            accept: None,
         };
         self.transport
             .start(post, request.cancellation.clone(), GoogleStream::default())
@@ -141,6 +142,7 @@ impl ModelProvider for GoogleVertexProvider {
             body: build_request_body(&request).to_string(),
             bearer: self.bearer_token.clone(),
             headers: Vec::new(),
+            accept: None,
         };
         self.transport
             .start(post, request.cancellation.clone(), GoogleStream::default())

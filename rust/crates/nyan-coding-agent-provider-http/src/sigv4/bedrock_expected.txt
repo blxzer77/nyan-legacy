@@ -1,0 +1,1 @@
+AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-west-2/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=e1f12a120778fd0135fd50bebc202ccd42cf95efbf328f3060d4867ea0c2d371

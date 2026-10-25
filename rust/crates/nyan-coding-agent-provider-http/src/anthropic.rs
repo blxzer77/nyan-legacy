@@ -79,6 +79,7 @@ impl ModelProvider for AnthropicMessagesProvider {
                 ),
                 ("anthropic-version".to_owned(), ANTHROPIC_VERSION.to_owned()),
             ],
+            accept: None,
         };
         self.transport.start(
             post,

@@ -402,3 +402,67 @@ fn cancellation_ends_a_silent_stream() {
     assert_eq!(error, ProviderError::Cancelled);
     assert!(started.elapsed() < Duration::from_secs(2));
 }
+
+#[test]
+fn azure_sends_the_key_in_api_key_with_the_api_version_and_maps_deployments() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve(&runtime, "200 OK", frames(&[completed(&json!({}))]), false);
+    let provider = OpenAiResponsesProvider::azure(
+        "azure",
+        &format!("http://{}/custom/v1", server.address),
+        Some("azure-secret".to_owned()),
+        "2025-04-01-preview",
+        runtime.handle().clone(),
+    )
+    .expect("provider")
+    .with_deployments(std::collections::BTreeMap::from([(
+        "test-model".to_owned(),
+        "my-deployment".to_owned(),
+    )]));
+    let stream = runtime
+        .block_on(provider.stream(request(CancellationToken::new())))
+        .expect("stream");
+    drain(&runtime, stream).expect("drain");
+    let captured = server.captured.lock().expect("lock").clone();
+    assert!(
+        captured.starts_with("POST /custom/v1/responses?api-version=2025-04-01-preview HTTP/1.1"),
+        "{captured}"
+    );
+    let lower = captured.to_ascii_lowercase();
+    assert!(lower.contains("api-key: azure-secret"), "{captured}");
+    assert!(
+        !lower.contains("authorization:"),
+        "Azure must not get a bearer header: {captured}"
+    );
+    assert_eq!(body_of(&server)["model"], "my-deployment");
+}
+
+#[test]
+fn azure_resource_urls_reduce_to_the_openai_v1_root() {
+    use nyan_coding_agent_provider_http::responses::normalize_azure_base_url as normalize;
+    for input in [
+        "https://res.openai.azure.com",
+        "https://res.openai.azure.com/",
+        "https://res.openai.azure.com/openai",
+        "https://res.openai.azure.com/openai/v1/responses",
+        "https://res.cognitiveservices.azure.com",
+    ] {
+        let expected = format!(
+            "{}/openai/v1",
+            input
+                .split("/openai")
+                .next()
+                .expect("origin")
+                .trim_end_matches('/')
+        );
+        assert_eq!(normalize(input), expected, "{input}");
+    }
+    assert_eq!(
+        normalize("https://res.openai.azure.com/openai/v1"),
+        "https://res.openai.azure.com/openai/v1"
+    );
+    assert_eq!(
+        normalize("https://gateway.example.com/azure/"),
+        "https://gateway.example.com/azure"
+    );
+}
