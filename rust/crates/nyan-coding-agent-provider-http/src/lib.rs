@@ -5,6 +5,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod codex;
 pub mod codex_auth;
 pub mod cpa;
 pub mod eventstream;
@@ -19,6 +20,7 @@ pub(crate) mod transport;
 
 pub use anthropic::AnthropicMessagesProvider;
 pub use bedrock::{BedrockAuth, BedrockConverseProvider};
+pub use codex::{CodexAuthSource, CodexCredentials, OpenAiCodexProvider};
 pub use google::{GoogleGenerativeAiProvider, GoogleVertexProvider, VertexAuth};
 pub use mistral::MistralConversationsProvider;
 pub use openai::OpenAiChatProvider;

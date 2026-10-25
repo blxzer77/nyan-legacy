@@ -25,6 +25,8 @@ pub enum WireApi {
     GoogleGenerativeAi,
     /// Google Vertex AI.
     GoogleVertex,
+    /// The `ChatGPT` Codex backend.
+    OpenAiCodexResponses,
 }
 
 impl WireApi {
@@ -37,6 +39,7 @@ impl WireApi {
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
             Self::GoogleVertex => "google-vertex",
+            Self::OpenAiCodexResponses => "openai-codex-responses",
         }
     }
 }

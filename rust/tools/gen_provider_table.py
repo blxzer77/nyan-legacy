@@ -22,6 +22,7 @@ API = {
     "anthropic-messages": "AnthropicMessages",
     "google-generative-ai": "GoogleGenerativeAi",
     "google-vertex": "GoogleVertex",
+    "openai-codex-responses": "OpenAiCodexResponses",
 }
 NON_CHAT = {
     "openai-decisions", "typesafe-system-one", "openrouter-images",
@@ -34,6 +35,7 @@ OWNER_EXCLUDED = {
     "vercel-ai-gateway", "mistral", "amazon-bedrock",
 }
 supported, mixed, other = [], [], []
+codex_models = []
 for path in sorted(glob.glob(os.path.join(providers, "data", "*.json"))):
     pid = os.path.basename(path)[:-5]
     if pid in OWNER_EXCLUDED:
@@ -52,6 +54,14 @@ for path in sorted(glob.glob(os.path.join(providers, "data", "*.json"))):
     envs = [env_map[pid]] if pid in env_map else []
     if len(apis) > 1:
         mixed.append((pid, name, envs))
+    elif pid == "openai-codex":
+        # Called through its own provider and OAuth login, with the hand-written model
+        # list below; the generic table has no row for it.
+        codex_models = [
+            (m["id"], m.get("name", m["id"]), m["contextWindow"], m["maxTokens"],
+             bool(m.get("reasoning")), "image" in m.get("input", []))
+            for models in data.values() for m in models.values()
+        ]
     elif not apis:
         other.append((pid, ["(no chat models)"]))
     elif apis <= set(API):
@@ -113,6 +123,31 @@ out += [
 for pid, name, envs in mixed:
     env_text = ", ".join(f'"{e}"' for e in envs)
     out.append(f'    MixedDef {{ id: "{pid}", name: "{name}", env_keys: &[{env_text}] }},')
+out += [
+    "];",
+    "",
+    "/// A model listed by hand rather than from models.dev.",
+    "#[derive(Debug)]",
+    "pub struct StaticModel {",
+    "    /// Model id.",
+    "    pub id: &'static str,",
+    "    /// Display name.",
+    "    pub name: &'static str,",
+    "    /// Context window in tokens.",
+    "    pub context_window: u64,",
+    "    /// Output limit in tokens.",
+    "    pub max_tokens: u64,",
+    "    /// Whether the model reasons.",
+    "    pub reasoning: bool,",
+    "    /// Whether the model accepts images.",
+    "    pub image_input: bool,",
+    "}",
+    "",
+    "/// The `openai-codex` models, which the TypeScript generator also lists by hand.",
+    "pub const CODEX_MODELS: &[StaticModel] = &[",
+]
+for mid, name, ctx, mx, reasoning, image in sorted(codex_models):
+    out.append(f'    StaticModel {{ id: "{mid}", name: "{name}", context_window: {ctx:_}, max_tokens: {mx:_}, reasoning: {str(reasoning).lower()}, image_input: {str(image).lower()} }},')
 out += ["];", "", "/// Providers whose wire API this build does not implement.", "pub const UNSUPPORTED_API_PROVIDERS: &[(&str, &str)] = &["]
 out += [f'    ("{pid}", "{apis[0]}"),' for pid, apis in other]
 out += ["];", ""]

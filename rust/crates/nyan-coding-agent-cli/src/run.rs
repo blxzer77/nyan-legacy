@@ -31,7 +31,12 @@ use crate::tool_selection::select_tools;
 pub type EnvLookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Asks one question and returns the answer line, or `None` at end of input.
-pub type PromptFn = Box<dyn Fn(&str, bool) -> Option<String> + Send + Sync>;
+///
+/// Shared, so a prompt that cannot be interrupted can wait on a thread of its own.
+pub type PromptFn = Arc<dyn Fn(&str, bool) -> Option<String> + Send + Sync>;
+
+/// Opens a URL in the user's browser, if it can.
+pub type OpenUrlFn = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Reads whatever was piped to stdin, trimmed.
 pub type StdinReader = Box<dyn Fn() -> Option<String> + Send + Sync>;
@@ -57,6 +62,10 @@ pub struct Environment {
     pub read_stdin: StdinReader,
     /// Asks the user one question (`secret` hides the answer); `None` when input has ended.
     pub prompt: PromptFn,
+    /// Opens a sign-in URL in a browser.
+    pub open_url: OpenUrlFn,
+    /// The port the browser sign-in listens on; `0` lets the system choose.
+    pub oauth_callback_port: u16,
 }
 
 impl std::fmt::Debug for Environment {
@@ -88,9 +97,12 @@ fn help_text() -> String {
             .to_owned(),
         "and ls tools; sessions, @files, and piped stdin. Providers (API key from the".to_owned(),
         "environment, --api-key, or `nyan login <provider>`): CLIProxyAPI, OpenAI, xAI,".to_owned(),
-        "Anthropic, Google, Google Vertex (API key), and the OpenAI-compatible".to_owned(),
-        "providers. Providers that mix wire APIs per model and OAuth logins are not".to_owned(),
-        "supported yet.".to_owned(),
+        "Anthropic, Google, Google Vertex (API key), OpenCode Go, and the OpenAI-compatible"
+            .to_owned(),
+        "providers; and OpenAI Codex with a ChatGPT sign-in (`nyan login openai-codex`)."
+            .to_owned(),
+        "OpenRouter, OpenCode Zen, GitHub Copilot, and other OAuth logins are not supported."
+            .to_owned(),
         String::new(),
         "Commands:".to_owned(),
         "  login [provider]    Store a login and choose a default model".to_owned(),

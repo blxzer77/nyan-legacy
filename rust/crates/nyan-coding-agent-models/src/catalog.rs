@@ -10,14 +10,14 @@
 //!
 //! Not ported from the generator: the providers it fills from live listings
 //! (`OpenRouter`, Vercel AI Gateway, NVIDIA NIM), the hand-written entries
-//! (`DeepSeek`, Ant Ling, `OpenAI` Codex), the `GitHub` Copilot and Baseten
+//! (`DeepSeek`, Ant Ling), the `GitHub` Copilot and Baseten
 //! sections, the Qwen Token Plan individual allow-list, the Kimi implied
-//! subscription costs, tiered pricing, thinking-level maps, and `compat` flags.
+//! subscription costs, prices for the `openai-codex` list, tiered pricing, thinking-level maps, and `compat` flags.
 
 use serde_json::{Map, Value};
 
 use crate::WireApi;
-use crate::table::PROVIDERS;
+use crate::table::{CODEX_MODELS, PROVIDERS};
 
 /// Prices in US dollars per million tokens.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -145,7 +145,11 @@ const SOURCES: &[Source] = &[
 /// The providers the catalog can list.
 #[must_use]
 pub fn catalog_providers() -> Vec<&'static str> {
-    SOURCES.iter().map(|source| source.provider).collect()
+    SOURCES
+        .iter()
+        .map(|source| source.provider)
+        .chain(["openai-codex"])
+        .collect()
 }
 
 fn number(value: Option<&Value>) -> f64 {
@@ -248,6 +252,18 @@ pub fn build(providers: &Map<String, Value>) -> Vec<CatalogModel> {
             catalog.extend(models_for(source.provider, source.rule, models));
         }
     }
+    catalog.extend(CODEX_MODELS.iter().map(|model| CatalogModel {
+        provider: "openai-codex".to_owned(),
+        id: model.id.to_owned(),
+        name: model.name.to_owned(),
+        api: WireApi::OpenAiCodexResponses,
+        base_url: "https://chatgpt.com/backend-api".to_owned(),
+        reasoning: model.reasoning,
+        image_input: model.image_input,
+        context_window: model.context_window,
+        max_tokens: model.max_tokens,
+        cost: Cost::default(),
+    }));
     catalog
 }
 

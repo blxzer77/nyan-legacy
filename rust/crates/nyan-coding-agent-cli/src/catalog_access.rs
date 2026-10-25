@@ -31,7 +31,7 @@ pub enum Access {
 /// A catalog and anything the caller should tell the user about it.
 #[derive(Debug)]
 pub struct Loaded {
-    /// The catalog; empty when nothing was available in [`Access::CacheOnly`].
+    /// The catalog; without a cache in [`Access::CacheOnly`] it holds only the built-in lists.
     pub catalog: Catalog,
     /// Lines for stderr, such as "using data from 3 days ago".
     pub notes: Vec<String>,
@@ -62,8 +62,9 @@ pub fn load(env: &Environment, agent_dir: &Path, access: Access) -> Result<Loade
     match (&cached, access) {
         (Some(cached), Access::CacheOnly) => return Ok(from(cached, Vec::new())),
         (None, Access::CacheOnly) => {
+            // Not empty: the hand-written Codex list needs no models.dev data.
             return Ok(Loaded {
-                catalog: Catalog::default(),
+                catalog: Catalog::from_models_dev(&serde_json::Map::new()),
                 notes: Vec::new(),
             });
         }

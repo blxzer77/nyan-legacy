@@ -200,7 +200,7 @@ pub fn build_request_body(request: &ProviderRequest, instruction_role: &str) -> 
     body
 }
 
-fn wire_tool(tool: &ToolSpec) -> Value {
+pub(crate) fn wire_tool(tool: &ToolSpec) -> Value {
     let parameters = serde_json::from_str::<Value>(&tool.parameters_schema)
         .ok()
         .filter(Value::is_object)
@@ -213,7 +213,7 @@ fn wire_tool(tool: &ToolSpec) -> Value {
     })
 }
 
-fn push_input_items(input: &mut Vec<Value>, message: &Message, instruction_role: &str) {
+pub(crate) fn push_input_items(input: &mut Vec<Value>, message: &Message, instruction_role: &str) {
     match message.role {
         MessageRole::System => {
             if !message.text.is_empty() {
@@ -264,7 +264,7 @@ struct Terminal {
 }
 
 #[derive(Default)]
-struct ResponsesStream {
+pub(crate) struct ResponsesStream {
     calls: BTreeMap<u64, PendingCall>,
     by_item_id: HashMap<String, u64>,
     terminal: Option<Terminal>,

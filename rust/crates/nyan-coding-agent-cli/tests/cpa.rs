@@ -211,9 +211,9 @@ fn a_cancelled_login_stores_nothing_and_exits_one() {
     let unknown = home.go(&["login", "nowhere"], &[], &[]);
     assert_eq!(unknown.code, 1);
     assert!(
-        unknown
-            .stderr
-            .contains("cannot log in to \"nowhere\" (available: cliproxyapi, ant-ling, "),
+        unknown.stderr.contains(
+            "cannot log in to \"nowhere\" (available: cliproxyapi, openai-codex, ant-ling, "
+        ),
         "{}",
         unknown.stderr
     );

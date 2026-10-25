@@ -103,8 +103,10 @@ fn execute_with_stdin(
         cwd,
         base_urls: std::collections::BTreeMap::from([("groq".to_owned(), base_url.to_owned())]),
         models_dev_url: "http://127.0.0.1:1/api.json".to_owned(),
+        open_url: Box::new(|_| {}),
+        oauth_callback_port: 0,
         read_stdin: Box::new(move || stdin.clone()),
-        prompt: Box::new(|_, _| None),
+        prompt: std::sync::Arc::new(|_, _| None),
     };
     let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
     let code = run(&argv, &environment, &out, &err);
@@ -654,8 +656,10 @@ fn system_prompt_flags_and_project_context_shape_the_first_message() {
                 format!("http://{address}/v1"),
             )]),
             models_dev_url: "http://127.0.0.1:1/api.json".to_owned(),
+            open_url: Box::new(|_| {}),
+            oauth_callback_port: 0,
             read_stdin: Box::new(|| None),
-            prompt: Box::new(|_, _| None),
+            prompt: std::sync::Arc::new(|_, _| None),
         };
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
         assert_eq!(run(&argv, &environment, &out, &err), 0);

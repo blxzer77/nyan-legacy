@@ -3,6 +3,7 @@
 pub mod app_mode;
 pub mod args;
 pub mod catalog_access;
+pub mod codex;
 pub mod headless;
 pub mod initial_message;
 pub mod login;

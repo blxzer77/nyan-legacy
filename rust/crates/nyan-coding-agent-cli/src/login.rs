@@ -34,9 +34,15 @@ use nyan_coding_agent_models::table::PROVIDERS;
 /// entry stores an API key.
 #[must_use]
 pub fn login_providers() -> Vec<(&'static str, &'static str)> {
-    let mut providers = vec![(CPA_PROVIDER, "CLIProxyAPI")];
+    let mut providers = vec![
+        (CPA_PROVIDER, "CLIProxyAPI"),
+        (
+            crate::codex::CODEX_PROVIDER,
+            "OpenAI Codex (ChatGPT Plus/Pro)",
+        ),
+    ];
     providers.extend(PROVIDERS.iter().map(|def| (def.id, def.name)));
-    providers[1..].sort_by_key(|(id, _)| *id);
+    providers[2..].sort_by_key(|(id, _)| *id);
     providers
 }
 
@@ -157,6 +163,17 @@ pub fn run_login(
         if provider == CPA_PROVIDER {
             let runtime = runtime()?;
             login_cpa(env, agent_dir, out, runtime.handle())
+        } else if provider == crate::codex::CODEX_PROVIDER {
+            let runtime = runtime()?;
+            crate::codex::login(env, agent_dir, out, runtime.handle())?;
+            // The Codex model list is built in, so choosing a default needs no network.
+            let loaded = load(env, agent_dir, Access::CacheOnly)?;
+            let listed: Vec<Listed> = loaded
+                .catalog
+                .for_provider(provider)
+                .map(Listed::from)
+                .collect();
+            choose_default(env, agent_dir, out, provider, &listed)
         } else {
             login_api_key(provider, env, agent_dir, out)
         }
@@ -465,7 +482,16 @@ pub fn run_list_models(
         .filter(|provider| credential_available(provider, env, agent_dir))
         .collect();
     if !wanted.is_empty() {
-        match load(env, agent_dir, Access::RefreshIfStale) {
+        // The Codex list is built in; only the others need models.dev.
+        let access = if wanted
+            .iter()
+            .any(|provider| *provider != crate::codex::CODEX_PROVIDER)
+        {
+            Access::RefreshIfStale
+        } else {
+            Access::CacheOnly
+        };
+        match load(env, agent_dir, access) {
             Ok(loaded) => {
                 for note in &loaded.notes {
                     say(err, &format!("{note}\n"));

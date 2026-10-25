@@ -66,6 +66,30 @@ fn read_hidden_line() -> Option<String> {
     result
 }
 
+/// Asks the system to open `url`; the URL is also printed, so failure is harmless.
+fn open_in_browser(url: &str) {
+    use std::process::{Command, Stdio};
+    let mut command = if cfg!(windows) {
+        // `start` would need shell quoting for the `&` in the URL; this does not.
+        let mut command = Command::new("rundll32");
+        command.args(["url.dll,FileProtocolHandler", url]);
+        command
+    } else if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    let _ = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cwd = match std::env::current_dir() {
@@ -83,7 +107,9 @@ fn main() {
         base_urls: std::collections::BTreeMap::new(),
         models_dev_url: nyan_coding_agent_models::cache::MODELS_DEV_URL.to_owned(),
         read_stdin: Box::new(read_piped_stdin),
-        prompt: Box::new(prompt_user),
+        prompt: std::sync::Arc::new(prompt_user),
+        open_url: Box::new(open_in_browser),
+        oauth_callback_port: nyan_coding_agent_provider_http::codex_auth::CALLBACK_PORT,
     };
     let out: SharedWriter = Arc::new(Mutex::new(std::io::stdout()));
     let err: SharedWriter = Arc::new(Mutex::new(std::io::stderr()));

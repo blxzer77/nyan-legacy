@@ -286,11 +286,21 @@ fn fireworks_splits_glm_and_kimi_k3_from_the_anthropic_compatible_rest() {
 
 #[test]
 fn providers_without_a_source_and_an_empty_map_yield_nothing_and_every_source_is_listed_once() {
-    assert_eq!(Catalog::from_models_dev(&Map::new()).models(), &[]);
+    let empty = Catalog::from_models_dev(&Map::new());
+    assert!(
+        empty
+            .models()
+            .iter()
+            .all(|model| model.provider == "openai-codex"),
+        "with no models.dev data only the hand-written Codex list remains"
+    );
     let catalog =
         Catalog::from_models_dev(&dev(&json!({"openrouter": {"models": {"m": model(true)}}})));
     assert!(
-        catalog.models().is_empty(),
+        catalog
+            .models()
+            .iter()
+            .all(|model| model.provider == "openai-codex"),
         "OpenRouter is filled from a live listing, not ported"
     );
     let providers = catalog_providers();
@@ -343,4 +353,22 @@ fn openai_leaves_out_the_model_its_api_does_not_serve() {
     }}})));
     let ids: Vec<String> = only(&catalog, "openai").into_iter().map(|m| m.id).collect();
     assert_eq!(ids, ["gpt-x"]);
+}
+
+#[test]
+fn the_codex_models_are_listed_without_any_models_dev_data() {
+    let catalog = Catalog::from_models_dev(&Map::new());
+    let codex: Vec<_> = catalog.for_provider("openai-codex").collect();
+    assert!(codex.len() >= 5, "{codex:?}");
+    let sol = catalog
+        .find("openai-codex", "gpt-6.1-sol")
+        .expect("a listed model");
+    assert_eq!(sol.api, WireApi::OpenAiCodexResponses);
+    assert_eq!(sol.base_url, "https://chatgpt.com/backend-api");
+    assert_eq!((sol.context_window, sol.max_tokens), (272_000, 128_000));
+    assert!(sol.reasoning && sol.image_input);
+    let spark = catalog
+        .find("openai-codex", "gpt-5.3-codex-spark")
+        .expect("spark");
+    assert_eq!((spark.context_window, spark.image_input), (128_000, false));
 }

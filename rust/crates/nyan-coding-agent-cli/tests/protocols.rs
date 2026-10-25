@@ -205,10 +205,9 @@ fn providers_that_cannot_be_called_correctly_are_refused_with_the_reason() {
     let copilot = ask("github-copilot/m", &[]);
     assert!(copilot.contains("needs a GitHub OAuth login"), "{copilot}");
     let codex = ask("openai-codex/gpt-x", &[]);
-    assert!(
-        codex
-            .contains("uses the openai-codex-responses API, which this build does not support yet"),
-        "{codex}"
+    assert_eq!(
+        codex,
+        "Error: not logged in to openai-codex: run `nyan login openai-codex`\n"
     );
     let unknown = ask("nowhere/m", &[]);
     assert!(

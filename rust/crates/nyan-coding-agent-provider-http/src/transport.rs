@@ -227,7 +227,13 @@ pub(crate) fn status_error(status: u16, body: &str) -> ProviderError {
         message.clone_into(&mut detail);
     }
     let message = format!("HTTP {status}: {detail}");
+    // A spent quota does not come back by trying again.
+    let spent = status == 429 && is_spent_quota(&format!("{body} {detail}"));
     match status {
+        429 if spent => ProviderError::Request {
+            message,
+            retryable: false,
+        },
         401 | 403 => ProviderError::Authentication { message },
         404 => ProviderError::ModelUnavailable { message },
         408 | 409 | 425 | 429 | 500..=599 => ProviderError::Request {
@@ -239,6 +245,24 @@ pub(crate) fn status_error(status: u16, body: &str) -> ProviderError {
             retryable: false,
         },
     }
+}
+
+/// Whether a 429 body says the account is out of quota or budget, not just busy.
+fn is_spent_quota(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "gousagelimiterror",
+        "freeusagelimiterror",
+        "monthly usage limit reached",
+        "usage limit",
+        "available balance",
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// Token accounting shared by the `OpenAI` wire protocols.

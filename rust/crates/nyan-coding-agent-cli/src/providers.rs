@@ -21,7 +21,7 @@ use nyan_coding_agent_provider::{ModelProvider, ProviderError, ProviderModel, Pr
 use nyan_coding_agent_provider_http::cpa::{Endpoints, resolve_endpoints};
 use nyan_coding_agent_provider_http::{
     AnthropicMessagesProvider, GoogleGenerativeAiProvider, GoogleVertexProvider,
-    OpenAiChatProvider, OpenAiResponsesProvider, VertexAuth,
+    OpenAiChatProvider, OpenAiCodexProvider, OpenAiResponsesProvider, VertexAuth,
 };
 use tokio::runtime::Handle;
 
@@ -75,6 +75,15 @@ pub enum ProviderSetup {
         base_url: String,
         /// API key.
         api_key: String,
+    },
+    /// `ChatGPT` Codex, signed in with OAuth.
+    Codex {
+        /// The backend's base URL.
+        base_url: String,
+        /// The sign-in server, used to refresh the login.
+        auth_base: String,
+        /// Where the stored login lives.
+        agent_dir: std::path::PathBuf,
     },
     /// Google Vertex AI.
     Vertex {
@@ -153,6 +162,7 @@ pub fn cpa_connection(
 pub fn supported_providers() -> Vec<&'static str> {
     let mut ids: Vec<&'static str> = PROVIDERS.iter().map(|def| def.id).collect();
     ids.push(CPA_PROVIDER);
+    ids.push(crate::codex::CODEX_PROVIDER);
     ids.sort_unstable();
     ids
 }
@@ -285,6 +295,32 @@ fn mixed_refusal(def: &MixedDef) -> String {
     format!("provider \"{}\" is not supported yet: {reason}", def.id)
 }
 
+/// `openai-codex` needs a stored OAuth login; there is no key to pass or set.
+fn codex_setup(
+    env: &Environment,
+    store: &AuthStore,
+    agent_dir: &Path,
+) -> Result<ProviderSetup, String> {
+    match store
+        .credential(crate::codex::CODEX_PROVIDER)
+        .map_err(|error| error.to_string())?
+    {
+        Some(Credential::OAuth(_)) => Ok(ProviderSetup::Codex {
+            base_url: env
+                .base_urls
+                .get(crate::codex::CODEX_PROVIDER)
+                .cloned()
+                .unwrap_or_else(|| nyan_coding_agent_provider_http::codex::DEFAULT_BASE_URL.to_owned()),
+            auth_base: crate::codex::auth_base(env),
+            agent_dir: agent_dir.to_path_buf(),
+        }),
+        Some(Credential::ApiKey(_)) => Err(
+            "the stored login for \"openai-codex\" is an API key, but Codex needs a ChatGPT sign-in: run `nyan login openai-codex`".to_owned(),
+        ),
+        None => Err("not logged in to openai-codex: run `nyan login openai-codex`".to_owned()),
+    }
+}
+
 /// Resolves the endpoint and credential for `provider` serving `model`.
 ///
 /// # Errors
@@ -308,6 +344,7 @@ pub fn resolve_provider(
             }))
         }
         "google-vertex" => vertex_setup(args, env, &store).map(resolved),
+        crate::codex::CODEX_PROVIDER => codex_setup(env, &store, agent_dir).map(resolved),
         _ => {
             if let Some(def) = provider_def(provider) {
                 return simple_setup(def, model, args, env, &store, agent_dir);
@@ -376,7 +413,7 @@ fn setup_for_api(
             max_tokens,
         },
         Api::GoogleGenerativeAi => ProviderSetup::Google { base_url, api_key },
-        Api::GoogleVertex => {
+        Api::GoogleVertex | Api::OpenAiCodexResponses => {
             return Err("this provider needs its own settings".to_owned());
         }
     })
@@ -428,6 +465,10 @@ pub fn credential_available(provider: &str, env: &Environment, agent_dir: &Path)
     match provider {
         CPA_PROVIDER => cpa_connection(None, env, agent_dir).is_ok(),
         "google-vertex" => vertex_setup(&no_flags, env, &store).is_ok(),
+        crate::codex::CODEX_PROVIDER => matches!(
+            store.credential(crate::codex::CODEX_PROVIDER),
+            Ok(Some(Credential::OAuth(_)))
+        ),
         other => {
             let env_keys: &[&str] = if other == "anthropic" {
                 &["ANTHROPIC_API_KEY"]
@@ -563,6 +604,18 @@ pub fn build_provider(
         ProviderSetup::Vertex { base_url, auth } => {
             Box::new(GoogleVertexProvider::new(id, base_url, Some(auth), handle)?)
         }
+        ProviderSetup::Codex {
+            base_url,
+            auth_base,
+            agent_dir,
+        } => {
+            let auth = std::sync::Arc::new(crate::codex::StoredCodexAuth::new(
+                &agent_dir,
+                auth_base,
+                handle.clone(),
+            ));
+            Box::new(OpenAiCodexProvider::new(id, &base_url, auth, handle)?)
+        }
     };
     Ok(SingleProvider(provider))
 }
@@ -603,8 +656,10 @@ mod tests {
             cwd: Path::new("/tmp").to_path_buf(),
             base_urls: BTreeMap::new(),
             models_dev_url: "http://127.0.0.1:1/api.json".to_owned(),
+            open_url: Box::new(|_| {}),
+            oauth_callback_port: 0,
             read_stdin: Box::new(|| None),
-            prompt: Box::new(|_, _| None),
+            prompt: std::sync::Arc::new(|_, _| None),
         }
     }
 
@@ -673,8 +728,10 @@ mod template_tests {
             cwd: Path::new("/tmp").to_path_buf(),
             base_urls: BTreeMap::new(),
             models_dev_url: "http://127.0.0.1:1/api.json".to_owned(),
+            open_url: Box::new(|_| {}),
+            oauth_callback_port: 0,
             read_stdin: Box::new(|| None),
-            prompt: Box::new(|_, _| None),
+            prompt: std::sync::Arc::new(|_, _| None),
         }
     }
 
