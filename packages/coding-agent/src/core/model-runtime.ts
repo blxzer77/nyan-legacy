@@ -191,6 +191,13 @@ export class ModelRuntime implements Models {
 	};
 	private availabilityRefreshSeq = 0;
 	private availabilityErrorSeq = 0;
+	/**
+	 * Full refreshes apply one at a time. Registering a provider starts one that its caller does not await, and
+	 * startup then awaits another. Overlapped full passes let the awaited one return from a superseded availability
+	 * check before either pass has published the snapshot, so a reader sees no models. A provider-scoped refresh stays
+	 * outside this queue: it must keep running beside another provider's refresh.
+	 */
+	private refreshQueue: Promise<void> = Promise.resolve();
 	private readonly providerAvailabilitySeq = new Map<string, number>();
 	private availabilityError: string | undefined;
 	private readonly credentialOperations = new Map<string, Promise<unknown>>();
@@ -817,6 +824,21 @@ export class ModelRuntime implements Models {
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
+		if (options.providers !== undefined) return this.performRefresh(options);
+		const previous = this.refreshQueue;
+		let release!: () => void;
+		this.refreshQueue = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await this.performRefresh(options);
+		} finally {
+			release();
+		}
+	}
+
+	private async performRefresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
 		this.config = await ModelConfig.load(this.modelsPath);
 		if (options.providers) {
 			for (const providerId of new Set(options.providers)) this.recomposeProvider(providerId);
