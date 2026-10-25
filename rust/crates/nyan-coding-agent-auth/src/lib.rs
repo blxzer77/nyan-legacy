@@ -1,9 +1,9 @@
 //! Credential storage for the Rust Coding Agent: `auth.json` in the agent directory.
 //!
 //! The file is a JSON object with one credential per provider id. Rust writes
-//! only the plain `{"type": "api_key", "key": ..., "env": {...}}` shape, which
-//! the TypeScript CLI also accepts, and leaves every other entry as it found
-//! it. The file is validated as a whole before it is changed: an unreadable or
+//! the plain `{"type": "api_key", "key": ..., "env": {...}}` shape and the
+//! `{"type": "oauth", "access", "refresh", "expires", ...}` shape, which the
+//! TypeScript CLI also accepts, and leaves every other entry as it found it. The file is validated as a whole before it is changed: an unreadable or
 //! malformed file is reported and never overwritten, because only its owner can
 //! say whether the content is recoverable.
 //!
@@ -24,6 +24,8 @@ const FILE_NAME: &str = "auth.json";
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 const LOCK_POLL: Duration = Duration::from_millis(25);
 const LOCK_STALE: Duration = Duration::from_secs(30);
+/// A refresh makes a network call while holding the lock, so waiters wait longer.
+const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(45);
 
 /// A stored API-key credential.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,13 +36,49 @@ pub struct ApiKeyCredential {
     pub env: BTreeMap<String, String>,
 }
 
+/// A stored OAuth login.
+#[derive(Clone, Eq, PartialEq)]
+pub struct OAuthCredential {
+    /// The access token.
+    pub access: String,
+    /// The refresh token.
+    pub refresh: String,
+    /// When the access token expires, in Unix milliseconds.
+    pub expires_ms: u64,
+    /// Provider-specific fields stored beside the tokens, such as `accountId`.
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl std::fmt::Debug for OAuthCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthCredential")
+            .field("expires_ms", &self.expires_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OAuthCredential {
+    /// Whether the access token is still good for at least `margin_ms` at `now_ms`.
+    #[must_use]
+    pub fn is_valid_for(&self, now_ms: u64, margin_ms: u64) -> bool {
+        self.expires_ms > now_ms.saturating_add(margin_ms)
+    }
+
+    /// A string field stored beside the tokens.
+    #[must_use]
+    pub fn extra_str(&self, name: &str) -> Option<&str> {
+        self.extra.get(name).and_then(Value::as_str)
+    }
+}
+
 /// A stored credential.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Credential {
     /// A plain API key.
     ApiKey(ApiKeyCredential),
-    /// An OAuth login made by another CLI; it is kept but not usable here yet.
-    OAuth,
+    /// An OAuth login.
+    OAuth(OAuthCredential),
 }
 
 /// Why a credential operation failed.
@@ -65,6 +103,16 @@ pub enum AuthError {
         /// Lock file path.
         path: PathBuf,
     },
+    /// There is no stored OAuth login to refresh.
+    NotLoggedIn {
+        /// The provider.
+        provider: String,
+    },
+    /// The refresh itself failed; the stored login was left as it was.
+    RefreshFailed {
+        /// What the refresher reported.
+        message: String,
+    },
 }
 
 impl AuthError {
@@ -75,6 +123,8 @@ impl AuthError {
             Self::Io { .. } => "auth_io",
             Self::Invalid { .. } => "auth_invalid",
             Self::Locked { .. } => "auth_locked",
+            Self::NotLoggedIn { .. } => "auth_not_logged_in",
+            Self::RefreshFailed { .. } => "auth_refresh_failed",
         }
     }
 }
@@ -93,6 +143,15 @@ impl std::fmt::Display for AuthError {
                 "another process is writing credentials ({} is locked)",
                 path.display()
             ),
+            Self::NotLoggedIn { provider } => {
+                write!(
+                    formatter,
+                    "there is no stored OAuth login for \"{provider}\""
+                )
+            }
+            Self::RefreshFailed { message } => {
+                write!(formatter, "refreshing the login failed: {message}")
+            }
         }
     }
 }
@@ -213,6 +272,72 @@ impl AuthStore {
         .map(|_| ())
     }
 
+    /// Stores an OAuth login for `provider`, replacing any earlier credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file is invalid, locked, or cannot be written.
+    pub fn save_oauth(
+        &self,
+        provider: &str,
+        credential: &OAuthCredential,
+    ) -> Result<(), AuthError> {
+        self.modify(|entries| {
+            entries.insert(provider.to_owned(), oauth_json(credential));
+            true
+        })
+        .map(|_| ())
+    }
+
+    /// Returns the OAuth login for `provider` with an access token good for at
+    /// least `margin_ms`, refreshing it first if it is not.
+    ///
+    /// The refresh runs under the write lock, and the stored login is read again
+    /// once the lock is held: a process that refreshed while this one waited has
+    /// already replaced the (single-use) refresh token, so using the old one
+    /// would fail. `refresher` gets the stored login and returns the new one,
+    /// which is written before the lock is released. If it fails, nothing is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::NotLoggedIn`] when the provider has no OAuth login,
+    /// [`AuthError::RefreshFailed`] when `refresher` fails, and the usual file
+    /// errors otherwise.
+    pub fn refresh_oauth(
+        &self,
+        provider: &str,
+        now_ms: u64,
+        margin_ms: u64,
+        refresher: impl FnOnce(&OAuthCredential) -> Result<OAuthCredential, String>,
+    ) -> Result<OAuthCredential, AuthError> {
+        if let Some(Credential::OAuth(current)) = self.credential(provider)?
+            && current.is_valid_for(now_ms, margin_ms)
+        {
+            return Ok(current);
+        }
+        if let Some(directory) = self.path.parent() {
+            fs::create_dir_all(directory)
+                .map_err(|error| io_error("create the agent directory", &error))?;
+        }
+        let _lock = self.lock(REFRESH_LOCK_WAIT.max(self.lock_wait))?;
+        let mut entries = self.read_entries()?;
+        let Some(Credential::OAuth(current)) = entries.get(provider).and_then(parse_credential)
+        else {
+            return Err(AuthError::NotLoggedIn {
+                provider: provider.to_owned(),
+            });
+        };
+        if current.is_valid_for(now_ms, margin_ms) {
+            return Ok(current);
+        }
+        let renewed =
+            refresher(&current).map_err(|message| AuthError::RefreshFailed { message })?;
+        entries.insert(provider.to_owned(), oauth_json(&renewed));
+        self.write(&entries)?;
+        Ok(renewed)
+    }
+
     /// Removes the credential for `provider` and reports whether there was one.
     ///
     /// # Errors
@@ -232,7 +357,7 @@ impl AuthStore {
             fs::create_dir_all(directory)
                 .map_err(|error| io_error("create the agent directory", &error))?;
         }
-        let _lock = self.lock()?;
+        let _lock = self.lock(self.lock_wait)?;
         let mut entries = self.read_entries()?;
         let changed = change(&mut entries);
         if changed {
@@ -241,7 +366,7 @@ impl AuthStore {
         Ok(changed)
     }
 
-    fn lock(&self) -> Result<WriteLock, AuthError> {
+    fn lock(&self, wait: Duration) -> Result<WriteLock, AuthError> {
         let path = self.path.with_extension("json.lock");
         let started = std::time::Instant::now();
         loop {
@@ -261,7 +386,7 @@ impl AuthStore {
                         let _ = fs::remove_file(&path);
                         continue;
                     }
-                    if started.elapsed() >= self.lock_wait {
+                    if started.elapsed() >= wait {
                         return Err(AuthError::Locked { path });
                     }
                     std::thread::sleep(LOCK_POLL);
@@ -305,6 +430,18 @@ impl AuthStore {
     }
 }
 
+fn oauth_json(credential: &OAuthCredential) -> Value {
+    let mut object = Map::new();
+    object.insert("type".to_owned(), json!("oauth"));
+    object.insert("access".to_owned(), json!(credential.access));
+    object.insert("refresh".to_owned(), json!(credential.refresh));
+    object.insert("expires".to_owned(), json!(credential.expires_ms));
+    for (name, value) in &credential.extra {
+        object.insert(name.clone(), value.clone());
+    }
+    Value::Object(object)
+}
+
 /// Parses one entry; `None` means it is not a credential.
 fn parse_credential(entry: &Value) -> Option<Credential> {
     let object = entry.as_object()?;
@@ -328,9 +465,26 @@ fn parse_credential(entry: &Value) -> Option<Credential> {
             Some(Credential::ApiKey(ApiKeyCredential { key, env }))
         }
         "oauth" => {
-            let text = |name: &str| object.get(name).is_some_and(Value::is_string);
-            let expires = object.get("expires").is_some_and(Value::is_number);
-            (text("access") && text("refresh") && expires).then_some(Credential::OAuth)
+            let text = |name: &str| object.get(name)?.as_str().map(str::to_owned);
+            let expires = object.get("expires")?.as_f64()?;
+            if !expires.is_finite() || expires < 0.0 {
+                return None;
+            }
+            let extra = object
+                .iter()
+                .filter(|(name, _)| {
+                    !matches!(name.as_str(), "type" | "access" | "refresh" | "expires")
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            Some(Credential::OAuth(OAuthCredential {
+                access: text("access")?,
+                refresh: text("refresh")?,
+                // Whole milliseconds; the file stores a JSON number.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                expires_ms: expires as u64,
+                extra,
+            }))
         }
         _ => None,
     }

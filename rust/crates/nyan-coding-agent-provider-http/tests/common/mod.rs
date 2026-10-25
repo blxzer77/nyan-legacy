@@ -162,3 +162,65 @@ pub fn converse_event(kind: &str, payload: &serde_json::Value) -> Vec<u8> {
         payload.to_string().as_bytes(),
     )
 }
+
+/// A server that answers the n-th request with the n-th `(status, body)` and repeats the
+/// last one after that. Returns its address and every request it received.
+pub fn serve_sequence(
+    runtime: &Runtime,
+    responses: Vec<(&'static str, String)>,
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let listener = runtime
+        .block_on(TcpListener::bind("127.0.0.1:0"))
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("address");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    runtime.spawn(async move {
+        let mut index = 0_usize;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&received).into_owned();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if received.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            sink.lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&received).into_owned());
+            let (status, body) = responses
+                .get(index)
+                .or_else(|| responses.last())
+                .cloned()
+                .unwrap_or(("500 Internal Server Error", String::new()));
+            index += 1;
+            let head = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+    });
+    (address, log)
+}

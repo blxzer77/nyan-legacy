@@ -5,6 +5,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod codex_auth;
 pub mod cpa;
 pub mod eventstream;
 pub mod google;

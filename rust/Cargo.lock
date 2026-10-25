@@ -904,6 +904,7 @@ dependencies = [
 name = "nyan-coding-agent-provider-http"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "hmac",
  "nyan-coding-agent-core",
  "nyan-coding-agent-provider",

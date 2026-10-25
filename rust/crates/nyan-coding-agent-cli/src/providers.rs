@@ -99,7 +99,7 @@ fn stored_api_key(store: &AuthStore, provider: &str) -> Result<Option<ApiKeyCred
         .map_err(|error| error.to_string())?
     {
         Some(Credential::ApiKey(credential)) => Ok(Some(credential)),
-        Some(Credential::OAuth) => Err(format!(
+        Some(Credential::OAuth(_)) => Err(format!(
             "the stored login for \"{provider}\" is an OAuth login made by another CLI, which this build cannot use yet; run `nyan login {provider}` to store an API key"
         )),
         None => Ok(None),
