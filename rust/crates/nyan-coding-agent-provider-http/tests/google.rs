@@ -149,7 +149,7 @@ fn vertex_uses_bearer_auth_and_publisher_path() {
 
 #[test]
 fn thought_parts_are_not_shown_and_history_replays_as_function_parts() {
-    use nyan_coding_agent_core::{Message, MessageRole, ToolCall, ToolCallId};
+    use nyan_coding_agent_core::{ContentBlock, Message, MessageRole, ToolCall, ToolCallId};
     let runtime = Runtime::new().expect("runtime");
     let server = serve(
         &runtime,
@@ -173,10 +173,15 @@ fn thought_parts_are_not_shown_and_history_replays_as_function_parts() {
     });
     let mut result = Message::tool_result(ToolCallId::new("c1").expect("id"), "echo", "x", false);
     result.text = r#"{"output":"x"}"#.to_owned();
+    let mut user = Message::text(MessageRole::User, "go");
+    user.content.push(ContentBlock::Image {
+        data: "aGVsbG8=".to_owned(),
+        mime_type: "image/png".to_owned(),
+    });
     let mut req = request(CancellationToken::new());
     req.messages = vec![
         Message::text(MessageRole::System, "rules"),
-        Message::text(MessageRole::User, "go"),
+        user,
         assistant,
         result,
     ];
@@ -195,6 +200,10 @@ fn thought_parts_are_not_shown_and_history_replays_as_function_parts() {
     let body: serde_json::Value =
         serde_json::from_str(captured.split("\r\n\r\n").nth(1).expect("body")).expect("json");
     assert_eq!(body["systemInstruction"]["parts"][0]["text"], "rules");
+    assert_eq!(
+        body["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+        "image/png"
+    );
     assert_eq!(body["contents"][1]["role"], "model");
     assert_eq!(
         body["contents"][1]["parts"][1]["functionCall"]["name"],

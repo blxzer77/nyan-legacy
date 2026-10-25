@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, MessageRole, Usage};
+use nyan_coding_agent_core::{BoxFuture, ContentBlock, MessageRole, Usage};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ToolCallRequest, ToolSpec,
@@ -185,36 +185,40 @@ pub fn build_request_body(request: &ProviderRequest) -> Value {
     let mut system = String::new();
     let mut contents = Vec::new();
     for message in &request.messages {
+        let blocks = message.model_content();
         match message.role {
             MessageRole::System => {
-                if !system.is_empty() {
-                    system.push('\n');
+                for block in blocks {
+                    if let ContentBlock::Text { text, .. } = block {
+                        if !system.is_empty() {
+                            system.push('\n');
+                        }
+                        system.push_str(&text);
+                    }
                 }
-                system.push_str(&message.text);
             }
-            MessageRole::User => contents.push(json!({
-                "role": "user",
-                "parts": [{"text": message.text}],
-            })),
+            MessageRole::User => {
+                let parts = blocks
+                    .iter()
+                    .filter_map(wire_input_part)
+                    .collect::<Vec<_>>();
+                if !parts.is_empty() {
+                    contents.push(json!({"role": "user", "parts": parts}));
+                }
+            }
             MessageRole::Assistant => {
-                let mut parts = Vec::new();
-                if !message.text.is_empty() {
-                    parts.push(json!({"text": message.text}));
-                }
-                for call in &message.tool_calls {
-                    let args = serde_json::from_str::<Value>(&call.arguments)
-                        .unwrap_or_else(|_| json!({}));
-                    parts.push(json!({
-                        "functionCall": {"name": call.name, "args": args},
-                    }));
-                }
+                let parts = blocks
+                    .iter()
+                    .filter_map(wire_model_part)
+                    .collect::<Vec<_>>();
                 if !parts.is_empty() {
                     contents.push(json!({"role": "model", "parts": parts}));
                 }
             }
             MessageRole::Tool => {
-                let args = serde_json::from_str::<Value>(&message.text)
-                    .unwrap_or_else(|_| json!({"output": message.text}));
+                let text = message.text_content();
+                let args = serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|_| json!({"output": text}));
                 contents.push(json!({
                     "role": "user",
                     "parts": [{"functionResponse": {
@@ -235,6 +239,29 @@ pub fn build_request_body(request: &ProviderRequest) -> Value {
         }]);
     }
     body
+}
+
+fn wire_input_part(block: &ContentBlock) -> Option<Value> {
+    match block {
+        ContentBlock::Text { text, .. } => Some(json!({"text": text})),
+        ContentBlock::Image { data, mime_type } => Some(json!({
+            "inlineData": {"mimeType": mime_type, "data": data},
+        })),
+        ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) => None,
+    }
+}
+
+fn wire_model_part(block: &ContentBlock) -> Option<Value> {
+    match block {
+        ContentBlock::Text { text, .. } => Some(json!({"text": text})),
+        ContentBlock::ToolCall(call) => {
+            let args = serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!({}));
+            Some(json!({
+                "functionCall": {"name": call.name, "args": args},
+            }))
+        }
+        ContentBlock::Thinking { .. } | ContentBlock::Image { .. } => None,
+    }
 }
 
 fn wire_tool(tool: &ToolSpec) -> Value {
