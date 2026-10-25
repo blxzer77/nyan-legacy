@@ -4,7 +4,7 @@
 > Runtime state stays outside it and outside the repository — `keys/` (the Qdrant API key), `vllm-cache/` (the weight
 > cache, ~42 MB) and `last-probe.txt`, all covered by the local `.gitignore`.
 >
-> The deployed copy on `nyan-dev-02` is `/opt/stacks/retrieval`, and the workstation units are
+> The deployed copy on `nyan-ops` is `/opt/stacks/retrieval`, and the workstation units are
 > `~/.config/containers/systemd/retrieval-*.container` and `~/.config/systemd/user/retrieval-probes.service`. Editing a
 > script here does nothing until it is copied there; the two paths are recorded so that is not a surprise.
 
@@ -21,9 +21,9 @@ retrieval budget (0.6B; revisit only if quality proves insufficient).
 | --- | --- | --- | --- |
 | Embedding: `jinaai/jina-code-embeddings-1.5b` (BF16 GGUF) via llama.cpp | this workstation, RTX 3060 Laptop 12 GB | `http://127.0.0.1:8090` | rootless podman, user unit `retrieval-llama-embed` |
 | Rerank: `Qwen/Qwen3-Reranker-0.6B` via vLLM `--runner pooling` | this workstation | `http://127.0.0.1:8091` | rootless podman, user unit `retrieval-vllm-rerank` |
-| Vector backend: Qdrant 1.19.2 | nyan-dev-02 (6 vCPU, 23 GB, no GPU) | `http://100.80.19.12:6333` (+ loopback) | docker compose, `/opt/stacks/retrieval` |
-| Coordinator metadata DB: PostgreSQL 17.11 (`retrieval_coord`, own role) | nyan-dev-02, inside the langfuse Postgres container | `127.0.0.1:5433/retrieval_coord` | row in `/opt/stacks/retrieval/keys/coord-db.env` |
-| Observability/eval plane: Langfuse 4 API | nyan-dev-02 | `http://100.80.19.12:50007/langfuse-api/` | existing langfuse stack, new nginx location |
+| Vector backend: Qdrant 1.19.2 | nyan-ops (6 vCPU, 23 GB, no GPU) | `http://100.80.19.12:6333` (+ loopback) | docker compose, `/opt/stacks/retrieval` |
+| Coordinator metadata DB: PostgreSQL 17.11 (`retrieval_coord`, own role) | nyan-ops, inside the langfuse Postgres container | `127.0.0.1:5433/retrieval_coord` | row in `/opt/stacks/retrieval/keys/coord-db.env` |
+| Observability/eval plane: Langfuse 4 API | nyan-ops | `http://100.80.19.12:50007/langfuse-api/` | existing langfuse stack, new nginx location |
 
 GPU services are Quadlet units: `~/.config/containers/systemd/retrieval-*.container`.
 Operate with `systemctl --user {start,stop,status} retrieval-llama-embed retrieval-vllm-rerank`;
@@ -119,7 +119,7 @@ Deferred until an eval set shows the 0.6B is insufficient.
 
 ## Prepared ahead of the code
 
-- **Coordinator DB** on dev-02: database `retrieval_coord` with its own login role,
+- **Coordinator DB** on nyan-ops: database `retrieval_coord` with its own login role,
   created in the existing PostgreSQL 17 container (langfuse's), reachable only on
   `127.0.0.1:5433`. The role owns an empty database and sees no langfuse tables.
   Credentials: `/opt/stacks/retrieval/keys/coord-db.env` (0600).
@@ -145,7 +145,7 @@ Deferred until an eval set shows the 0.6B is insufficient.
 - strict Tantivy/BM25 service
 - external search provider (N8) and the SSRF-safe fetch path
 - eval corpus + gold query set (decides whether the 0.6B reranker is enough)
-- backup plan: backrest runs on dev-02 with `/opt/stacks` mounted at
+- backup plan: backrest runs on nyan-ops with `/opt/stacks` mounted at
   `/userdata/stacks` but has no repos or plans configured, and retention is still
   an owner decision (roadmap G8). Qdrant's own snapshot API works; no snapshot
   job or prune policy is installed.
@@ -156,5 +156,5 @@ Deferred until an eval set shows the 0.6B is insufficient.
 - `~/.config/containers/containers.conf`, `~/.config/cdi/nvidia.yaml` — rootless GPU plumbing
 - `probe.sh`, `probe-embed.py` — readiness probes (exit code = failures)
 - `bench-embed.py`, `bench-rerank.py` — throughput/latency measurement
-- `keys/qdrant-api-key` — Qdrant credential copied from dev-02
+- `keys/qdrant-api-key` — Qdrant credential copied from nyan-ops
 - `compose.gpu.yaml` — docker reference, not used

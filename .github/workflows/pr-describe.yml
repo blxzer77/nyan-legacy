@@ -29,7 +29,7 @@ permissions:
 
 env:
   # The fast tier: this job is a summary, not a review. Override with a repository variable if the address changes.
-  GATEWAY_URL: ${{ vars.GATEWAY_URL || 'https://nyan-dev-02.tail6334e5.ts.net:8449/v1' }}
+  GATEWAY_URL: ${{ vars.GATEWAY_URL || 'https://nyan-ops.tail6334e5.ts.net:8449/v1' }}
   PR_AGENT_IMAGE: codiumai/pr-agent:latest
 
 jobs:
