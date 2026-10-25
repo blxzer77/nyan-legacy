@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, MessageRole, Usage};
+use nyan_coding_agent_core::{BoxFuture, ContentBlock, MessageRole, Usage};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ToolCallRequest, ToolSpec,
@@ -120,44 +120,58 @@ pub fn build_request_body(request: &ProviderRequest, max_tokens: u64) -> Value {
     let mut system = Vec::new();
     let mut messages = Vec::new();
     for message in &request.messages {
+        let blocks = message.model_content();
         match message.role {
             MessageRole::System => {
-                if !message.text.is_empty() {
-                    system.push(json!({"type": "text", "text": message.text}));
+                for block in blocks {
+                    if let ContentBlock::Text { text, .. } = block {
+                        system.push(json!({"type": "text", "text": text}));
+                    }
                 }
             }
-            MessageRole::User => messages.push(json!({
-                "role": "user",
-                "content": [{"type": "text", "text": message.text}],
-            })),
+            MessageRole::User => {
+                let content = blocks
+                    .iter()
+                    .filter_map(wire_input_block)
+                    .collect::<Vec<_>>();
+                if !content.is_empty() {
+                    messages.push(json!({"role": "user", "content": content}));
+                }
+            }
             MessageRole::Assistant => {
-                let mut content = Vec::new();
-                if !message.text.is_empty() {
-                    content.push(json!({"type": "text", "text": message.text}));
-                }
-                for call in &message.tool_calls {
-                    let input = serde_json::from_str::<Value>(&call.arguments)
-                        .unwrap_or_else(|_| json!({}));
-                    content.push(json!({
-                        "type": "tool_use",
-                        "id": call.id.as_str(),
-                        "name": call.name,
-                        "input": input,
-                    }));
-                }
+                let content = blocks
+                    .iter()
+                    .filter_map(wire_assistant_block)
+                    .collect::<Vec<_>>();
                 if !content.is_empty() {
                     messages.push(json!({"role": "assistant", "content": content}));
                 }
             }
-            MessageRole::Tool => messages.push(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": message.tool_call_id.as_ref().map_or("", |id| id.as_str()),
-                    "content": message.text,
-                    "is_error": message.is_error,
-                }],
-            })),
+            MessageRole::Tool => {
+                let result_content = blocks
+                    .iter()
+                    .filter_map(wire_input_block)
+                    .collect::<Vec<_>>();
+                let content = if result_content.len() == 1
+                    && result_content[0].get("type").and_then(Value::as_str) == Some("text")
+                {
+                    result_content[0]
+                        .get("text")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                } else {
+                    Value::Array(result_content)
+                };
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": message.tool_call_id.as_ref().map_or("", |id| id.as_str()),
+                        "content": content,
+                        "is_error": message.is_error,
+                    }],
+                }));
+            }
         }
     }
     let mut body = json!({
@@ -173,6 +187,54 @@ pub fn build_request_body(request: &ProviderRequest, max_tokens: u64) -> Value {
         body["tools"] = Value::Array(request.tools.iter().map(wire_tool).collect());
     }
     body
+}
+
+fn wire_input_block(block: &ContentBlock) -> Option<Value> {
+    match block {
+        ContentBlock::Text { text, .. } => Some(json!({"type": "text", "text": text})),
+        ContentBlock::Image { data, mime_type } => Some(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime_type, "data": data},
+        })),
+        ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) => None,
+    }
+}
+
+fn wire_assistant_block(block: &ContentBlock) -> Option<Value> {
+    match block {
+        ContentBlock::Text { text, .. } => Some(json!({"type": "text", "text": text})),
+        ContentBlock::Thinking {
+            text: _,
+            signature: Some(data),
+            redacted: true,
+        } => Some(json!({"type": "redacted_thinking", "data": data})),
+        ContentBlock::Thinking { redacted: true, .. } => None,
+        ContentBlock::Thinking {
+            text,
+            signature,
+            redacted: false,
+        } => {
+            let mut value = json!({"type": "thinking", "thinking": text});
+            if let Some(signature) = signature {
+                value["signature"] = json!(signature);
+            }
+            Some(value)
+        }
+        ContentBlock::Image { data, mime_type } => Some(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime_type, "data": data},
+        })),
+        ContentBlock::ToolCall(call) => {
+            let input =
+                serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!({}));
+            Some(json!({
+                "type": "tool_use",
+                "id": call.id.as_str(),
+                "name": call.name,
+                "input": input,
+            }))
+        }
+    }
 }
 
 fn wire_tool(tool: &ToolSpec) -> Value {

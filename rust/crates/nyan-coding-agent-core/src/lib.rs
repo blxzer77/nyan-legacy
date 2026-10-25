@@ -254,6 +254,33 @@ impl Message {
         }
     }
 
+    /// Returns ordered content, falling back to the compatibility fields for
+    /// messages created by code that has not migrated yet.
+    #[must_use]
+    pub fn model_content(&self) -> Vec<ContentBlock> {
+        let mut content = if self.content.is_empty() {
+            let mut content = Vec::new();
+            if !self.text.is_empty() {
+                content.push(ContentBlock::Text {
+                    text: self.text.clone(),
+                    signature: None,
+                });
+            }
+            content
+        } else {
+            self.content.clone()
+        };
+        for call in &self.tool_calls {
+            let already_present = content.iter().any(
+                |block| matches!(block, ContentBlock::ToolCall(existing) if existing.id == call.id),
+            );
+            if !already_present {
+                content.push(ContentBlock::ToolCall(call.clone()));
+            }
+        }
+        content
+    }
+
     /// The text of the message: every text block, joined without a separator.
     #[must_use]
     pub fn text_content(&self) -> String {

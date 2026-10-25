@@ -143,6 +143,47 @@ fn request_uses_anthropic_headers_system_prompt_and_content_blocks() {
 }
 
 #[test]
+fn history_replays_thinking_and_image_blocks_in_order() {
+    use nyan_coding_agent_core::{ContentBlock, Message, MessageRole};
+
+    let runtime = Runtime::new().expect("runtime");
+    let server = text_server(&runtime);
+    let mut assistant = Message::text(MessageRole::Assistant, "");
+    assistant.content = vec![
+        ContentBlock::Thinking {
+            text: "reason".to_owned(),
+            signature: Some("sig".to_owned()),
+            redacted: false,
+        },
+        ContentBlock::Image {
+            data: "aGVsbG8=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        },
+        ContentBlock::Text {
+            text: "answer".to_owned(),
+            signature: None,
+        },
+    ];
+    let mut req = request(CancellationToken::new());
+    req.messages = vec![Message::text(MessageRole::User, "go"), assistant];
+    let stream = runtime
+        .block_on(provider(&runtime, &server).stream(req))
+        .expect("stream");
+    drain(&runtime, stream).expect("events");
+    let captured = server.captured.lock().expect("lock").clone();
+    let body: serde_json::Value =
+        serde_json::from_str(captured.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    let content = &body["messages"][1]["content"];
+    assert_eq!(
+        content[0],
+        json!({"type": "thinking", "thinking": "reason", "signature": "sig"})
+    );
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[2], json!({"type": "text", "text": "answer"}));
+}
+
+#[test]
 fn tool_use_arguments_are_assembled_and_tool_use_stop_is_reported() {
     let runtime = Runtime::new().expect("runtime");
     let server = serve(
