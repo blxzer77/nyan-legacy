@@ -116,6 +116,41 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// One block of message content, in the order the model produced it.
+///
+/// An assistant message is a list of blocks, not a text plus a list of calls: a
+/// response can think, speak, call a tool, and speak again, and a provider needs the
+/// blocks back in that order (a thinking block with its signature must stay in front
+/// of the tool call it led to).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContentBlock {
+    /// Plain text.
+    Text {
+        /// The text.
+        text: String,
+        /// Opaque provider metadata that must come back with the text.
+        signature: Option<String>,
+    },
+    /// The model's reasoning.
+    Thinking {
+        /// Visible reasoning text; empty for a redacted block.
+        text: String,
+        /// Opaque provider replay data (a signature, or an encrypted payload).
+        signature: Option<String>,
+        /// Whether the provider withheld the reasoning and sent only the payload.
+        redacted: bool,
+    },
+    /// An image.
+    Image {
+        /// Base64-encoded image bytes.
+        data: String,
+        /// Media type such as `image/png`.
+        mime_type: String,
+    },
+    /// A tool call requested by the model.
+    ToolCall(ToolCall),
+}
+
 /// Token accounting reported by a provider for one assistant response.
 ///
 /// Cost is not carried: it needs per-model pricing, which the Rust model
@@ -164,16 +199,18 @@ pub fn now_ms() -> u64 {
 pub struct Message {
     /// The message role.
     pub role: MessageRole,
-    /// The text payload.
+    /// The content blocks, in order.
+    pub content: Vec<ContentBlock>,
+    /// Legacy flattened text view retained while callers migrate to `content`.
     pub text: String,
+    /// Legacy flattened tool-call view retained while callers migrate to `content`.
+    pub tool_calls: Vec<ToolCall>,
     /// The provider tool-call id for a tool result, when applicable.
     pub tool_call_id: Option<ToolCallId>,
     /// The provider tool name for a tool result, when applicable.
     pub tool_name: Option<String>,
     /// Whether a tool result represents a failed execution.
     pub is_error: bool,
-    /// Tool calls requested by an assistant message.
-    pub tool_calls: Vec<ToolCall>,
     /// Creation time in Unix milliseconds, stamped by the constructors.
     pub timestamp_ms: u64,
     /// Provider id that produced an assistant message.
@@ -192,13 +229,22 @@ impl Message {
     /// Creates a text message.
     #[must_use]
     pub fn text(role: MessageRole, text: impl Into<String>) -> Self {
+        let text = text.into();
         Self {
             role,
-            text: text.into(),
+            content: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text {
+                    text: text.clone(),
+                    signature: None,
+                }]
+            },
+            text,
+            tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
             is_error: false,
-            tool_calls: Vec::new(),
             timestamp_ms: now_ms(),
             provider: None,
             model: None,
@@ -206,6 +252,47 @@ impl Message {
             stop_reason: None,
             error_message: None,
         }
+    }
+
+    /// The text of the message: every text block, joined without a separator.
+    #[must_use]
+    pub fn text_content(&self) -> String {
+        if !self.content.is_empty() {
+            return self
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+        }
+        self.text.clone()
+    }
+
+    /// Whether the message requests at least one tool call.
+    #[must_use]
+    pub fn has_tool_calls(&self) -> bool {
+        !self.tool_calls.is_empty()
+    }
+
+    /// Appends streamed text while keeping both the ordered and legacy views in sync.
+    pub fn append_text(&mut self, delta: &str) {
+        self.text.push_str(delta);
+        if let Some(ContentBlock::Text { text, .. }) = self.content.last_mut() {
+            text.push_str(delta);
+        } else {
+            self.content.push(ContentBlock::Text {
+                text: delta.to_owned(),
+                signature: None,
+            });
+        }
+    }
+
+    /// Appends a streamed tool call while keeping both the ordered and legacy views in sync.
+    pub fn append_tool_call(&mut self, call: ToolCall) {
+        self.tool_calls.push(call.clone());
+        self.content.push(ContentBlock::ToolCall(call));
     }
 
     /// Creates a model-visible tool result.
@@ -216,14 +303,11 @@ impl Message {
         text: impl Into<String>,
         is_error: bool,
     ) -> Self {
-        Self {
-            role: MessageRole::Tool,
-            text: text.into(),
-            tool_call_id: Some(call_id),
-            tool_name: Some(tool_name.into()),
-            is_error,
-            ..Self::text(MessageRole::Tool, String::new())
-        }
+        let mut message = Self::text(MessageRole::Tool, text);
+        message.tool_call_id = Some(call_id);
+        message.tool_name = Some(tool_name.into());
+        message.is_error = is_error;
+        message
     }
 }
 
@@ -380,7 +464,10 @@ impl ExecutionContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{CancellationToken, CoreError, Message, MessageRole, SessionId};
+    use super::{
+        CancellationToken, ContentBlock, CoreError, Message, MessageRole, SessionId, ToolCall,
+        ToolCallId,
+    };
 
     #[test]
     fn identifiers_reject_empty_values() {
@@ -407,6 +494,34 @@ mod tests {
         assert_eq!(
             Message::text(MessageRole::User, "hello").role,
             MessageRole::User
+        );
+    }
+
+    #[test]
+    fn streamed_content_keeps_text_and_tool_calls_in_order() {
+        let mut message = Message::text(MessageRole::Assistant, "before");
+        message.append_text(" after");
+        message.append_tool_call(ToolCall {
+            id: ToolCallId::new("call-1").expect("id"),
+            name: "echo".to_owned(),
+            arguments: "{}".to_owned(),
+        });
+        message.append_text(" tail");
+        assert_eq!(message.text, "before after tail");
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(
+            message.content,
+            vec![
+                ContentBlock::Text {
+                    text: "before after".to_owned(),
+                    signature: None,
+                },
+                ContentBlock::ToolCall(message.tool_calls[0].clone()),
+                ContentBlock::Text {
+                    text: " tail".to_owned(),
+                    signature: None,
+                },
+            ]
         );
     }
 }

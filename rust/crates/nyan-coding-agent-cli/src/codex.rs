@@ -100,6 +100,7 @@ fn provider_error(error: AuthError) -> ProviderError {
             ProviderError::Request {
                 message,
                 retryable: true,
+                retry_after: None,
             }
         }
         AuthError::RefreshFailed { message } => ProviderError::Authentication {
@@ -108,6 +109,7 @@ fn provider_error(error: AuthError) -> ProviderError {
         other => ProviderError::Request {
             message: other.to_string(),
             retryable: false,
+            retry_after: None,
         },
     }
 }
@@ -145,6 +147,7 @@ impl CodexAuthSource for StoredCodexAuth {
                 .map_err(|error| ProviderError::Request {
                     message: format!("the credential task failed: {error}"),
                     retryable: false,
+                    retry_after: None,
                 })?
                 .map_err(provider_error)?;
             let account_id = outcome

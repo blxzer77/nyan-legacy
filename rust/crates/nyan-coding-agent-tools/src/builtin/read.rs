@@ -3,6 +3,8 @@
 //! Parity gap: image files are refused with an explanation instead of being
 //! resized and attached, because the Rust runtime has no image content block yet.
 
+use std::io::Read as _;
+
 use nyan_coding_agent_core::ExecutionContext;
 use serde_json::Value;
 
@@ -12,6 +14,11 @@ use super::{SyncTool, io_error, optional_number, required_string};
 use crate::ToolError;
 
 const SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}},"required":["path"]}"#;
+
+/// Do not read arbitrary devices or unbounded files into the agent process.
+/// The output limit is smaller, but this cap also bounds input memory and makes
+/// a path that grows while it is being read fail closed.
+const MAX_READ_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) fn tool() -> SyncTool {
     SyncTool {
@@ -23,6 +30,66 @@ pub(super) fn tool() -> SyncTool {
         schema: SCHEMA,
         run,
     }
+}
+
+fn read_regular_file(path: &str, absolute: &std::path::Path) -> Result<Vec<u8>, ToolError> {
+    // Stat the path before opening it: opening a FIFO can block until another
+    // process supplies a writer, which is not an acceptable tool behavior.
+    let path_metadata =
+        std::fs::metadata(absolute).map_err(|error| io_error(&error, "open", absolute))?;
+    if !path_metadata.file_type().is_file() {
+        return Err(ToolError::Execution {
+            message: format!("Cannot read {path}: the path is not a regular file"),
+        });
+    }
+    if path_metadata.len() > MAX_READ_FILE_BYTES {
+        return Err(ToolError::Execution {
+            message: format!(
+                "Cannot read {path}: the file is {} and exceeds the {} read limit",
+                format_size(usize::try_from(path_metadata.len()).unwrap_or(usize::MAX)),
+                format_size(usize::try_from(MAX_READ_FILE_BYTES).expect("read limit fits usize")),
+            ),
+        });
+    }
+    let file = std::fs::File::open(absolute).map_err(|error| io_error(&error, "open", absolute))?;
+
+    let mut bytes = Vec::new();
+    file.take(MAX_READ_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(&error, "read", absolute))?;
+    if bytes.len() as u64 > MAX_READ_FILE_BYTES {
+        return Err(ToolError::Execution {
+            message: format!(
+                "Cannot read {path}: the file grew beyond the {} read limit",
+                format_size(usize::try_from(MAX_READ_FILE_BYTES).expect("read limit fits usize")),
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+fn decode_utf16_bom(bytes: &[u8]) -> Option<String> {
+    let (little_endian, body) = if bytes.starts_with(&[0xff, 0xfe]) {
+        (true, &bytes[2..])
+    } else if bytes.starts_with(&[0xfe, 0xff]) {
+        (false, &bytes[2..])
+    } else {
+        return None;
+    };
+    let (pairs, remainder) = body.as_chunks::<2>();
+    let mut decoded = char::decode_utf16(pairs.iter().map(|pair| {
+        if little_endian {
+            u16::from_le_bytes(*pair)
+        } else {
+            u16::from_be_bytes(*pair)
+        }
+    }))
+    .map(|result| result.unwrap_or('\u{fffd}'))
+    .collect::<String>();
+    if !remainder.is_empty() {
+        decoded.push('\u{fffd}');
+    }
+    Some(decoded)
 }
 
 fn is_image(bytes: &[u8]) -> Option<&'static str> {
@@ -52,7 +119,7 @@ fn run(arguments: &Value, context: &ExecutionContext) -> Result<String, ToolErro
     let offset = optional_number(arguments, "offset")?;
     let limit = optional_number(arguments, "limit")?;
     let absolute = resolve_to_cwd(path, &context.cwd);
-    let bytes = std::fs::read(&absolute).map_err(|error| io_error(&error, "open", &absolute))?;
+    let bytes = read_regular_file(path, &absolute)?;
     if let Some(mime) = is_image(&bytes) {
         return Err(ToolError::Execution {
             message: format!(
@@ -60,7 +127,8 @@ fn run(arguments: &Value, context: &ExecutionContext) -> Result<String, ToolErro
             ),
         });
     }
-    let text = String::from_utf8_lossy(&bytes);
+    let text =
+        decode_utf16_bom(&bytes).unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
     let all_lines: Vec<&str> = text.split('\n').collect();
     let total_file_lines = all_lines.len();
 
@@ -205,6 +273,76 @@ mod tests {
         assert_eq!(
             output,
             "[Line 1 is 58.6KB, exceeds 50.0KB limit. Use bash: sed -n '1p' g.txt | head -c 51200]"
+        );
+    }
+
+    #[test]
+    fn utf16_little_and_big_endian_files_drop_the_bom_and_decode_text() {
+        let dir = TempDir::new("read-utf16");
+        std::fs::write(
+            dir.path().join("le.txt"),
+            [0xff, 0xfe, b'h', 0, b'i', 0, b'!', 0],
+        )
+        .expect("write little endian");
+        std::fs::write(
+            dir.path().join("be.txt"),
+            [0xfe, 0xff, 0, b'h', 0, b'i', 0, b'!'],
+        )
+        .expect("write big endian");
+        assert_eq!(
+            call(run, dir.path(), &json!({"path": "le.txt"})).expect("read little endian"),
+            "hi!"
+        );
+        assert_eq!(
+            call(run, dir.path(), &json!({"path": "be.txt"})).expect("read big endian"),
+            "hi!"
+        );
+    }
+
+    #[test]
+    fn oversized_files_are_rejected_before_their_contents_are_read() {
+        let dir = TempDir::new("read-large");
+        let path = dir.path().join("large.bin");
+        let file = std::fs::File::create(&path).expect("create sparse file");
+        file.set_len(super::MAX_READ_FILE_BYTES + 1)
+            .expect("make sparse file");
+        let error = call(run, dir.path(), &json!({"path": "large.bin"})).expect_err("large");
+        assert_eq!(
+            error.to_string(),
+            "Cannot read large.bin: the file is 16.0MB and exceeds the 16.0MB read limit"
+        );
+    }
+
+    #[test]
+    fn directories_are_rejected_as_non_regular_files() {
+        let dir = TempDir::new("read-directory");
+        let error = call(run, dir.path(), &json!({"path": "."})).expect_err("directory");
+        assert_eq!(
+            error.to_string(),
+            "Cannot read .: the path is not a regular file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_devices_and_fifos_are_rejected_without_opening_or_blocking() {
+        use std::process::Command;
+
+        let dir = TempDir::new("read-special");
+        let fifo = dir.path().join("pipe");
+        let status = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+        assert!(status.success(), "mkfifo failed: {status}");
+        let fifo_error = call(run, dir.path(), &json!({"path": "pipe"})).expect_err("fifo");
+        assert_eq!(
+            fifo_error.to_string(),
+            "Cannot read pipe: the path is not a regular file"
+        );
+
+        let device_error =
+            call(run, dir.path(), &json!({"path": "/dev/null"})).expect_err("device");
+        assert_eq!(
+            device_error.to_string(),
+            "Cannot read /dev/null: the path is not a regular file"
         );
     }
 

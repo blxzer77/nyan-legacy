@@ -732,15 +732,21 @@ impl<'a> AgentRuntime<'a> {
         })
     }
 
-    /// The wait before retry number `attempt`: the base doubled each time, capped.
-    fn retry_delay(&self, attempt: usize) -> Duration {
+    /// The wait before retry number `attempt`: a provider delay overrides the
+    /// local backoff, and both are capped by the runtime policy.
+    fn retry_delay(&self, attempt: usize, error: &RuntimeError) -> Duration {
         let doublings = u32::try_from(attempt.saturating_sub(1))
             .unwrap_or(u32::MAX)
             .min(32);
-        self.config
+        let fallback = self
+            .config
             .retry_base_delay
-            .saturating_mul(2_u32.saturating_pow(doublings))
-            .min(self.config.retry_max_delay)
+            .saturating_mul(2_u32.saturating_pow(doublings));
+        let requested = match error {
+            RuntimeError::Provider(provider) => provider.retry_after().unwrap_or(fallback),
+            _ => fallback,
+        };
+        requested.min(self.config.retry_max_delay)
     }
 
     async fn request_assistant(
@@ -800,7 +806,7 @@ impl<'a> AgentRuntime<'a> {
                 return Err(failure);
             }
             let attempt = retry_index + 1;
-            let delay = self.retry_delay(attempt);
+            let delay = self.retry_delay(attempt, &failure);
             sink.emit(AgentEvent::RetryStart {
                 attempt,
                 max_attempts: self.config.max_retries,
@@ -890,7 +896,7 @@ impl<'a> AgentRuntime<'a> {
                         });
                         index
                     };
-                    assistant.text.push_str(&text);
+                    assistant.append_text(&text);
                     self.replace_last_message(&assistant);
                     sink.emit(AgentEvent::MessageUpdate {
                         message: assistant.clone(),
@@ -921,7 +927,7 @@ impl<'a> AgentRuntime<'a> {
                             name: tool_call.name.clone(),
                         },
                     });
-                    assistant.tool_calls.push(tool_call.clone());
+                    assistant.append_tool_call(tool_call.clone());
                     self.replace_last_message(&assistant);
                     sink.emit(AgentEvent::MessageUpdate {
                         message: assistant.clone(),
@@ -1269,7 +1275,7 @@ mod tests {
 
     use super::{
         AgentEvent, AgentOutcome, AgentRuntime, AssistantEvent, EventSink, RuntimeConfig,
-        ToolExecutionMode,
+        RuntimeError, ToolExecutionMode,
     };
     use nyan_coding_agent_core::{BoxFuture, ExecutionContext, Message, MessageRole, ToolResult};
     use nyan_coding_agent_provider::{
@@ -1352,6 +1358,7 @@ mod tests {
                     return Err(ProviderError::Request {
                         message: "temporary provider failure".to_owned(),
                         retryable: true,
+                        retry_after: None,
                     });
                 }
                 Ok(Box::new(ImmediateStream {
@@ -2325,6 +2332,37 @@ mod tests {
             "/tmp/project",
         );
         (providers, config)
+    }
+
+    #[test]
+    fn a_server_retry_after_delay_overrides_local_backoff_but_respects_the_cap() {
+        let config = RuntimeConfig::new(
+            ProviderModel {
+                provider: "fake".to_owned(),
+                model: "test".to_owned(),
+            },
+            "/tmp/project",
+        );
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::new()),
+                failures: Mutex::new(0),
+            },
+        };
+        let runtime = AgentRuntime::new(&providers, &Tools { echo: EchoTool }, config);
+        let error = RuntimeError::Provider(ProviderError::Request {
+            message: "busy".to_owned(),
+            retryable: true,
+            retry_after: Some(Duration::from_secs(9)),
+        });
+        assert_eq!(runtime.retry_delay(1, &error), Duration::from_secs(9));
+        let mut capped = runtime.config.clone();
+        capped.retry_max_delay = Duration::from_secs(4);
+        let capped_runtime = AgentRuntime::new(&providers, &Tools { echo: EchoTool }, capped);
+        assert_eq!(
+            capped_runtime.retry_delay(1, &error),
+            Duration::from_secs(4)
+        );
     }
 
     #[test]

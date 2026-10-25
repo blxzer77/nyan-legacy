@@ -7,7 +7,7 @@
 //! can be awaited on any executor.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use nyan_coding_agent_core::{BoxFuture, CancellationToken, Usage};
 use nyan_coding_agent_provider::{
@@ -84,6 +84,7 @@ impl Transport {
             .map_err(|error| ProviderError::Request {
                 message: format!("failed to build the HTTP client: {error}"),
                 retryable: false,
+                retry_after: None,
             })?;
         Ok(Self {
             client,
@@ -145,8 +146,13 @@ impl Transport {
                 if status.is_success() {
                     return Ok(response);
                 }
+                let retry_after = retry_after(response.headers());
                 let text = response.text().await.unwrap_or_default();
-                Err(status_error(status.as_u16(), &text))
+                Err(status_error_with_retry_after(
+                    status.as_u16(),
+                    &text,
+                    retry_after,
+                ))
             });
             // Waiting for the response headers can take as long as the server likes, so
             // the wait itself watches for cancellation.
@@ -163,6 +169,7 @@ impl Transport {
             let response = admitted.map_err(|error| ProviderError::Request {
                 message: format!("the request task failed: {error}"),
                 retryable: false,
+                retry_after: None,
             })??;
             let (sender, receiver) = mpsc::channel(64);
             handle.spawn(pump(response, sender, cancellation, idle_timeout, protocol));
@@ -194,11 +201,107 @@ fn transport_error(error: &reqwest::Error) -> ProviderError {
     ProviderError::Request {
         message: format!("request failed: {error}"),
         retryable: error.is_connect() || error.is_timeout() || error.is_request(),
+        retry_after: None,
     }
 }
 
+fn duration_from_secs(value: f64) -> Option<Duration> {
+    if value.is_finite() && value >= 0.0 && value <= Duration::MAX.as_secs_f64() {
+        Some(Duration::from_secs_f64(value))
+    } else {
+        None
+    }
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(value) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .and_then(|value| duration_from_secs(value / 1000.0))
+    {
+        return Some(value);
+    }
+    let value = headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)?;
+    if let Ok(seconds) = value.parse::<f64>()
+        && let Some(delay) = duration_from_secs(seconds)
+    {
+        return Some(delay);
+    }
+    let timestamp = parse_http_date(value)?;
+    Some(
+        timestamp
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+fn parse_http_date(value: &str) -> Option<SystemTime> {
+    let fields: Vec<&str> = value.split_ascii_whitespace().collect();
+    if fields.len() != 6 || fields[5] != "GMT" {
+        return None;
+    }
+    let day = fields[1].parse::<u32>().ok()?;
+    let month = match fields[2] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = fields[3].parse::<i64>().ok()?;
+    let mut clock = fields[4].split(':');
+    let hour = clock.next()?.parse::<u64>().ok()?;
+    let minute = clock.next()?.parse::<u64>().ok()?;
+    let second = clock.next()?.parse::<u64>().ok()?;
+    if clock.next().is_some() || hour >= 24 || minute >= 60 || second >= 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::try_from(hour * 3_600 + minute * 60 + second).ok()?)?;
+    if seconds < 0 {
+        return Some(SystemTime::UNIX_EPOCH);
+    }
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).ok()?))
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 || !(1..=9999).contains(&year) {
+        return None;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let year_of_era = y - era * 400;
+    let month_prime = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
 /// Maps a non-success HTTP status and body to a stable error kind.
+#[cfg(test)]
 pub(crate) fn status_error(status: u16, body: &str) -> ProviderError {
+    status_error_with_retry_after(status, body, None)
+}
+
+fn status_error_with_retry_after(
+    status: u16,
+    body: &str,
+    retry_after: Option<Duration>,
+) -> ProviderError {
     let mut detail: String = body.chars().take(MAX_ERROR_BODY_BYTES).collect();
     if let Ok(value) = serde_json::from_str::<Value>(body)
         && let Some(message) = value.pointer("/error/message").and_then(Value::as_str)
@@ -212,16 +315,19 @@ pub(crate) fn status_error(status: u16, body: &str) -> ProviderError {
         429 if spent => ProviderError::Request {
             message,
             retryable: false,
+            retry_after,
         },
         401 | 403 => ProviderError::Authentication { message },
         404 => ProviderError::ModelUnavailable { message },
         408 | 409 | 425 | 429 | 500..=599 => ProviderError::Request {
             message,
             retryable: true,
+            retry_after,
         },
         _ => ProviderError::Request {
             message,
             retryable: false,
+            retry_after,
         },
     }
 }
@@ -372,7 +478,9 @@ async fn pump<P: StreamProtocol>(
 
 #[cfg(test)]
 mod tests {
-    use super::{status_error, usage_from_counts};
+    use std::time::Duration;
+
+    use super::{retry_after, status_error, status_error_with_retry_after, usage_from_counts};
     use nyan_coding_agent_provider::ProviderError;
 
     #[test]
@@ -403,7 +511,41 @@ mod tests {
             error,
             ProviderError::Request {
                 message: "HTTP 429: slow down".to_owned(),
-                retryable: true
+                retryable: true,
+                retry_after: None,
+            }
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_milliseconds_seconds_and_http_dates() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "retry-after-ms",
+            reqwest::header::HeaderValue::from_static("1250"),
+        );
+        assert_eq!(retry_after(&headers), Some(Duration::from_millis(1250)));
+
+        headers.clear();
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_static("2.5"),
+        );
+        assert_eq!(retry_after(&headers), Some(Duration::from_millis(2500)));
+
+        headers.clear();
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
+        );
+        assert_eq!(retry_after(&headers), Some(Duration::ZERO));
+
+        assert_eq!(
+            status_error_with_retry_after(503, "busy", Some(Duration::from_secs(7))),
+            ProviderError::Request {
+                message: "HTTP 503: busy".to_owned(),
+                retryable: true,
+                retry_after: Some(Duration::from_secs(7)),
             }
         );
     }

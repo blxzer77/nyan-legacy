@@ -19,13 +19,13 @@ Future sizes are relative planning estimates (S, M, L, XL), not delivery dates. 
 
 ## Baseline (verified 2026-10-26)
 
-`main` is 36 commits ahead of `origin/main` (`b506c86e2`); none is pushed. `main` is protected and requires the "Merge gate" check, so the commits reach GitHub through a short-lived branch and a pull request. 332 tests pass; `cargo fmt`, `cargo clippy -D warnings`, and `cargo test` are clean on Linux; the Windows clippy check passes for every crate except `provider-http` and `cli`, which compile C code and cannot be cross-checked from Linux.
+`main` is 36 commits ahead of `origin/main` (`b506c86e2`); none is pushed. `main` is protected and requires the "Merge gate" check, so the commits reach GitHub through a short-lived branch and a pull request. 353 tests pass; `cargo fmt`, `cargo clippy -D warnings`, and `cargo test` are clean on Linux; the Windows clippy check passes for every crate except `provider-http` and `cli`, which compile C code and cannot be cross-checked from Linux.
 
 | Crate | Lines | Tests | State |
 | --- | --- | --- | --- |
-| `core` | 412 | 3 | ids, cancellation token, flat message and tool-call types, usage without cost |
-| `runtime` | 2,600 | 19 | agent loop, sequential and parallel tools, retry with backoff and cancellation, tool timing, unknown-outcome state, process-group ownership |
-| `session` | 1,695 | 18 | Rust-native journal: versioned header, create-new lock file, append-only records, corruption detection, fork and clone by prefix |
+| `core` | 520 | 4 | ids, cancellation, ordered content-block model with compatibility views, usage without cost |
+| `runtime` | 2,600 | 20 | agent loop, sequential and parallel tools, retry with backoff, server `Retry-After`, cancellation, tool timing, unknown-outcome state, process-group ownership |
+| `session` | 1,950 | 19 (+2 crash-lock integration) | Rust-native journal: versioned header, operating-system lock, v2-compatible v3 message codec, append-only records, corruption detection, fork and clone by prefix |
 | `provider` / `provider-http` | 218 / 6,354 | 2 / 75 | six wire APIs (`openai-completions`, `openai-responses`, `anthropic-messages`, `google-generative-ai`, `google-vertex`, `openai-codex-responses`); text and tool calls only |
 | `auth` | 857 | 12 | `auth.json` read and write under a file lock, OAuth credentials, single refresh |
 | `models` | 1,202 | 15 | models.dev catalog, provider table, cache shared with the TypeScript CLI |
@@ -35,11 +35,11 @@ Future sizes are relative planning estimates (S, M, L, XL), not delivery dates. 
 
 Known gaps against the frozen contract (`compat/coding-agent/cli-surface.json`):
 
-- **Model layer:** no thinking blocks, image blocks, `toolcall_delta`, reasoning effort, prompt-cache control, or `usage.cost`; `Retry-After` is not read; Codex sends no `reasoning`.
+- **Model layer:** content-block storage now exists, but providers and JSON events still lack thinking blocks, image blocks, `toolcall_delta`, reasoning effort, prompt-cache control, and `usage.cost`; `Retry-After` is now parsed and used for admission retries; Codex sends no `reasoning`.
 - **Sessions:** `--resume`, `--fork`, export, import, listing, the entry model behind `get_entries` and `get_tree`.
 - **Behavior:** no steering or follow-up queues, no compaction, no thinking levels, no user shell commands, no tool hooks; 10 of the 23 event types missing.
 - **Resources:** no `settings.json`, `models.json`, trust, skills, prompt templates, themes, keybindings, `SYSTEM.md`, MCP, proxy or CA configuration.
-- **Tools:** `read` reads whole files with no device or size guard and no image input; `edit` has no fuzzy match or diff details; no PowerShell tool, `tool_search`, or codemode.
+- **Tools:** `read` now rejects non-regular files and files over 16 MiB and decodes UTF-16 BOM files, but has no image input; `edit` has no fuzzy match or diff details; no PowerShell tool, `tool_search`, or codemode.
 - **Surfaces:** no RPC mode (exits 2), no interactive mode (exits 2), no subcommands except `login` and `logout`, no `--help` text parity, no extensions.
 
 ## Analysis
@@ -230,10 +230,9 @@ Not used: either project's engine, plugin kernel, MCP client, SSE parser (Rebon-
 Reversible work that does not wait on a decision, in order. Done 2026-10-26: the operating-system lock for sessions and `auth.json`, the atomic-replace crate `nyan-coding-agent-fs` used by `write`, `edit`, and `auth.json`, and `edit` refusing non-UTF-8 files (`PARITY-DEVIATION(edit-non-utf8)`).
 
 1. T0: open a pull request from `rust-core-preview` so the Windows runner runs; `rust.yml` is not on `origin/main` yet, so `workflow_dispatch` cannot start it and only a pull request does. Needs the owner's go-ahead to open the PR.
-2. RS7: `read` guards (devices, FIFOs, size, UTF-16 BOM).
-3. RS4: cwd-identity session keys and the entry model behind `get_entries` and `get_tree`.
-4. RS3: `Retry-After` and the error classes; then content blocks and the v3 codec.
-5. T1: differential harness skeleton with one wire API, so RS3 has its gate.
+2. RS4: add the session cwd sidecar and the entry model behind `get_entries` and `get_tree`.
+3. RS3: complete stable provider error classes, then migrate provider request/replay paths from compatibility fields to ordered content blocks and add thinking/image streaming events.
+4. T1: differential harness skeleton with one wire API, so RS3 has its gate.
 
 ## Write sets
 
@@ -289,4 +288,5 @@ Do not close or reinterpret these entries without an owner decision. Work contin
 | 2026-10-23 | RS0 contract frozen | `compat/coding-agent/cli-surface.json` at `24424b129` |
 | 2026-10-23 | RS1 workspace and crate boundaries | `rust/` workspace; fmt, clippy, test on Linux; Windows clippy for the pure crates |
 | 2026-10-26 | RS4 crash-safe locks: the session and `auth.json` locks are operating-system locks the kernel drops when the process dies, with a test that kills the holder; the old create-new lock files left a session locked for good after a crash and the old `auth.json` stale-lock timer could steal a lock held during a slow refresh. Atomic file replacement (`nyan-coding-agent-fs`): readers never see a torn file under concurrent writers, symlinks and modes are kept, Windows rename retry. `rust-version` is 1.89 | 345 passing tests; mutation checks recorded for each; Linux only, the Windows runner has not executed them |
+| 2026-10-26 | RS3/RS4/RS7 incremental core work: ordered content blocks with a v3 session codec and v2 reader, runtime synchronization for streamed text/tool calls, `Retry-After` parsing for milliseconds, seconds, and HTTP-date, normalized cwd identities, and `read` guards for devices/FIFOs, size, and UTF-16 BOM files | 353 passing tests; new behavior mutation-checked; Linux only, the Windows runner has not executed them |
 | 2026-10-23 – 10-26 | RS2 runtime foundation, journal sessions, six wire APIs, `auth.json` and Codex OAuth, models.dev catalog, built-in tools, print and JSON modes, `login`, signals, retry backoff, deletion of the out-of-scope adapters | 36 local commits ending at `b506c86e2`; 332 passing tests; loopback servers only, no real provider or credential was used; the Windows runner has not executed any of it |

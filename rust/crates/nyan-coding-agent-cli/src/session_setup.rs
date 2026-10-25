@@ -29,11 +29,29 @@ use crate::headless::new_session_id;
 /// The directory under the agent directory that holds Rust-native sessions.
 pub const SESSION_STORE_DIR: &str = "sessions";
 
-/// FNV-1a over the path bytes: stable across platforms and releases, which a
-/// directory name must be.
+/// Returns the stable identity used to partition sessions by working directory.
+/// Existing paths are canonicalized so symlinked spellings share one session
+/// directory. Windows paths are case-insensitive and may be returned with the
+/// `\\?\\` device prefix; neither detail belongs in the persisted key.
+fn cwd_identity(cwd: &Path) -> String {
+    let path = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned());
+    let mut identity = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = identity.strip_prefix("//?/UNC/") {
+        identity = format!("//{rest}");
+    } else if let Some(rest) = identity.strip_prefix("//?/") {
+        identity = rest.to_owned();
+    }
+    if cfg!(windows) {
+        identity.make_ascii_lowercase();
+    }
+    identity
+}
+
+/// FNV-1a over the normalized path bytes: stable across platforms and releases,
+/// which a directory name must be.
 fn cwd_hash(cwd: &Path) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in cwd.to_string_lossy().replace('\\', "/").bytes() {
+    for byte in cwd_identity(cwd).bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
@@ -166,7 +184,7 @@ mod tests {
     use nyan_coding_agent_core::{Message, MessageRole};
     use nyan_coding_agent_session::SessionRecordKind;
 
-    use super::{cwd_hash, open_session};
+    use super::{cwd_hash, cwd_identity, open_session};
     use crate::args::parse_args;
 
     fn temp(name: &str) -> PathBuf {
@@ -211,6 +229,25 @@ mod tests {
             cwd_hash(Path::new("C:/a/b"))
         );
         assert_eq!(cwd_hash(Path::new("/a/b")).len(), 16);
+        assert_eq!(
+            cwd_identity(Path::new(r"\\?\C:\a\b")),
+            cwd_identity(Path::new("C:/a/b"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_directory_and_its_symlink_have_one_cwd_identity() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("cwd-identity");
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir(&real).expect("real");
+        symlink(&real, &link).expect("link");
+        assert_eq!(cwd_identity(&real), cwd_identity(&link));
+        assert_eq!(cwd_hash(&real), cwd_hash(&link));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

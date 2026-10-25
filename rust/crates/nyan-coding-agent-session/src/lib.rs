@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nyan_coding_agent_core::{
-    AgentMode, CoreError, Message, MessageRole, SessionId, StopReason, ToolCall, ToolCallId, Usage,
+    AgentMode, ContentBlock, CoreError, Message, MessageRole, SessionId, StopReason, ToolCall,
+    ToolCallId, Usage,
 };
 
 const RUST_SESSION_HEADER: &[u8] = b"NYANRS01\n1\n";
@@ -187,6 +188,11 @@ pub enum SessionMessageError {
         /// Flag value found in the payload.
         value: u8,
     },
+    /// A content block discriminant was not recognized.
+    InvalidBlock {
+        /// Block discriminant found in the payload.
+        value: u8,
+    },
     /// A tool-call identifier was rejected by the core identity type.
     InvalidToolCallId,
     /// A length would exceed the supported codec limit.
@@ -210,6 +216,9 @@ impl std::fmt::Display for SessionMessageError {
             Self::InvalidFlag { value } => {
                 write!(formatter, "invalid session message flag: {value}")
             }
+            Self::InvalidBlock { value } => {
+                write!(formatter, "invalid session message content block: {value}")
+            }
             Self::InvalidToolCallId => formatter.write_str("invalid session message tool-call id"),
             Self::LengthOverflow => formatter.write_str("session message field is too large"),
         }
@@ -218,7 +227,21 @@ impl std::fmt::Display for SessionMessageError {
 
 impl std::error::Error for SessionMessageError {}
 
-const MESSAGE_CODEC_VERSION: u8 = 2;
+/// The version the encoder writes. The decoder also reads [`LEGACY_FLAT_CODEC_VERSION`].
+const MESSAGE_CODEC_VERSION: u8 = 3;
+
+/// The first Rust format: one text field and a list of tool calls, no block order.
+const LEGACY_FLAT_CODEC_VERSION: u8 = 2;
+
+const BLOCK_TEXT: u8 = 0;
+const BLOCK_THINKING: u8 = 1;
+const BLOCK_IMAGE: u8 = 2;
+const BLOCK_TOOL_CALL: u8 = 3;
+
+/// Usage record kinds. Kind 1 is the five token counts; later kinds extend it in place,
+/// so adding cost does not need a new codec version.
+const USAGE_NONE: u8 = 0;
+const USAGE_BASIC: u8 = 1;
 
 /// Encodes one provider-neutral message into a stable Rust-native payload.
 ///
@@ -236,26 +259,50 @@ pub fn encode_message(message: &Message) -> Result<Vec<u8>, SessionMessageError>
         MessageRole::Tool => 3,
     });
     bytes.push(u8::from(message.is_error));
-    put_string(&mut bytes, &message.text)?;
+    let content = message_content(message);
+    let count = u32::try_from(content.len()).map_err(|_| SessionMessageError::LengthOverflow)?;
+    bytes.extend_from_slice(&count.to_le_bytes());
+    for block in &content {
+        match block {
+            ContentBlock::Text { text, signature } => {
+                bytes.push(BLOCK_TEXT);
+                put_string(&mut bytes, text)?;
+                put_optional_string(&mut bytes, signature.as_deref())?;
+            }
+            ContentBlock::Thinking {
+                text,
+                signature,
+                redacted,
+            } => {
+                bytes.push(BLOCK_THINKING);
+                put_string(&mut bytes, text)?;
+                put_optional_string(&mut bytes, signature.as_deref())?;
+                bytes.push(u8::from(*redacted));
+            }
+            ContentBlock::Image { data, mime_type } => {
+                bytes.push(BLOCK_IMAGE);
+                put_string(&mut bytes, data)?;
+                put_string(&mut bytes, mime_type)?;
+            }
+            ContentBlock::ToolCall(call) => {
+                bytes.push(BLOCK_TOOL_CALL);
+                put_string(&mut bytes, call.id.as_str())?;
+                put_string(&mut bytes, &call.name)?;
+                put_string(&mut bytes, &call.arguments)?;
+            }
+        }
+    }
     put_optional_string(
         &mut bytes,
         message.tool_call_id.as_ref().map(ToolCallId::as_str),
     )?;
     put_optional_string(&mut bytes, message.tool_name.as_deref())?;
-    let count =
-        u32::try_from(message.tool_calls.len()).map_err(|_| SessionMessageError::LengthOverflow)?;
-    bytes.extend_from_slice(&count.to_le_bytes());
-    for call in &message.tool_calls {
-        put_string(&mut bytes, call.id.as_str())?;
-        put_string(&mut bytes, &call.name)?;
-        put_string(&mut bytes, &call.arguments)?;
-    }
     bytes.extend_from_slice(&message.timestamp_ms.to_le_bytes());
     put_optional_string(&mut bytes, message.provider.as_deref())?;
     put_optional_string(&mut bytes, message.model.as_deref())?;
     match message.usage {
         Some(usage) => {
-            bytes.push(1);
+            bytes.push(USAGE_BASIC);
             for value in [
                 usage.input,
                 usage.output,
@@ -266,7 +313,7 @@ pub fn encode_message(message: &Message) -> Result<Vec<u8>, SessionMessageError>
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
-        None => bytes.push(0),
+        None => bytes.push(USAGE_NONE),
     }
     bytes.push(match message.stop_reason {
         None => 0,
@@ -288,7 +335,7 @@ pub fn encode_message(message: &Message) -> Result<Vec<u8>, SessionMessageError>
 pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
     let mut cursor = Cursor { bytes, position: 0 };
     let version = cursor.u8()?;
-    if version != MESSAGE_CODEC_VERSION {
+    if version != MESSAGE_CODEC_VERSION && version != LEGACY_FLAT_CODEC_VERSION {
         return Err(SessionMessageError::UnsupportedVersion { version });
     }
     let role = match cursor.u8()? {
@@ -298,34 +345,21 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
         3 => MessageRole::Tool,
         value => return Err(SessionMessageError::InvalidRole { value }),
     };
-    let is_error = match cursor.u8()? {
-        0 => false,
-        1 => true,
-        value => return Err(SessionMessageError::InvalidFlag { value }),
+    let is_error = cursor.flag()?;
+    let (content, tool_call_id, tool_name) = if version == LEGACY_FLAT_CODEC_VERSION {
+        decode_flat_content(&mut cursor)?
+    } else {
+        let content = decode_blocks(&mut cursor)?;
+        let tool_call_id = cursor.tool_call_id()?;
+        let tool_name = cursor.optional_string()?;
+        (content, tool_call_id, tool_name)
     };
-    let text = cursor.string()?;
-    let tool_call_id = cursor
-        .optional_string()?
-        .map(|value| ToolCallId::new(value).map_err(|_| SessionMessageError::InvalidToolCallId))
-        .transpose()?;
-    let tool_name = cursor.optional_string()?;
-    let count = cursor.u32()? as usize;
-    let mut tool_calls = Vec::with_capacity(count);
-    for _ in 0..count {
-        let id = ToolCallId::new(cursor.string()?)
-            .map_err(|_| SessionMessageError::InvalidToolCallId)?;
-        tool_calls.push(ToolCall {
-            id,
-            name: cursor.string()?,
-            arguments: cursor.string()?,
-        });
-    }
     let timestamp_ms = cursor.u64()?;
     let provider = cursor.optional_string()?;
     let model = cursor.optional_string()?;
     let usage = match cursor.u8()? {
-        0 => None,
-        1 => Some(Usage {
+        USAGE_NONE => None,
+        USAGE_BASIC => Some(Usage {
             input: cursor.u64()?,
             output: cursor.u64()?,
             cache_read: cursor.u64()?,
@@ -344,13 +378,28 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
         value => return Err(SessionMessageError::InvalidFlag { value }),
     };
     let error_message = cursor.optional_string()?;
+    let text = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_calls = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect();
     Ok(Message {
         role,
+        content,
         text,
+        tool_calls,
         tool_call_id,
         tool_name,
         is_error,
-        tool_calls,
         timestamp_ms,
         provider,
         model,
@@ -358,6 +407,90 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
         stop_reason,
         error_message,
     })
+}
+
+fn message_content(message: &Message) -> Vec<ContentBlock> {
+    if !message.content.is_empty() {
+        return message.content.clone();
+    }
+    let mut content = Vec::new();
+    if !message.text.is_empty() {
+        content.push(ContentBlock::Text {
+            text: message.text.clone(),
+            signature: None,
+        });
+    }
+    content.extend(
+        message
+            .tool_calls
+            .iter()
+            .cloned()
+            .map(ContentBlock::ToolCall),
+    );
+    content
+}
+
+/// Version 2 stored the text first and the tool calls after it, so a message that
+/// spoke and then called a tool reads back as that order.
+type DecodedMessageParts = (Vec<ContentBlock>, Option<ToolCallId>, Option<String>);
+
+fn decode_flat_content(
+    cursor: &mut Cursor<'_>,
+) -> Result<DecodedMessageParts, SessionMessageError> {
+    let text = cursor.string()?;
+    let tool_call_id = cursor.tool_call_id()?;
+    let tool_name = cursor.optional_string()?;
+    let count = cursor.u32()? as usize;
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(ContentBlock::Text {
+            text,
+            signature: None,
+        });
+    }
+    for _ in 0..count {
+        let id = ToolCallId::new(cursor.string()?)
+            .map_err(|_| SessionMessageError::InvalidToolCallId)?;
+        content.push(ContentBlock::ToolCall(ToolCall {
+            id,
+            name: cursor.string()?,
+            arguments: cursor.string()?,
+        }));
+    }
+    Ok((content, tool_call_id, tool_name))
+}
+
+fn decode_blocks(cursor: &mut Cursor<'_>) -> Result<Vec<ContentBlock>, SessionMessageError> {
+    let count = cursor.u32()? as usize;
+    let mut content = Vec::new();
+    for _ in 0..count {
+        content.push(match cursor.u8()? {
+            BLOCK_TEXT => ContentBlock::Text {
+                text: cursor.string()?,
+                signature: cursor.optional_string()?,
+            },
+            BLOCK_THINKING => ContentBlock::Thinking {
+                text: cursor.string()?,
+                signature: cursor.optional_string()?,
+                redacted: cursor.flag()?,
+            },
+            BLOCK_IMAGE => ContentBlock::Image {
+                data: cursor.string()?,
+                mime_type: cursor.string()?,
+            },
+            BLOCK_TOOL_CALL => {
+                let id = ToolCallId::new(cursor.string()?)
+                    .map_err(|_| SessionMessageError::InvalidToolCallId)?;
+                ContentBlock::ToolCall(ToolCall {
+                    id,
+                    name: cursor.string()?,
+                    arguments: cursor.string()?,
+                })
+            }
+            value => return Err(SessionMessageError::InvalidBlock { value }),
+        });
+    }
+    Ok(content)
 }
 
 fn put_string(bytes: &mut Vec<u8>, value: &str) -> Result<(), SessionMessageError> {
@@ -438,6 +571,20 @@ impl Cursor<'_> {
             .ok_or(SessionMessageError::Truncated)?;
         self.position = end;
         String::from_utf8(bytes.to_vec()).map_err(|_| SessionMessageError::InvalidUtf8)
+    }
+
+    fn flag(&mut self) -> Result<bool, SessionMessageError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(SessionMessageError::InvalidFlag { value }),
+        }
+    }
+
+    fn tool_call_id(&mut self) -> Result<Option<ToolCallId>, SessionMessageError> {
+        self.optional_string()?
+            .map(|value| ToolCallId::new(value).map_err(|_| SessionMessageError::InvalidToolCallId))
+            .transpose()
     }
 
     fn optional_string(&mut self) -> Result<Option<String>, SessionMessageError> {
@@ -1265,7 +1412,8 @@ mod tests {
         decode_message, encode_message,
     };
     use nyan_coding_agent_core::{
-        AgentMode, Message, MessageRole, SessionId, StopReason, ToolCall, ToolCallId, Usage,
+        AgentMode, ContentBlock, Message, MessageRole, SessionId, StopReason, ToolCall, ToolCallId,
+        Usage,
     };
 
     fn test_root(name: &str) -> std::path::PathBuf {
@@ -1378,6 +1526,26 @@ mod tests {
     fn message_codec_roundtrips_tool_calls_and_results() {
         let message = Message {
             role: MessageRole::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "use tool".to_owned(),
+                    signature: None,
+                },
+                ContentBlock::Thinking {
+                    text: "reason".to_owned(),
+                    signature: Some("sig".to_owned()),
+                    redacted: false,
+                },
+                ContentBlock::Image {
+                    data: "aGVsbG8=".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: ToolCallId::new("call-1").expect("tool call id"),
+                    name: "echo".to_owned(),
+                    arguments: "hello".to_owned(),
+                }),
+            ],
             text: "use tool".to_owned(),
             tool_call_id: Some(ToolCallId::new("result-1").expect("tool result id")),
             tool_name: Some("echo".to_owned()),

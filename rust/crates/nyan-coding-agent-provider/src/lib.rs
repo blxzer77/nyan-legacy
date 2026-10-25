@@ -113,6 +113,8 @@ pub enum ProviderError {
         message: String,
         /// Whether a fresh request may be attempted safely.
         retryable: bool,
+        /// Server-requested delay before retrying, if the response supplied one.
+        retry_after: Option<std::time::Duration>,
     },
     /// The provider stream ended unexpectedly.
     Stream {
@@ -140,6 +142,18 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 impl ProviderError {
+    /// Returns a server-requested retry delay, when one crossed the provider boundary.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Request { retry_after, .. } => *retry_after,
+            Self::Authentication { .. }
+            | Self::ModelUnavailable { .. }
+            | Self::Stream { .. }
+            | Self::Cancelled => None,
+        }
+    }
+
     /// Reports whether the request can be retried without changing the outcome contract.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
@@ -205,6 +219,7 @@ mod tests {
             super::ProviderError::Request {
                 message: "temporary".to_owned(),
                 retryable: true,
+                retry_after: None,
             }
             .is_retryable()
         );
