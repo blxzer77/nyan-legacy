@@ -3,11 +3,12 @@
 
 use std::time::Duration;
 
-use nyan_coding_agent_core::CancellationToken;
+use nyan_coding_agent_core::{CancellationToken, ContentBlock};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderStopReason, ProviderStream, ProviderStreamEvent,
 };
 use nyan_coding_agent_provider_http::OpenAiChatProvider;
+use serde_json::json;
 
 mod common;
 use common::{Server, drain, request, serve, sse};
@@ -83,6 +84,44 @@ fn text_arrives_incrementally_and_the_request_is_well_formed() {
     assert_eq!(
         body["tools"][0]["function"]["parameters"]["required"][0], "text",
         "the declared argument schema reaches the provider"
+    );
+}
+
+#[test]
+fn image_history_uses_openai_multimodal_parts() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve(
+        &runtime,
+        "200 OK",
+        vec![
+            (
+                0,
+                sse(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            ),
+            (0, sse("[DONE]")),
+        ],
+        false,
+    );
+    let mut req = request(CancellationToken::new());
+    req.messages[0].content.push(ContentBlock::Image {
+        data: "aGVsbG8=".to_owned(),
+        mime_type: "image/png".to_owned(),
+    });
+    let stream = runtime
+        .block_on(provider(&runtime, &server).stream(req))
+        .expect("stream");
+    drain(&runtime, stream).expect("events");
+    let captured = server.captured.lock().expect("captured lock").clone();
+    let body: serde_json::Value =
+        serde_json::from_str(captured.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(
+        body["messages"][0]["content"][0],
+        json!({"type": "text", "text": "hello"})
+    );
+    assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
+    assert_eq!(
+        body["messages"][0]["content"][1]["image_url"]["url"],
+        "data:image/png;base64,aGVsbG8="
     );
 }
 

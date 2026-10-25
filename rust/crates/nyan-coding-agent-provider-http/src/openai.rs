@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, Message, MessageRole, Usage};
+use nyan_coding_agent_core::{BoxFuture, ContentBlock, Message, MessageRole, Usage};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ToolCallRequest, ToolSpec,
@@ -115,36 +115,75 @@ fn wire_tool(tool: &ToolSpec) -> Value {
 }
 
 fn wire_message(message: &Message) -> Value {
+    let blocks = message.model_content();
     match message.role {
-        MessageRole::System => json!({"role": "system", "content": message.text}),
-        MessageRole::User => json!({"role": "user", "content": message.text}),
+        MessageRole::System => json!({
+            "role": "system",
+            "content": wire_prompt_content(&blocks),
+        }),
+        MessageRole::User => json!({
+            "role": "user",
+            "content": wire_prompt_content(&blocks),
+        }),
         MessageRole::Assistant => {
             let mut wire = json!({
                 "role": "assistant",
-                "content": if message.text.is_empty() { Value::Null } else { json!(message.text) },
+                "content": wire_text_content(&blocks).map_or(Value::Null, Value::String),
             });
-            if !message.tool_calls.is_empty() {
-                wire["tool_calls"] = Value::Array(
-                    message
-                        .tool_calls
-                        .iter()
-                        .map(|call| {
-                            json!({
-                                "id": call.id.as_str(),
-                                "type": "function",
-                                "function": {"name": call.name, "arguments": call.arguments},
-                            })
-                        })
-                        .collect(),
-                );
+            let calls = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .map(|call| {
+                    json!({
+                        "id": call.id.as_str(),
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !calls.is_empty() {
+                wire["tool_calls"] = Value::Array(calls);
             }
             wire
         }
         MessageRole::Tool => json!({
             "role": "tool",
             "tool_call_id": message.tool_call_id.as_ref().map_or("", |id| id.as_str()),
-            "content": message.text,
+            "content": message.text_content(),
         }),
+    }
+}
+
+fn wire_text_content(blocks: &[ContentBlock]) -> Option<String> {
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
+fn wire_prompt_content(blocks: &[ContentBlock]) -> Value {
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text, .. } => parts.push(json!({"type": "text", "text": text})),
+            ContentBlock::Image { data, mime_type } => parts.push(json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{mime_type};base64,{data}")},
+            })),
+            ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) => {}
+        }
+    }
+    if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text") {
+        parts[0].get("text").cloned().unwrap_or(Value::Null)
+    } else {
+        Value::Array(parts)
     }
 }
 
