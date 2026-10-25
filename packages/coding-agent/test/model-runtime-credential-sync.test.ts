@@ -373,3 +373,69 @@ describe("ModelRuntime credential synchronization", () => {
 		expect(await credentials.read("broken-sync")).toEqual({ type: "api_key", key: "broken-sync-key" });
 	});
 });
+
+describe("ModelRuntime refresh ordering", () => {
+	it("keeps a later refresh behind an availability pass that has not finished", async () => {
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirst!: () => void;
+		const firstEntered = new Promise<void>((resolve) => {
+			markFirst = resolve;
+		});
+		let markOverlap!: () => void;
+		const overlapped = new Promise<void>((resolve) => {
+			markOverlap = resolve;
+		});
+		let checks = 0;
+		let refreshModelsCalls = 0;
+		const registered = provider("gated", {
+			refreshModels: async () => {
+				refreshModelsCalls += 1;
+				if (refreshModelsCalls === 2) markOverlap();
+			},
+		});
+		const apiKey = registered.auth.apiKey;
+		if (apiKey === undefined) throw new Error("gated provider has no api-key auth");
+		apiKey.check = async () => {
+			checks += 1;
+			if (checks === 1) {
+				markFirst();
+				await firstGate;
+			}
+			return { type: "api_key", source: "env" };
+		};
+
+		const runtime = await ModelRuntime.create({
+			credentials: AuthStorage.inMemory(),
+			modelsPath: null,
+			allowModelNetwork: false,
+			refreshOnCreate: false,
+		});
+		runtime.registerNativeProvider(registered);
+		await firstEntered;
+
+		let settled = false;
+		const pending = runtime.refresh({ allowNetwork: false }).finally(() => {
+			settled = true;
+		});
+		// Registration starts a refresh it does not await, and startup then awaits another. The later one must not
+		// resolve while the earlier availability pass is still running: that pass can supersede it and leave the
+		// snapshot empty.
+		const outcome = await Promise.race([
+			overlapped.then(() => "overlapped" as const),
+			new Promise<"serialized">((resolve) => {
+				setTimeout(() => resolve("serialized"), 300);
+			}),
+		]);
+		expect(outcome).toBe("serialized");
+		expect(settled).toBe(false);
+
+		releaseFirst();
+		await pending;
+		expect(runtime.getAvailableSnapshot().some((model) => model.provider === "gated" && model.id === "dynamic")).toBe(
+			true,
+		);
+	});
+});
