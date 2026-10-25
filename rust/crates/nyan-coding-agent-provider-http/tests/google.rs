@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use nyan_coding_agent_core::{CancellationToken, Usage};
 use nyan_coding_agent_provider::{ModelProvider, ProviderStopReason, ProviderStreamEvent};
-use nyan_coding_agent_provider_http::{GoogleGenerativeAiProvider, GoogleVertexProvider};
+use nyan_coding_agent_provider_http::{
+    GoogleGenerativeAiProvider, GoogleVertexProvider, VertexAuth,
+};
 use serde_json::json;
 use tokio::runtime::Runtime;
 
@@ -20,7 +22,7 @@ fn sse(value: serde_json::Value) -> Vec<u8> {
 fn gemini_provider(runtime: &Runtime, server: &Server) -> GoogleGenerativeAiProvider {
     GoogleGenerativeAiProvider::new(
         "google",
-        format!("http://{}", server.address),
+        format!("http://{}/v1beta", server.address),
         Some("google-key".to_owned()),
         runtime.handle().clone(),
     )
@@ -87,10 +89,19 @@ fn generative_ai_uses_key_query_contents_tools_and_usage() {
     );
     let captured = server.captured.lock().expect("lock").clone();
     assert!(
-        captured.starts_with(
-            "POST /v1beta/models/test-model:streamGenerateContent?alt=sse&key=google-key HTTP/1.1"
-        ),
+        captured
+            .starts_with("POST /v1beta/models/test-model:streamGenerateContent?alt=sse HTTP/1.1"),
         "{captured}"
+    );
+    assert!(
+        captured
+            .to_ascii_lowercase()
+            .contains("x-goog-api-key: google-key"),
+        "{captured}"
+    );
+    assert!(
+        !captured.lines().next().unwrap_or("").contains("google-key"),
+        "the key must not appear in the URL"
     );
     let body: serde_json::Value =
         serde_json::from_str(captured.split("\r\n\r\n").nth(1).expect("body")).expect("json");
@@ -119,7 +130,7 @@ fn vertex_uses_bearer_auth_and_publisher_path() {
             "http://{}/v1/projects/p/locations/l/publishers/google",
             server.address
         ),
-        Some("vertex-token".to_owned()),
+        Some(VertexAuth::Bearer("vertex-token".to_owned())),
         runtime.handle().clone(),
     )
     .expect("provider");
@@ -128,7 +139,7 @@ fn vertex_uses_bearer_auth_and_publisher_path() {
         .expect("stream");
     drain(&runtime, stream).expect("events");
     let captured = server.captured.lock().expect("lock").clone();
-    assert!(captured.starts_with("POST /v1/projects/p/locations/l/publishers/google/models/test-model:streamGenerateContent HTTP/1.1"), "{captured}");
+    assert!(captured.starts_with("POST /v1/projects/p/locations/l/publishers/google/models/test-model:streamGenerateContent?alt=sse HTTP/1.1"), "{captured}");
     assert!(
         captured
             .to_ascii_lowercase()
@@ -201,4 +212,36 @@ fn thought_parts_are_not_shown_and_history_replays_as_function_parts() {
         body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
         "x"
     );
+}
+
+#[test]
+fn vertex_express_mode_sends_the_api_key_header_and_no_bearer() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve(
+        &runtime,
+        "200 OK",
+        vec![(0, sse(json!({"candidates": [{"finishReason": "STOP"}]})))],
+        false,
+    );
+    let provider = GoogleVertexProvider::new(
+        "google-vertex",
+        format!("http://{}/v1/publishers/google", server.address),
+        Some(VertexAuth::ApiKey("express-key".to_owned())),
+        runtime.handle().clone(),
+    )
+    .expect("provider");
+    let stream = runtime
+        .block_on(provider.stream(request(CancellationToken::new())))
+        .expect("stream");
+    drain(&runtime, stream).expect("events");
+    let captured = server.captured.lock().expect("lock").clone();
+    let lower = captured.to_ascii_lowercase();
+    assert!(
+        captured.starts_with(
+            "POST /v1/publishers/google/models/test-model:streamGenerateContent?alt=sse HTTP/1.1"
+        ),
+        "{captured}"
+    );
+    assert!(lower.contains("x-goog-api-key: express-key"), "{captured}");
+    assert!(!lower.contains("authorization:"), "{captured}");
 }

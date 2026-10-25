@@ -28,19 +28,30 @@ pub struct GoogleGenerativeAiProvider {
     transport: Transport,
 }
 
-/// A Google Vertex AI provider using a Bearer token.
+/// How a Vertex request is authenticated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VertexAuth {
+    /// An API key (Vertex express mode), sent in `x-goog-api-key`.
+    ApiKey(String),
+    /// An OAuth access token, sent as a bearer token.
+    Bearer(String),
+}
+
+/// A Google Vertex AI provider.
 #[derive(Clone, Debug)]
 pub struct GoogleVertexProvider {
     id: String,
     base_url: String,
-    bearer_token: Option<String>,
+    auth: Option<VertexAuth>,
     transport: Transport,
 }
 
 impl GoogleGenerativeAiProvider {
-    /// Creates a provider for the Generative AI API root.
+    /// Creates a provider for a Generative AI base URL that already carries the
+    /// API version, for example `https://generativelanguage.googleapis.com/v1beta`.
     ///
-    /// The request path becomes `v1beta/models/{model}:streamGenerateContent`.
+    /// The request path becomes `models/{model}:streamGenerateContent`. The key
+    /// travels in `x-goog-api-key`, not in the URL.
     ///
     /// # Errors
     ///
@@ -68,8 +79,9 @@ impl GoogleGenerativeAiProvider {
 }
 
 impl GoogleVertexProvider {
-    /// Creates a Vertex provider. `base_url` should include the project/location
-    /// endpoint prefix up to `/publishers/google`.
+    /// Creates a Vertex provider. `base_url` is everything before `/models/`:
+    /// `https://aiplatform.googleapis.com/v1/publishers/google` for an API key, or
+    /// the project and location path for an access token.
     ///
     /// # Errors
     ///
@@ -77,13 +89,13 @@ impl GoogleVertexProvider {
     pub fn new(
         id: impl Into<String>,
         base_url: impl Into<String>,
-        bearer_token: Option<String>,
+        auth: Option<VertexAuth>,
         handle: Handle,
     ) -> Result<Self, ProviderError> {
         Ok(Self {
             id: id.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            bearer_token,
+            auth,
             transport: Transport::new(handle)?,
         })
     }
@@ -105,18 +117,20 @@ impl ModelProvider for GoogleGenerativeAiProvider {
         &self,
         request: ProviderRequest,
     ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
-        let key = self.api_key.clone().unwrap_or_default();
         let url = format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+            "{}/models/{}:streamGenerateContent?alt=sse",
             self.base_url,
             url_encode(&request.model.model),
-            url_encode(&key)
         );
         let post = Post {
             url,
             body: build_request_body(&request).to_string(),
             bearer: None,
-            headers: Vec::new(),
+            headers: self
+                .api_key
+                .iter()
+                .map(|key| ("x-goog-api-key".to_owned(), key.clone()))
+                .collect(),
             accept: None,
         };
         self.transport
@@ -133,15 +147,22 @@ impl ModelProvider for GoogleVertexProvider {
         &self,
         request: ProviderRequest,
     ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
+        let (bearer, headers) = match &self.auth {
+            Some(VertexAuth::ApiKey(key)) => {
+                (None, vec![("x-goog-api-key".to_owned(), key.clone())])
+            }
+            Some(VertexAuth::Bearer(token)) => (Some(token.clone()), Vec::new()),
+            None => (None, Vec::new()),
+        };
         let post = Post {
             url: format!(
-                "{}/models/{}:streamGenerateContent",
+                "{}/models/{}:streamGenerateContent?alt=sse",
                 self.base_url,
                 url_encode(&request.model.model)
             ),
             body: build_request_body(&request).to_string(),
-            bearer: self.bearer_token.clone(),
-            headers: Vec::new(),
+            bearer,
+            headers,
             accept: None,
         };
         self.transport

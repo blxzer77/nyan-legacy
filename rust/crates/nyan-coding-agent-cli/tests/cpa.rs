@@ -3,38 +3,18 @@
 //! `/v1/models` and `/backend-api/codex/responses` and checks the bearer key.
 //! Nothing here uses a real proxy or a real credential.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::Write;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use nyan_coding_agent_cli::headless::SharedWriter;
-use nyan_coding_agent_cli::run::{Environment, run};
 use serde_json::{Value, json};
+mod support;
+use support::Home;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Capture {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-struct Outcome {
-    code: i32,
-    stdout: String,
-    stderr: String,
-    asked: Vec<String>,
-}
 
 struct Proxy {
     address: SocketAddr,
@@ -130,86 +110,6 @@ fn proxy(runtime: &Runtime, valid_key: &'static str) -> Proxy {
     Proxy { address, requests }
 }
 
-struct Home {
-    agent: PathBuf,
-    cwd: PathBuf,
-}
-
-impl Home {
-    fn new(label: &str) -> Self {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("nyan-cpa-{label}-{}-{nonce}", std::process::id()));
-        let agent = root.join("agent");
-        let cwd = root.join("project");
-        std::fs::create_dir_all(&agent).expect("agent");
-        std::fs::create_dir_all(&cwd).expect("cwd");
-        Self { agent, cwd }
-    }
-
-    /// Runs the CLI with `answers` queued for its prompts.
-    fn go(&self, argv: &[&str], env: &[(&str, &str)], answers: &[&str]) -> Outcome {
-        let out_bytes = Arc::new(Mutex::new(Vec::new()));
-        let err_bytes = Arc::new(Mutex::new(Vec::new()));
-        let out: SharedWriter = Arc::new(Mutex::new(Capture(Arc::clone(&out_bytes))));
-        let err: SharedWriter = Arc::new(Mutex::new(Capture(Arc::clone(&err_bytes))));
-        let queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(
-            answers.iter().map(|a| (*a).to_owned()).collect(),
-        ));
-        let asked = Arc::new(Mutex::new(Vec::new()));
-        let mut variables: BTreeMap<String, String> = env
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect();
-        variables.insert(
-            "NYAN_CODING_AGENT_DIR".to_owned(),
-            self.agent.to_string_lossy().into_owned(),
-        );
-        let (queue_for_prompt, asked_for_prompt) = (Arc::clone(&queue), Arc::clone(&asked));
-        let environment = Environment {
-            var: Box::new(move |name| variables.get(name).cloned()),
-            stdin_is_tty: false,
-            stdout_is_tty: false,
-            cwd: self.cwd.clone(),
-            openai_base_url: "http://127.0.0.1:1/v1".to_owned(),
-            read_stdin: Box::new(|| None),
-            prompt: Box::new(move |message, _secret| {
-                asked_for_prompt
-                    .lock()
-                    .expect("lock")
-                    .push(message.to_owned());
-                queue_for_prompt.lock().expect("lock").pop_front()
-            }),
-        };
-        let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
-        let code = run(&argv, &environment, &out, &err);
-        let text = |bytes: &Arc<Mutex<Vec<u8>>>| {
-            String::from_utf8(bytes.lock().expect("lock").clone()).expect("utf8")
-        };
-        let asked = asked.lock().expect("lock").clone();
-        Outcome {
-            code,
-            stdout: text(&out_bytes),
-            stderr: text(&err_bytes),
-            asked,
-        }
-    }
-
-    fn json(&self, name: &str) -> Value {
-        serde_json::from_str(&std::fs::read_to_string(self.agent.join(name)).expect("read"))
-            .expect("json")
-    }
-
-    fn cleanup(self) {
-        if let Some(root) = self.agent.parent() {
-            let _ = std::fs::remove_dir_all(root);
-        }
-    }
-}
-
 fn url_of(proxy: &Proxy) -> String {
     format!("http://{}", proxy.address)
 }
@@ -266,7 +166,7 @@ fn a_rejected_key_or_a_bad_url_asks_again_and_stores_nothing_until_one_works() {
     let home = Home::new("retry");
     let url = url_of(&proxy);
     let outcome = home.go(
-        &["login"],
+        &["login", "cliproxyapi"],
         &[],
         &["http://", "", &url, "  ", &url, "bad", &url, "good", ""],
     );
@@ -313,7 +213,7 @@ fn a_cancelled_login_stores_nothing_and_exits_one() {
     assert!(
         unknown
             .stderr
-            .contains("cannot log in to \"nowhere\" yet (available: cliproxyapi)"),
+            .contains("cannot log in to \"nowhere\" (available: cliproxyapi, azure, "),
         "{}",
         unknown.stderr
     );
@@ -326,7 +226,11 @@ fn a_run_uses_the_stored_login_and_the_saved_default_model() {
     let proxy = proxy(&runtime, "sk-cpa");
     let home = Home::new("run");
     let url = url_of(&proxy);
-    assert_eq!(home.go(&["login"], &[], &[&url, "sk-cpa", "1"]).code, 0);
+    assert_eq!(
+        home.go(&["login", "cliproxyapi"], &[], &[&url, "sk-cpa", "1"])
+            .code,
+        0
+    );
     proxy.requests.lock().expect("lock").clear();
 
     let outcome = home.go(&["-p", "--no-session", "say hi"], &[], &[]);
@@ -433,7 +337,11 @@ fn without_a_login_or_a_default_the_error_says_what_to_do() {
     );
 
     let url = url_of(&proxy);
-    assert_eq!(home.go(&["login"], &[], &[&url, "k", ""]).code, 0);
+    assert_eq!(
+        home.go(&["login", "cliproxyapi"], &[], &[&url, "k", ""])
+            .code,
+        0
+    );
     let undecided = home.go(&["-p", "hi"], &[], &[]);
     assert_eq!(undecided.code, 1);
     assert!(
@@ -452,7 +360,11 @@ fn logout_removes_the_login_and_reports_when_there_is_none() {
     let proxy = proxy(&runtime, "k");
     let home = Home::new("logout");
     let url = url_of(&proxy);
-    assert_eq!(home.go(&["login"], &[], &[&url, "k", ""]).code, 0);
+    assert_eq!(
+        home.go(&["login", "cliproxyapi"], &[], &[&url, "k", ""])
+            .code,
+        0
+    );
     let out = home.go(&["logout"], &[], &[]);
     assert_eq!(
         (out.code, out.stdout.as_str()),
@@ -484,7 +396,11 @@ fn list_models_shows_the_logged_in_catalog_and_filters_by_search() {
     );
 
     let url = url_of(&proxy);
-    assert_eq!(home.go(&["login"], &[], &[&url, "k", ""]).code, 0);
+    assert_eq!(
+        home.go(&["login", "cliproxyapi"], &[], &[&url, "k", ""])
+            .code,
+        0
+    );
     let all = home.go(&["--list-models"], &[], &[]);
     assert_eq!(all.code, 0, "{}", all.stderr);
     let lines: Vec<&str> = all.stdout.lines().collect();

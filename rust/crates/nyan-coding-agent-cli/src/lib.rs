@@ -5,6 +5,7 @@ pub mod args;
 pub mod headless;
 pub mod initial_message;
 pub mod login;
+pub mod provider_table;
 pub mod providers;
 pub mod run;
 pub mod session_setup;

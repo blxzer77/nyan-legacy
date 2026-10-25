@@ -17,7 +17,7 @@ pub(crate) mod transport;
 
 pub use anthropic::AnthropicMessagesProvider;
 pub use bedrock::{BedrockAuth, BedrockConverseProvider};
-pub use google::{GoogleGenerativeAiProvider, GoogleVertexProvider};
+pub use google::{GoogleGenerativeAiProvider, GoogleVertexProvider, VertexAuth};
 pub use mistral::MistralConversationsProvider;
 pub use openai::OpenAiChatProvider;
 pub use responses::OpenAiResponsesProvider;

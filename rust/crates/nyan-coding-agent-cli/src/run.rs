@@ -4,6 +4,7 @@
 //! output) behind one function lets tests drive the same code the executable
 //! runs, with the environment and the provider endpoint injected.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -26,9 +27,6 @@ use crate::system_prompt::{
 };
 use crate::tool_selection::select_tools;
 
-/// The `OpenAI` endpoint used when nothing else is configured.
-pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-
 /// Looks up an environment variable.
 pub type EnvLookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
@@ -48,8 +46,11 @@ pub struct Environment {
     pub stdout_is_tty: bool,
     /// Working directory.
     pub cwd: PathBuf,
-    /// Base URL of the OpenAI-compatible endpoint.
-    pub openai_base_url: String,
+    /// Base URLs that replace a provider's own, by provider id.
+    ///
+    /// This is the injection point tests use to reach a loopback server and
+    /// where a `models.json` override will land; the executable passes none.
+    pub base_urls: BTreeMap<String, String>,
     /// Reads piped stdin: `None` when stdin is a terminal or holds only whitespace.
     pub read_stdin: StdinReader,
     /// Asks the user one question (`secret` hides the answer); `None` when input has ended.
@@ -63,7 +64,7 @@ impl std::fmt::Debug for Environment {
             .field("stdin_is_tty", &self.stdin_is_tty)
             .field("stdout_is_tty", &self.stdout_is_tty)
             .field("cwd", &self.cwd)
-            .field("openai_base_url", &self.openai_base_url)
+            .field("base_urls", &self.base_urls)
             .finish_non_exhaustive()
     }
 }
@@ -80,10 +81,13 @@ fn help_text() -> String {
             SessionEventName::all().len()
         ),
         String::new(),
-        "Supported now: --print and --mode json with the openai provider (OPENAI_API_KEY)"
+        "Supported now: --print and --mode json; the read, bash, edit, write, grep, find,"
             .to_owned(),
-        "and CLIProxyAPI (`nyan login cliproxyapi`), the read, bash, edit, write, grep,".to_owned(),
-        "find, and ls tools, sessions, @files, and piped stdin.".to_owned(),
+        "and ls tools; sessions, @files, and piped stdin. Providers (API key from the".to_owned(),
+        "environment, --api-key, or `nyan login <provider>`): CLIProxyAPI, OpenAI, xAI,".to_owned(),
+        "Anthropic, Google, Google Vertex (API key), Mistral, Azure OpenAI, Amazon".to_owned(),
+        "Bedrock, and the OpenAI-compatible providers. Providers that mix wire APIs per".to_owned(),
+        "model (OpenRouter, OpenCode, ...) and OAuth logins are not supported yet.".to_owned(),
         String::new(),
         "Commands:".to_owned(),
         "  login [provider]    Store a login and choose a default model".to_owned(),

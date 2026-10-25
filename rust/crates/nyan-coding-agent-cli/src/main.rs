@@ -4,7 +4,7 @@ use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 
 use nyan_coding_agent_cli::headless::SharedWriter;
-use nyan_coding_agent_cli::run::{Environment, OPENAI_BASE_URL, run};
+use nyan_coding_agent_cli::run::{Environment, run};
 
 /// Piped stdin, trimmed; nothing when stdin is a terminal or empty.
 fn read_piped_stdin() -> Option<String> {
@@ -80,7 +80,7 @@ fn main() {
         stdin_is_tty: std::io::stdin().is_terminal(),
         stdout_is_tty: std::io::stdout().is_terminal(),
         cwd,
-        openai_base_url: OPENAI_BASE_URL.to_owned(),
+        base_urls: std::collections::BTreeMap::new(),
         read_stdin: Box::new(read_piped_stdin),
         prompt: Box::new(prompt_user),
     };

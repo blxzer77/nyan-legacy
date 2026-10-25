@@ -19,12 +19,28 @@ use nyan_coding_agent_provider_http::cpa::{CatalogModel, fetch_catalog, resolve_
 use tokio::runtime::Handle;
 
 use crate::headless::SharedWriter;
+use crate::provider_table::PROVIDERS;
 use crate::providers::{CPA_BASE_URL_SETTING, CPA_PROVIDER, DEFAULT_CPA_BASE_URL, cpa_connection};
 use crate::run::Environment;
 use crate::settings::{DefaultModel, read_default_model, write_default_model};
 
 /// The providers `nyan login` can set up: id and display name.
-pub const LOGIN_PROVIDERS: [(&str, &str); 1] = [(CPA_PROVIDER, "CLIProxyAPI")];
+///
+/// `cliproxyapi` has its own flow (base URL, key, catalog check). Every other
+/// entry stores an API key; Amazon Bedrock is absent because it takes AWS
+/// credentials from the environment, not a key.
+#[must_use]
+pub fn login_providers() -> Vec<(&'static str, &'static str)> {
+    let mut providers = vec![(CPA_PROVIDER, "CLIProxyAPI"), ("azure", "Azure OpenAI")];
+    providers.extend(
+        PROVIDERS
+            .iter()
+            .filter(|def| def.id != "amazon-bedrock")
+            .map(|def| (def.id, def.name)),
+    );
+    providers[2..].sort_by_key(|(id, _)| *id);
+    providers
+}
 
 fn say(writer: &SharedWriter, text: &str) {
     if let Ok(mut writer) = writer.lock() {
@@ -46,10 +62,11 @@ fn ask(env: &Environment, message: &str, secret: bool) -> Result<String, String>
     (env.prompt)(message, secret).ok_or_else(|| "Login cancelled".to_owned())
 }
 
-/// Picks the provider named in `rest`, or asks when there is a choice.
+/// Picks the provider named in `rest`, or asks when none was named.
 fn choose_provider(rest: &[String], env: &Environment) -> Result<&'static str, String> {
+    let providers = login_providers();
     if let Some(name) = rest.first() {
-        return LOGIN_PROVIDERS
+        return providers
             .iter()
             .find(|(id, display)| {
                 id.eq_ignore_ascii_case(name) || display.eq_ignore_ascii_case(name)
@@ -57,8 +74,8 @@ fn choose_provider(rest: &[String], env: &Environment) -> Result<&'static str, S
             .map(|(id, _)| *id)
             .ok_or_else(|| {
                 format!(
-                    "cannot log in to \"{name}\" yet (available: {})",
-                    LOGIN_PROVIDERS
+                    "cannot log in to \"{name}\" (available: {})",
+                    providers
                         .iter()
                         .map(|(id, _)| *id)
                         .collect::<Vec<_>>()
@@ -66,20 +83,21 @@ fn choose_provider(rest: &[String], env: &Environment) -> Result<&'static str, S
                 )
             });
     }
-    let providers: &[(&'static str, &'static str)] = &LOGIN_PROVIDERS;
-    if let [(id, _)] = providers {
-        return Ok(id);
-    }
     let mut menu = String::new();
-    for (index, (_, name)) in LOGIN_PROVIDERS.iter().enumerate() {
-        let _ = writeln!(menu, "  {}) {name}", index + 1);
+    for (index, (_, name)) in providers.iter().enumerate() {
+        let _ = writeln!(menu, "  {:>2}) {name}", index + 1);
     }
     let answer = ask(env, &format!("Choose a provider:\n{menu}> "), false)?;
+    let answer = answer.trim();
     answer
-        .trim()
         .parse::<usize>()
         .ok()
-        .and_then(|number| LOGIN_PROVIDERS.get(number.wrapping_sub(1)))
+        .and_then(|number| providers.get(number.wrapping_sub(1)))
+        .or_else(|| {
+            providers
+                .iter()
+                .find(|(id, _)| id.eq_ignore_ascii_case(answer))
+        })
         .map(|(id, _)| *id)
         .ok_or_else(|| "Login cancelled".to_owned())
 }
@@ -103,9 +121,13 @@ pub fn run_login(
     out: &SharedWriter,
     err: &SharedWriter,
 ) -> i32 {
-    let outcome = choose_provider(rest, env).and_then(|_| {
-        let runtime = runtime()?;
-        login_cpa(env, agent_dir, out, runtime.handle())
+    let outcome = choose_provider(rest, env).and_then(|provider| {
+        if provider == CPA_PROVIDER {
+            let runtime = runtime()?;
+            login_cpa(env, agent_dir, out, runtime.handle())
+        } else {
+            login_api_key(provider, env, agent_dir, out)
+        }
     });
     match outcome {
         Ok(()) => 0,
@@ -114,6 +136,58 @@ pub fn run_login(
             1
         }
     }
+}
+
+/// Stores an API key for a provider that has no catalog endpoint to check it against.
+///
+/// The key is stored as typed: nothing proves it works until a request is made.
+/// The default model is typed too, since this build has no per-provider model list.
+fn login_api_key(
+    provider: &str,
+    env: &Environment,
+    agent_dir: &Path,
+    out: &SharedWriter,
+) -> Result<(), String> {
+    let name = login_providers()
+        .into_iter()
+        .find(|(id, _)| *id == provider)
+        .map_or(provider, |(_, name)| name);
+    let key = ask(env, &format!("{name} API key: "), true)?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("the API key cannot be empty".to_owned());
+    }
+    AuthStore::new(agent_dir)
+        .save_api_key(provider, key, &BTreeMap::new())
+        .map_err(|error| error.to_string())?;
+    say(
+        out,
+        &format!("Stored the {name} API key. It has not been checked against the provider.\n"),
+    );
+    let model = (env.prompt)(
+        &format!("Default model id for {provider} (blank to skip): "),
+        false,
+    )
+    .unwrap_or_default();
+    let model = model.trim();
+    if model.is_empty() {
+        say(
+            out,
+            &format!(
+                "No default model saved; pass --model {provider}/<id> to choose one per run.\n"
+            ),
+        );
+        return Ok(());
+    }
+    write_default_model(
+        agent_dir,
+        &DefaultModel {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        },
+    )?;
+    say(out, &format!("Default model: {provider}/{model}\n"));
+    Ok(())
 }
 
 fn login_cpa(

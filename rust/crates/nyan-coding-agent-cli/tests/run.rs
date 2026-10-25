@@ -94,14 +94,14 @@ fn execute_with_stdin(
     let key = key.map(str::to_owned);
     let environment = Environment {
         var: Box::new(move |name| match name {
-            "OPENAI_API_KEY" => key.clone(),
+            "GROQ_API_KEY" => key.clone(),
             "NYAN_CODING_AGENT_DIR" => Some(agent_dir.clone()),
             _ => None,
         }),
         stdin_is_tty: tty,
         stdout_is_tty: tty,
         cwd,
-        openai_base_url: base_url.to_owned(),
+        base_urls: std::collections::BTreeMap::from([("groq".to_owned(), base_url.to_owned())]),
         read_stdin: Box::new(move || stdin.clone()),
         prompt: Box::new(|_, _| None),
     };
@@ -203,7 +203,7 @@ fn print_mode_prints_the_answer_and_sends_the_credential_and_model() {
     let runtime = Runtime::new().expect("runtime");
     let (address, captured) = serve(&runtime, "200 OK", answer_body());
     let outcome = execute(
-        &["-p", "--model", "openai/gpt-test", "say hi"],
+        &["-p", "--model", "groq/gpt-test", "say hi"],
         &format!("http://{address}/v1"),
         Some("env-key"),
         false,
@@ -239,7 +239,7 @@ fn an_explicit_api_key_flag_overrides_the_environment() {
         &[
             "-p",
             "--provider",
-            "openai",
+            "groq",
             "--model",
             "m",
             "--api-key",
@@ -265,7 +265,7 @@ fn json_mode_streams_the_session_header_and_documented_events() {
     let runtime = Runtime::new().expect("runtime");
     let (address, _) = serve(&runtime, "200 OK", answer_body());
     let outcome = execute(
-        &["--mode", "json", "--model", "openai/m", "hi"],
+        &["--mode", "json", "--model", "groq/m", "hi"],
         &format!("http://{address}/v1"),
         Some("k"),
         true,
@@ -290,7 +290,7 @@ fn json_mode_streams_the_session_header_and_documented_events() {
     let assistant = &end["messages"][1];
     assert_eq!(assistant["role"], "assistant");
     assert_eq!(assistant["content"][0]["text"], "Hello");
-    assert_eq!(assistant["provider"], "openai");
+    assert_eq!(assistant["provider"], "groq");
     assert_eq!(assistant["model"], "m");
     assert_eq!(assistant["stopReason"], "stop");
     assert_eq!(assistant["usage"]["input"], 5);
@@ -306,7 +306,7 @@ fn a_rejected_credential_exits_one_with_the_http_reason_on_stderr() {
         r#"{"error":{"message":"bad key"}}"#.to_owned(),
     );
     let outcome = execute(
-        &["-p", "--model", "openai/m", "hi"],
+        &["-p", "--model", "groq/m", "hi"],
         &format!("http://{address}/v1"),
         Some("wrong"),
         false,
@@ -325,10 +325,10 @@ fn configuration_errors_are_reported_before_any_network_use() {
     let unreachable = "http://127.0.0.1:1/v1";
     let cases: [(&[&str], Option<&str>, i32, &str); 6] = [
         (
-            &["-p", "--model", "openai/m", "hi"],
+            &["-p", "--model", "groq/m", "hi"],
             None,
             1,
-            "no API key for provider \"openai\"",
+            "no API key for provider \"groq\"",
         ),
         (
             &["-p", "hi"],
@@ -349,7 +349,7 @@ fn configuration_errors_are_reported_before_any_network_use() {
             "provider \"other\" is not supported",
         ),
         (
-            &["-p", "--model", "openai/m", "--plan", "hi"],
+            &["-p", "--model", "groq/m", "--plan", "hi"],
             Some("k"),
             1,
             "unknown option --plan",
@@ -422,22 +422,22 @@ fn sse_body(chunks: &[&str]) -> String {
 fn tool_flags_decide_which_tools_the_model_is_offered() {
     let cases: [(&[&str], &[&str]); 4] = [
         (
-            &["-p", "--model", "openai/m", "hi"],
+            &["-p", "--model", "groq/m", "hi"],
             &["read", "bash", "edit", "write"],
         ),
         (
-            &["-p", "--model", "openai/m", "--tools", "ls,grep,find", "hi"],
+            &["-p", "--model", "groq/m", "--tools", "ls,grep,find", "hi"],
             &["grep", "find", "ls"],
         ),
         (
-            &["-p", "--model", "openai/m", "--tools", "+ls,-bash", "hi"],
+            &["-p", "--model", "groq/m", "--tools", "+ls,-bash", "hi"],
             &["read", "edit", "write", "ls"],
         ),
         (
             &[
                 "-p",
                 "--model",
-                "openai/m",
+                "groq/m",
                 "--exclude-tools",
                 "bash,write",
                 "hi",
@@ -467,7 +467,7 @@ fn tool_flags_decide_which_tools_the_model_is_offered() {
     let runtime = Runtime::new().expect("runtime");
     let (address, captured) = serve(&runtime, "200 OK", answer_body());
     let outcome = execute(
-        &["-p", "--model", "openai/m", "--no-tools", "hi"],
+        &["-p", "--model", "groq/m", "--no-tools", "hi"],
         &format!("http://{address}/v1"),
         Some("k"),
         false,
@@ -483,7 +483,7 @@ fn tool_flags_decide_which_tools_the_model_is_offered() {
 #[test]
 fn an_unknown_tool_name_is_rejected_before_any_network_use() {
     let outcome = execute(
-        &["-p", "--model", "openai/m", "--tools", "teleport", "hi"],
+        &["-p", "--model", "groq/m", "--tools", "teleport", "hi"],
         "http://127.0.0.1:1/v1",
         Some("k"),
         false,
@@ -517,7 +517,7 @@ fn a_tool_call_changes_the_workspace_and_its_result_reaches_the_next_request() {
         vec![("200 OK", tool_turn), ("200 OK", answer_body())],
     );
     let outcome = execute_in(
-        &["--mode", "json", "--model", "openai/m", "create the file"],
+        &["--mode", "json", "--model", "groq/m", "create the file"],
         &format!("http://{address}/v1"),
         Some("k"),
         true,
@@ -593,7 +593,7 @@ fn a_bash_tool_call_runs_in_the_workspace_and_a_failure_is_reported_back_to_the_
         vec![("200 OK", tool_turn), ("200 OK", answer_body())],
     );
     let outcome = execute_in(
-        &["-p", "--model", "openai/m", "run it"],
+        &["-p", "--model", "groq/m", "run it"],
         &format!("http://{address}/v1"),
         Some("k"),
         false,
@@ -641,14 +641,17 @@ fn system_prompt_flags_and_project_context_shape_the_first_message() {
         let agent_dir = agent.to_string_lossy().into_owned();
         let environment = Environment {
             var: Box::new(move |name| match name {
-                "OPENAI_API_KEY" => Some("k".to_owned()),
+                "GROQ_API_KEY" => Some("k".to_owned()),
                 "NYAN_CODING_AGENT_DIR" => Some(agent_dir.clone()),
                 _ => None,
             }),
             stdin_is_tty: false,
             stdout_is_tty: false,
             cwd: project.clone(),
-            openai_base_url: format!("http://{address}/v1"),
+            base_urls: std::collections::BTreeMap::from([(
+                "groq".to_owned(),
+                format!("http://{address}/v1"),
+            )]),
             read_stdin: Box::new(|| None),
             prompt: Box::new(|_, _| None),
         };
@@ -663,7 +666,7 @@ fn system_prompt_flags_and_project_context_shape_the_first_message() {
             .to_owned()
     };
 
-    let default = first_message(&["-p", "--model", "openai/m", "hi"]);
+    let default = first_message(&["-p", "--model", "groq/m", "hi"]);
     let global = default
         .find("Global rule: be kind.")
         .expect("global context");
@@ -676,13 +679,13 @@ fn system_prompt_flags_and_project_context_shape_the_first_message() {
     );
     assert!(default.contains("<project_instructions path=\""));
 
-    let without = first_message(&["-p", "--model", "openai/m", "--no-context-files", "hi"]);
+    let without = first_message(&["-p", "--model", "groq/m", "--no-context-files", "hi"]);
     assert!(!without.contains("Project rule") && !without.contains("Global rule"));
 
     let custom = first_message(&[
         "-p",
         "--model",
-        "openai/m",
+        "groq/m",
         "--system-prompt",
         "You are terse.",
         "--append-system-prompt",
@@ -728,11 +731,11 @@ fn a_saved_session_is_continued_with_its_history_and_no_session_saves_nothing() 
         (outcome, captured)
     };
 
-    let (first, _) = run_once(&["-p", "--model", "openai/m", "my name is Ada"]);
+    let (first, _) = run_once(&["-p", "--model", "groq/m", "my name is Ada"]);
     assert_eq!(first.code, 0, "{}", first.stderr);
     assert!(agent.join(SESSION_STORE_DIR).is_dir(), "the run was saved");
 
-    let (second, captured) = run_once(&["-p", "--model", "openai/m", "--continue", "who am I?"]);
+    let (second, captured) = run_once(&["-p", "--model", "groq/m", "--continue", "who am I?"]);
     assert_eq!(second.code, 0, "{}", second.stderr);
     let messages = request_messages(&captured);
     let roles: Vec<&str> = messages
@@ -744,7 +747,7 @@ fn a_saved_session_is_continued_with_its_history_and_no_session_saves_nothing() 
     assert_eq!(messages[2]["content"], "Hello");
     assert_eq!(messages[3]["content"], "who am I?");
 
-    let (third, captured) = run_once(&["-p", "--model", "openai/m", "who am I?"]);
+    let (third, captured) = run_once(&["-p", "--model", "groq/m", "who am I?"]);
     assert_eq!(third.code, 0, "{}", third.stderr);
     assert_eq!(
         request_messages(&captured).len(),
@@ -756,7 +759,7 @@ fn a_saved_session_is_continued_with_its_history_and_no_session_saves_nothing() 
     let runtime = Runtime::new().expect("runtime");
     let (address, _) = serve(&runtime, "200 OK", answer_body());
     let ephemeral = execute_with_agent(
-        &["-p", "--model", "openai/m", "--no-session", "forget me"],
+        &["-p", "--model", "groq/m", "--no-session", "forget me"],
         &format!("http://{address}/v1"),
         Some("k"),
         false,
@@ -786,14 +789,7 @@ fn a_session_whose_previous_run_never_finished_is_refused_not_continued() {
         let runtime = Runtime::new().expect("runtime");
         let (address, _) = serve(&runtime, "200 OK", answer_body());
         let seed = execute_with_agent(
-            &[
-                "-p",
-                "--model",
-                "openai/m",
-                "--session-id",
-                "crashy",
-                "start",
-            ],
+            &["-p", "--model", "groq/m", "--session-id", "crashy", "start"],
             &format!("http://{address}/v1"),
             Some("k"),
             false,
@@ -826,14 +822,7 @@ fn a_session_whose_previous_run_never_finished_is_refused_not_continued() {
     }
 
     let outcome = execute_with_agent(
-        &[
-            "-p",
-            "--model",
-            "openai/m",
-            "--session-id",
-            "crashy",
-            "again",
-        ],
+        &["-p", "--model", "groq/m", "--session-id", "crashy", "again"],
         "http://127.0.0.1:1/v1",
         Some("k"),
         false,
@@ -861,7 +850,7 @@ fn a_session_held_by_another_process_exits_one_before_any_request() {
     let first_runtime = Runtime::new().expect("runtime");
     let (address, _) = serve(&first_runtime, "200 OK", answer_body());
     let seed = execute_with_agent(
-        &["-p", "--model", "openai/m", "--session-id", "busy", "hi"],
+        &["-p", "--model", "groq/m", "--session-id", "busy", "hi"],
         &format!("http://{address}/v1"),
         Some("k"),
         false,
@@ -885,7 +874,7 @@ fn a_session_held_by_another_process_exits_one_before_any_request() {
         .with_extension("lock");
     std::fs::write(&lock, "").expect("create the lock");
     let outcome = execute_with_agent(
-        &["-p", "--model", "openai/m", "--session-id", "busy", "again"],
+        &["-p", "--model", "groq/m", "--session-id", "busy", "again"],
         "http://127.0.0.1:1/v1",
         Some("k"),
         false,
@@ -911,7 +900,7 @@ fn stdin_and_file_arguments_form_the_first_prompt() {
     let runtime = Runtime::new().expect("runtime");
     let (address, captured) = serve(&runtime, "200 OK", answer_body());
     let outcome = execute_with_stdin(
-        &["-p", "--model", "openai/m", "@notes.md", "summarize"],
+        &["-p", "--model", "groq/m", "@notes.md", "summarize"],
         &format!("http://{address}/v1"),
         Some("k"),
         false,
@@ -938,7 +927,7 @@ fn a_missing_file_argument_fails_before_any_request_or_session() {
     let agent = scratch("agent-missing");
     let cwd = scratch("cwd-missing");
     let outcome = execute_with_agent(
-        &["-p", "--model", "openai/m", "@absent.md", "hi"],
+        &["-p", "--model", "groq/m", "@absent.md", "hi"],
         "http://127.0.0.1:1/v1",
         Some("k"),
         false,
