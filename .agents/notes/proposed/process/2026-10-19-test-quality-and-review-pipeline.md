@@ -101,7 +101,7 @@ is no evidence today that the suites of `agent`, `durable`, or `coding-agent` fa
     shown as a pass. Full results go to the run summary, an artifact, and Langfuse.
 29. **The reviewer's access is read-only** to the repository, plus restricted validation commands in a
     sandbox. No write, commit, push, or unrelated network.
-30. **Deployment:** the gateway is an independent long-running service on `nyan-dev-02` (the runner host
+30. **Deployment:** the gateway is an independent long-running service on `nyan-ops` (the runner host
     keeps its CPU for the tests), reachable only on the internal network, one instance restarted by Docker or
     systemd, with a health endpoint and a local outbox. No high availability.
 31. **Langfuse (owner's server) records traces and scores; the repository owns the dataset.** Golden review
@@ -226,7 +226,7 @@ Not decided. Each needs an owner answer before implementation.
 6. **Where review results live while repository Issues are disabled.** Today it is the run summary and a
    30-day artifact: no history, and no reference from a commit.
 7. **Where the gateway's own tests and golden cases run**, since the gateway is outside the repository's CI.
-8. **Whether the OCR dispatch service on `nyan-dev-02` accepts a `background` field and project rules.** The
+8. **Whether the OCR dispatch service on `nyan-ops` accepts a `background` field and project rules.** The
    repository cannot show this; the service's own interface has to be read. Decision 21 depends on it.
 9. **The format and location OCR reads project rules from.** Not inspectable from this repository.
 

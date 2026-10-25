@@ -12,7 +12,7 @@
 # The review is advisory. It opens an issue; it does not comment on a pull request, does not fail a build and is not
 # part of `Merge gate`. A finding blocks something only after a reproduction or a deterministic rule confirms it.
 #
-# Why self-hosted: the dispatch service lives on nyan-dev-02 and its UFW only admits tailscale0, so a GitHub-hosted
+# Why self-hosted: the dispatch service lives on nyan-ops and its UFW only admits tailscale0, so a GitHub-hosted
 # runner cannot reach it. The release workflow runs on hosted runners for the same reason it cannot call this one.
 # Nothing here runs for a pull request, so a fork can never reach this runner.
 #
@@ -23,8 +23,8 @@
 # run is never mistaken for a clean one. The run still counts as reviewed.
 #
 # Secrets needed (repo Settings -> Secrets and variables -> Actions):
-#   OCR_DISPATCH_URL    default http://100.80.19.12:50007/ocr  (tailnet + nginx)
-#   OCR_DISPATCH_TOKEN  must equal /etc/ocr-dispatch.token on dev-02
+#   OCR_DISPATCH_URL    default http://100.80.19.12:50007/ocr  (nyan-ops tailnet address + nginx)
+#   OCR_DISPATCH_TOKEN  must equal /etc/ocr-dispatch.token on nyan-ops
 #
 # The dispatch server holds the model credential. The runner only ships the diff and receives the rendered text.
 

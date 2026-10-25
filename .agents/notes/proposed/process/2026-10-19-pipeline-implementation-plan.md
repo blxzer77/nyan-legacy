@@ -238,7 +238,7 @@ Sub-steps, each with its own tests, because this is new code:
 - 8.3 a per-`review_run_id` ledger and outbox in SQLite; idempotent resume; completed stages not re-called.
 - 8.4 per-profile bounded queues, deadlines, and cancellation of stale commits.
 - 8.5 output validation against the schema from step 1, including the summary's coverage of changed files.
-Deployed on `nyan-dev-02`, one instance, Docker or systemd restart, internal network only. Limits are set after a
+Deployed on `nyan-ops`, one instance, Docker or systemd restart, internal network only. Limits are set after a
 load measurement taken from R2 and R3 traffic.
 Done when: unit tests per sub-step; a kill-and-restart test that resumes without a second model call; an
 outage test that returns `incomplete` and never "no findings".
@@ -268,7 +268,7 @@ Not done, and the reasons are decisions rather than gaps:
 - **Capability probes** are dropped: a candidate that cannot do tool calls is discovered when a caller asks for them.
 - Only one candidate per profile today, so same-tier failover is proven by tests and not yet by configuration.
 
-Open: deploy on `nyan-dev-02` with its own `GATEWAY_TOKEN` and its own upstream credentials — until that exists the
+Open: deploy on `nyan-ops` with its own `GATEWAY_TOKEN` and its own upstream credentials — until that exists the
 isolation is architectural, not real; and point steps 4 and 5 at the profiles, which is what makes them load-bearing.
 
 ### 9. R5: Langfuse and golden cases

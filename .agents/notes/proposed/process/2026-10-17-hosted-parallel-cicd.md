@@ -13,7 +13,7 @@ The quality gate in `ci.yml` takes 22 minutes on a full pull request while 17 of
 - Run `39028721085` (full PR, success) took 22.1 minutes: `policy` 24 s, `prepare` 38 s, the node/bun matrices 13.3 minutes of wall clock, `deep-gate` 7.4 minutes, `gate` 12 s.
 - `.github/quality/policy.json` sets `pullRequest.targetP95Minutes: 10`. The gate misses its own target by more than 2x.
 - Before the matrix split, the same change took 6.4 minutes (run `39029129651`, one vendor job per platform). Splitting into 25 matrix jobs made the pipeline 3.5x slower.
-- `nyan-dev-01` (6 vCPU, 23 GiB) reported `load average: 3.81, 8.92, 11.52` for 1/5/15 minutes while six runner services were busy: 1.9x oversubscribed. Each job starts `vitest` with `maxWorkers = cpus - 1 = 5`, so six concurrent jobs run about 30 worker threads on six cores.
+- `nyan-ci` (6 vCPU, 23 GiB) reported `load average: 3.81, 8.92, 11.52` for 1/5/15 minutes while six runner services were busy: 1.9x oversubscribed. Each job starts `vitest` with `maxWorkers = cpus - 1 = 5`, so six concurrent jobs run about 30 worker threads on six cores.
 
 Three independent causes, in order of size:
 
@@ -32,11 +32,11 @@ queue; the pool is most contended exactly when feedback is most wanted.
 Secondary costs found while measuring:
 
 - **Cache storage is 72% consumed and thrashing.** `gh api repos/blxzer77/nyan/actions/cache/usage` reports `active_caches_size_in_bytes: 7173534654` (7.17 GB) across 74 entries against the 10 GB limit. Almost all of it is `node-cache-<OS>-<arch>-npm-<lockfile sha>`, one entry per pull request because `actions/cache` is branch-scoped and every PR writes its own.
-- **`npm ci` on an already-populated cache is 9.1 s, not 20 s.** Measured on `nyan-dev-01` after `git clone --depth 1`: `added 421 packages in 9s`. The 20 s in CI is cache restore plus network, not extraction.
+- **`npm ci` on an already-populated cache is 9.1 s, not 20 s.** Measured on `nyan-ci` after `git clone --depth 1`: `added 421 packages in 9s`. The 20 s in CI is cache restore plus network, not extraction.
 - **The install output is small enough to ship.** `node_modules` is 438 MB / 23 233 files on Linux; `tar | zstd -3` gives 100 MB and extraction takes 0.79 s. A `node_modules` + `dist` artifact is therefore cheaper than a per-job install.
 - **The apt step is probably unnecessary.** `ci.yml` installs `libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep` in five jobs. The only `canvas` import in the repository is `packages/ai/scripts/generate-test-image.ts`, a one-off generator; `canvas` is otherwise a `devDependencies` entry of `packages/ai` with no importer at test time, and `npm ci` runs with `--ignore-scripts`. Only `fd`/`rg` may matter, and `packages/coding-agent/src/utils/tools-manager.ts` looks both up on `PATH`.
 - **`npm run check` never reads `dist`.** `tsconfig.json` maps every `@ny4n/*` specifier to `packages/*/src`, and `check-entry-graphs.mjs`, `check-architecture-layers.mjs` and `check-ts-relative-imports.mjs` either derive source paths from `exports` or skip `dist`. The `static` job still waits for `prepare` to finish building, which is pure serialization.
-- **GitHub-hosted runners are free for this repository.** `blxzer77/nyan` is public (`gh repo view --json visibility`), and every `/actions/runs/<id>/timing` response reports `total_ms: 0` for UBUNTU, WINDOWS and MACOS, including the 8.7-minute release run `39029131011`. Hosted is about 25% slower per core than `nyan-dev-01` (`npm ci` 20 s vs 9 s, `npm run check` 38 s vs 30 s, `build:offline` 17 s vs 12 s) but it is dedicated and effectively unbounded, which is the trade this design takes.
+- **GitHub-hosted runners are free for this repository.** `blxzer77/nyan` is public (`gh repo view --json visibility`), and every `/actions/runs/<id>/timing` response reports `total_ms: 0` for UBUNTU, WINDOWS and MACOS, including the 8.7-minute release run `39029131011`. Hosted is about 25% slower per core than `nyan-ci` (`npm ci` 20 s vs 9 s, `npm run check` 38 s vs 30 s, `build:offline` 17 s vs 12 s) but it is dedicated and effectively unbounded, which is the trade this design takes.
 
 ## Proposal
 
@@ -60,7 +60,7 @@ Implemented for the pull-request path, with one correction to the original desig
 | native `linux-x64`, release prepare / check / tests / pack / binaries / smoke linux-x64 | self-hosted | `ubuntu-latest` | a release dry run took 9.9 min on the shared host and 5.7 min hosted; see Phase 3 results |
 | npm-audit (daily scan) | self-hosted | `ubuntu-latest` | the same scanners already run hosted in the pull-request path |
 | nightly | self-hosted | self-hosted (decided, not a pull-request path) | matrix widths 2 + 2 + 1 so six vitest pools do not share six cores |
-| OCR review | self-hosted on every PR push | self-hosted in daily and release batches | the dispatch service on `nyan-dev-02` is tailnet-only; `gpt-6.1-sol` at service maximum `high`, advisory |
+| OCR review | self-hosted on every PR push | self-hosted in daily and release batches | the dispatch service on `nyan-ops` is tailnet-only; `gpt-6.1-sol` at service maximum `high`, advisory |
 
 **Correction: nothing urgent runs on the self-hosted pool.** The first attempt kept `prepare`,
 `supply-chain` and `deep-gate` on self-hosted on the theory that warm npm cache, local Docker images
@@ -81,7 +81,7 @@ non-urgent work — nightly suites and the release build — where queueing cann
 Consequence for the fork-PR split: with no pull-request job on self-hosted, the `fork_pr` guards and
 the `head.repo.full_name` runner ternaries protect nothing, so both were deleted.
 
-`nyan-dev-01` keeps its six runner services; they are the target for the nightly and release work.
+`nyan-ci` keeps its six runner services; they are the target for the nightly and release work.
 
 ### Prewarmed workspace instead of per-job install
 
@@ -120,7 +120,7 @@ Every Linux job then replaces setup+install+dist-download (20 s) with:
     - run: tar -xf workspace-linux.tar.zst
 ```
 
-Measured shape: 100 MB zstd archive, 23 233 files, 52 workspace symlinks (`node_modules/@ny4n/* -> ../../packages/*`) preserved by tar, 0.79 s extraction on `nyan-dev-01`. A zstd archive rather than a raw upload matters: upload-artifact's own compression is not worth re-compressing 438 MB of already-compressed content.
+Measured shape: 100 MB zstd archive, 23 233 files, 52 workspace symlinks (`node_modules/@ny4n/* -> ../../packages/*`) preserved by tar, 0.79 s extraction on `nyan-ci`. A zstd archive rather than a raw upload matters: upload-artifact's own compression is not worth re-compressing 438 MB of already-compressed content.
 
 Bun jobs add `oven-sh/setup-bun` (5 s) and keep the same artifact. Windows keeps its own `npm ci` because `node_modules` is platform-specific there.
 
@@ -266,9 +266,9 @@ Per-package jobs today localise a failure by name. Shards lose that. Compensate 
 
 ## Alternatives considered
 
-- **Keep self-hosted and only remove `max-parallel`.** Cheapest change, but 6 runners cap the run at 6 concurrent jobs, so the two-shard-limit becomes a six-runner limit and 28 jobs still take two waves. `nyan-dev-01` stays at ~2x CPU and the 74-entry cache problem stays.
-- **Raise the runner count on `nyan-dev-01`.** The host is 6 vCPU/23 GiB. More runner services increase oversubscription; it cannot be fixed by concurrency settings alone.
-- **Add `nyan-dev-03` (2 vCPU, 7 GiB, idle) as a runner.** Useful only for native arm64-style builds; 2 vCPU cannot take a `coding-agent` shard without becoming the new critical path.
+- **Keep self-hosted and only remove `max-parallel`.** Cheapest change, but 6 runners cap the run at 6 concurrent jobs, so the two-shard-limit becomes a six-runner limit and 28 jobs still take two waves. `nyan-ci` stays at ~2x CPU and the 74-entry cache problem stays.
+- **Raise the runner count on `nyan-ci`.** The host is 6 vCPU/23 GiB. More runner services increase oversubscription; it cannot be fixed by concurrency settings alone.
+- **Add `nyan-temp` (2 vCPU, 7 GiB, idle) as a runner.** Useful only for native arm64-style builds; 2 vCPU cannot take a `coding-agent` shard without becoming the new critical path.
 - **Aggregate all packages into one vitest `projects` run.** Measured: 47 s for eight packages and 908 tests, but 5 tests fail from CPU contention that pass in isolation. Also collapses per-package failure isolation. Rejected in favour of sequential small-package grouping plus weighted shards.
 - **Bake a `ghcr.io/blxzer77/nyan-ci` container image with node, bun, and system libraries.** Removes `setup-node` (5 s) and apt entirely, but adds an image build/publish/rotation workflow and a registry credential for a 5 s gain over the workspace artifact. Reconsider only if the apt step turns out to be required.
 - **Use `actions/cache` for `node_modules` instead of an artifact.** Same effect, but cache entries are branch-scoped and capped at 10 GB, which is the failure already observed at 7.17 GB / 74 entries. Artifacts are run-scoped and expire.
@@ -278,8 +278,8 @@ Per-package jobs today localise a failure by name. Shards lose that. Compensate 
 
 ## Consequences
 
-- Ordinary PR feedback drops from 22 minutes to about 3, p95 4, and no CI work runs on `nyan-dev-01`. The 6-vCPU host stops being a single point of failure for the whole repository.
-- The pipeline loses warm-runner locality: hosted per-core throughput is about 25% behind `nyan-dev-01`, and every job pays a 3-5 s checkout and toolcache link. That is repaid by dedicated cores and by removing 17 jobs' worth of install.
+- Ordinary PR feedback drops from 22 minutes to about 3, p95 4, and no CI work runs on `nyan-ci`. The 6-vCPU host stops being a single point of failure for the whole repository.
+- The pipeline loses warm-runner locality: hosted per-core throughput is about 25% behind `nyan-ci`, and every job pays a 3-5 s checkout and toolcache link. That is repaid by dedicated cores and by removing 17 jobs' worth of install.
 - The workspace artifact makes test jobs depend on `prepare` having succeeded. A `prepare` failure now blocks every test job at once instead of failing one vendor job; the fail-closed gate reports it as one reason.
 - Weight-based shard groups are a maintained list. When a suite's slowest files change, the balance degrades silently until someone re-measures. Mitigation: keep the profile generator and re-measure quarterly, or accept `--shard` round-robin as the fallback when weights are older than the last 30 commits.
 - Deleting the fork-PR guards removes code paths that no longer have a purpose. It also means a fork PR now runs the same jobs as an internal one, which is only safe because no self-hosted runner is involved. This must not be reverted while self-hosted runners are still registered.
@@ -292,8 +292,8 @@ Per-package jobs today localise a failure by name. Shards lose that. Compensate 
 
 - `gh run list --workflow=ci.yml` plus `/actions/runs/<id>/jobs` for runs `39028721085`, `39029129651`, `39028540637`, `39030387971`, `39030398500`: per-job and per-step durations, 22.1 min full-PR baseline, 6.4 min pre-matrix baseline, 12.7 min worst queue.
 - `/actions/runs/<id>/timing` for `39029131011`, `38660834853`, `39029129651`, `39028540637`: `total_ms: 0` for UBUNTU/WINDOWS/MACOS. `gh repo view --json visibility` reports `PUBLIC`.
-- `ssh nyan-dev-01`: `nproc 6`, 23 GiB, `load average: 3.81, 8.92, 11.52`, six `actions.runner.*` services, `/root/.npm` 151 MB.
-- `git clone --depth 1` on `nyan-dev-01`: `npm ci --ignore-scripts` 9.1 s, `node_modules` 438 MB / 23 233 files, `tar | zstd -3` 100 MB, extraction 0.79 s, 52 workspace symlinks preserved.
+- `ssh nyan-ci`: `nproc 6`, 23 GiB, `load average: 3.81, 8.92, 11.52`, six `actions.runner.*` services, `/root/.npm` 151 MB.
+- `git clone --depth 1` on `nyan-ci`: `npm ci --ignore-scripts` 9.1 s, `node_modules` 438 MB / 23 233 files, `tar | zstd -3` 100 MB, extraction 0.79 s, 52 workspace symlinks preserved.
 - `packages/coding-agent`: full 184 s, `--shard=1/2` 109 s, `1/4` 84.8 s, `1/8` 79 s. `packages/durable`: `1/2` 37 s, `1/3` 24 s. JSON reporter profiles: coding-agent 317 files / 903 s, durable 64 files / 748 s.
 - `npm test -- --shard=1/20` in `packages/coding-agent` ran all 317 files, confirming the flag is swallowed by the npm wrapper.
 - Eight-package `projects` probe: 51 files, 908 tests, 47 s, 5 failures that pass when run alone (`packages/codemode/test/sandbox.test.ts`, `packages/chord/test/state-fuzz.test.ts` and others).
@@ -483,7 +483,7 @@ OCR now runs in daily and pre-release batches, using `gpt-6.1-sol` at the dispat
 
 Owner actions that are not workflow edits:
 
-- Rotate the GitHub PAT found in plaintext in `/root/.npmrc` on `nyan-dev-01` (`//npm.pkg.github.com:_authToken=ghp_...`). Every self-hosted runner on that host can read it, and it will outlive this migration.
+- Rotate the GitHub PAT found in plaintext in `/root/.npmrc` on `nyan-ci` (`//npm.pkg.github.com:_authToken=ghp_...`). Every self-hosted runner on that host can read it, and it will outlive this migration.
 - Confirm the plan's concurrent-job limit in Settings -> Billing -> Actions, and record it in `policy.json`.
 - ~~Decide whether branch protection requires `Merge gate` alone or plus `Policy and impact`~~: `Merge gate` alone is set on `main` (strict, applies to admins, no force push, no deletion).
 - Decide whether to remove the six `nyan` self-hosted runner services. Nothing on a pull-request path uses them now; nightly and OCR still do. The original proposal was a one-week window first.
