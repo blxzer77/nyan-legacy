@@ -31,18 +31,12 @@ use nyan_coding_agent_models::table::PROVIDERS;
 /// The providers `nyan login` can set up: id and display name.
 ///
 /// `cliproxyapi` has its own flow (base URL, key, catalog check). Every other
-/// entry stores an API key; Amazon Bedrock is absent because it takes AWS
-/// credentials from the environment, not a key.
+/// entry stores an API key.
 #[must_use]
 pub fn login_providers() -> Vec<(&'static str, &'static str)> {
-    let mut providers = vec![(CPA_PROVIDER, "CLIProxyAPI"), ("azure", "Azure OpenAI")];
-    providers.extend(
-        PROVIDERS
-            .iter()
-            .filter(|def| def.id != "amazon-bedrock")
-            .map(|def| (def.id, def.name)),
-    );
-    providers[2..].sort_by_key(|(id, _)| *id);
+    let mut providers = vec![(CPA_PROVIDER, "CLIProxyAPI")];
+    providers.extend(PROVIDERS.iter().map(|def| (def.id, def.name)));
+    providers[1..].sort_by_key(|(id, _)| *id);
     providers
 }
 

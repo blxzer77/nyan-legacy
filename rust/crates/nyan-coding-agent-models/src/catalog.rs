@@ -62,10 +62,6 @@ pub struct CatalogModel {
 enum Rule {
     /// The provider's row in [`crate::table`] gives the API and base URL.
     Table,
-    /// `OpenAI`'s models, re-labelled for Azure.
-    AzureFromOpenAi,
-    /// Bedrock: a few ids are skipped and `eu.` ids use the Frankfurt endpoint.
-    Bedrock,
     /// Gemini models only.
     VertexGemini,
     /// The wire API follows the models.dev `provider.npm` field.
@@ -74,8 +70,6 @@ enum Rule {
     CloudflareGateway,
     /// `glm-` and `kimi-k3` use chat completions, the rest Anthropic Messages.
     Fireworks,
-    /// Version aliases collapse into `kimi-for-coding`.
-    KimiCoding,
 }
 
 struct Source {
@@ -102,18 +96,8 @@ const fn aliased(provider: &'static str, dev_keys: &'static [&'static str]) -> S
 
 /// Every provider the catalog can list, in the order it lists them.
 const SOURCES: &[Source] = &[
-    Source {
-        provider: "amazon-bedrock",
-        dev_keys: &[],
-        rule: Rule::Bedrock,
-    },
     table("anthropic"),
     table("openai"),
-    Source {
-        provider: "azure",
-        dev_keys: &["openai"],
-        rule: Rule::AzureFromOpenAi,
-    },
     table("groq"),
     table("cerebras"),
     table("cloudflare-workers-ai"),
@@ -123,8 +107,6 @@ const SOURCES: &[Source] = &[
         rule: Rule::CloudflareGateway,
     },
     table("xai"),
-    table("meta"),
-    table("mistral"),
     table("huggingface"),
     Source {
         provider: "fireworks",
@@ -147,13 +129,6 @@ const SOURCES: &[Source] = &[
         provider: "google-vertex",
         dev_keys: &[],
         rule: Rule::VertexGemini,
-    },
-    table("minimax"),
-    table("minimax-cn"),
-    Source {
-        provider: "kimi-coding",
-        dev_keys: &["kimi-code-plan-global"],
-        rule: Rule::KimiCoding,
     },
     table("moonshotai"),
     table("moonshotai-cn"),
@@ -269,37 +244,11 @@ pub fn build(providers: &Map<String, Value>) -> Vec<CatalogModel> {
         } else {
             source.dev_keys.to_vec()
         };
-        match source.rule {
-            Rule::AzureFromOpenAi => {
-                let openai: Vec<CatalogModel> = catalog
-                    .iter()
-                    .filter(|model| model.provider == "openai")
-                    .cloned()
-                    .collect();
-                catalog.extend(openai.into_iter().map(azure_model));
-            }
-            rule => {
-                if let Some(models) = models_of(providers, &keys) {
-                    catalog.extend(models_for(source.provider, rule, models));
-                }
-            }
+        if let Some(models) = models_of(providers, &keys) {
+            catalog.extend(models_for(source.provider, source.rule, models));
         }
     }
     catalog
-}
-
-fn azure_model(mut model: CatalogModel) -> CatalogModel {
-    "azure".clone_into(&mut model.provider);
-    model.api = WireApi::AzureOpenAiResponses;
-    model.base_url = String::new();
-    // Azure serves some models with a larger window than OpenAI's own listing.
-    if matches!(
-        model.id.as_str(),
-        "gpt-5.4" | "gpt-5.5" | "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra"
-    ) {
-        model.context_window = 1_050_000;
-    }
-    model
 }
 
 fn models_for(provider: &str, rule: Rule, models: &Map<String, Value>) -> Vec<CatalogModel> {
@@ -310,13 +259,10 @@ fn models_for(provider: &str, rule: Rule, models: &Map<String, Value>) -> Vec<Ca
         }
         let built = match rule {
             Rule::Table => table_model(provider, id, model, models),
-            Rule::Bedrock => bedrock_model(id, model),
             Rule::VertexGemini => vertex_model(id, model, models),
             Rule::Opencode(base_path) => Some(opencode_model(provider, base_path, id, model)),
             Rule::CloudflareGateway => cloudflare_gateway_model(id, model),
             Rule::Fireworks => Some(fireworks_model(id, model)),
-            Rule::KimiCoding => kimi_model(id, model, models),
-            Rule::AzureFromOpenAi => None,
         };
         out.extend(built);
     }
@@ -358,31 +304,7 @@ fn table_model(
     };
     let mut built = base_model(provider, id, source, api, base_url);
     built.name = base_model(provider, id, model, api, base_url).name;
-    if provider == "mistral" && model.pointer("/cost/cache_read").is_none() {
-        built.cost.cache_read = (built.cost.input * 0.1 * 1e6).round() / 1e6;
-    }
     Some(built)
-}
-
-fn bedrock_model(id: &str, model: &Value) -> Option<CatalogModel> {
-    if id == "anthropic.claude-opus-5"
-        || id.starts_with("ai21.jamba")
-        || id.starts_with("mistral.mistral-7b-instruct-v0")
-    {
-        return None;
-    }
-    let base_url = if id.starts_with("eu.") {
-        "https://bedrock-runtime.eu-central-1.amazonaws.com"
-    } else {
-        "https://bedrock-runtime.us-east-1.amazonaws.com"
-    };
-    Some(base_model(
-        "amazon-bedrock",
-        id,
-        model,
-        WireApi::BedrockConverse,
-        base_url,
-    ))
 }
 
 fn vertex_model(id: &str, model: &Value, all: &Map<String, Value>) -> Option<CatalogModel> {
@@ -472,20 +394,6 @@ fn fireworks_model(id: &str, model: &Value) -> CatalogModel {
             "https://api.fireworks.ai/inference",
         )
     }
-}
-
-fn kimi_model(id: &str, model: &Value, all: &Map<String, Value>) -> Option<CatalogModel> {
-    let alias = matches!(id, "k2p5" | "k2p6" | "k2p7");
-    if alias && all.contains_key("kimi-for-coding") {
-        return None;
-    }
-    let (api, base_url) = table_row("kimi-coding")?;
-    let mut built = base_model("kimi-coding", id, model, api, base_url);
-    if alias {
-        "kimi-for-coding".clone_into(&mut built.id);
-        "Kimi For Coding".clone_into(&mut built.name);
-    }
-    Some(built)
 }
 
 /// A built catalog with lookups.

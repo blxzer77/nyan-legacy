@@ -2,7 +2,7 @@
 //!
 //! A provider is one row of the generated table in [`crate::provider_table`]
 //! (one wire API for all its models), `cliproxyapi`, or one of the providers
-//! that need their own settings: `azure`, `amazon-bedrock`, `google-vertex`.
+//! that need their own settings: `google-vertex`.
 //!
 //! The API key comes from `--api-key`, then the provider's environment
 //! variables, then the key stored by `nyan login`. `cliproxyapi` also stores a
@@ -13,18 +13,15 @@
 //! refused rather than guessed: picking the API needs the per-model catalog,
 //! which this build does not have.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use nyan_coding_agent_auth::{ApiKeyCredential, AuthStore, Credential};
 use nyan_coding_agent_core::CoreError;
 use nyan_coding_agent_provider::{ModelProvider, ProviderError, ProviderModel, ProviderRegistry};
-use nyan_coding_agent_provider_http::bedrock::{BedrockAuth, BedrockConverseProvider};
 use nyan_coding_agent_provider_http::cpa::{Endpoints, resolve_endpoints};
-use nyan_coding_agent_provider_http::sigv4::AwsCredentials;
 use nyan_coding_agent_provider_http::{
     AnthropicMessagesProvider, GoogleGenerativeAiProvider, GoogleVertexProvider,
-    MistralConversationsProvider, OpenAiChatProvider, OpenAiResponsesProvider, VertexAuth,
+    OpenAiChatProvider, OpenAiResponsesProvider, VertexAuth,
 };
 use tokio::runtime::Handle;
 
@@ -63,17 +60,6 @@ pub enum ProviderSetup {
         /// API key.
         api_key: String,
     },
-    /// Azure `OpenAI` Responses.
-    Azure {
-        /// The resource's base URL.
-        base_url: String,
-        /// API key.
-        api_key: String,
-        /// The `api-version` query value.
-        api_version: String,
-        /// Model id to deployment name.
-        deployments: BTreeMap<String, String>,
-    },
     /// Anthropic Messages.
     Anthropic {
         /// Endpoint root.
@@ -96,22 +82,6 @@ pub enum ProviderSetup {
         base_url: String,
         /// Authentication.
         auth: VertexAuth,
-    },
-    /// Mistral Conversations.
-    Mistral {
-        /// Endpoint root.
-        base_url: String,
-        /// API key.
-        api_key: String,
-    },
-    /// Amazon Bedrock.
-    Bedrock {
-        /// AWS region.
-        region: String,
-        /// Authentication.
-        auth: BedrockAuth,
-        /// A replacement endpoint (scheme and authority), for tests and gateways.
-        endpoint: Option<String>,
     },
 }
 
@@ -182,7 +152,7 @@ pub fn cpa_connection(
 #[must_use]
 pub fn supported_providers() -> Vec<&'static str> {
     let mut ids: Vec<&'static str> = PROVIDERS.iter().map(|def| def.id).collect();
-    ids.extend([CPA_PROVIDER, "azure"]);
+    ids.push(CPA_PROVIDER);
     ids.sort_unstable();
     ids
 }
@@ -264,64 +234,6 @@ fn base_url_for(def: &ProviderDef, env: &Environment, store: &AuthStore) -> Resu
     expand_template(template, def.id, env, store)
 }
 
-fn azure_setup(args: &Args, env: &Environment, store: &AuthStore) -> Result<ProviderSetup, String> {
-    let api_key = api_key_for("azure", &["AZURE_OPENAI_API_KEY"], args, env, store)?;
-    let base_url = env
-        .base_urls
-        .get("azure")
-        .cloned()
-        .or_else(|| env_value(env, "AZURE_OPENAI_BASE_URL"))
-        .or_else(|| {
-            env_value(env, "AZURE_OPENAI_RESOURCE_NAME")
-                .map(|name| format!("https://{name}.openai.azure.com/openai/v1"))
-        })
-        .ok_or_else(|| {
-            "Azure OpenAI base URL is required: set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME".to_owned()
-        })?;
-    let deployments = env_value(env, "AZURE_OPENAI_DEPLOYMENT_NAME_MAP")
-        .map(|map| {
-            map.split(',')
-                .filter_map(|entry| entry.trim().split_once('='))
-                .filter(|(model, deployment)| !model.is_empty() && !deployment.is_empty())
-                .map(|(model, deployment)| (model.trim().to_owned(), deployment.trim().to_owned()))
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(ProviderSetup::Azure {
-        base_url,
-        api_key,
-        api_version: env_value(env, "AZURE_OPENAI_API_VERSION").unwrap_or_else(|| "v1".to_owned()),
-        deployments,
-    })
-}
-
-fn bedrock_setup(env: &Environment) -> Result<ProviderSetup, String> {
-    let region = env_value(env, "AWS_REGION")
-        .or_else(|| env_value(env, "AWS_DEFAULT_REGION"))
-        .ok_or_else(|| {
-            "no AWS region for amazon-bedrock: set AWS_REGION (or AWS_DEFAULT_REGION)".to_owned()
-        })?;
-    let auth = if let Some(token) = env_value(env, "AWS_BEARER_TOKEN_BEDROCK") {
-        BedrockAuth::Bearer(token)
-    } else if let (Some(access_key_id), Some(secret_access_key)) = (
-        env_value(env, "AWS_ACCESS_KEY_ID"),
-        env_value(env, "AWS_SECRET_ACCESS_KEY"),
-    ) {
-        BedrockAuth::Sigv4(AwsCredentials {
-            access_key_id,
-            secret_access_key,
-            session_token: env_value(env, "AWS_SESSION_TOKEN"),
-        })
-    } else {
-        return Err("no credentials for amazon-bedrock: set AWS_BEARER_TOKEN_BEDROCK, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (named profiles, ECS and IRSA roles, and SSO are not supported yet)".to_owned());
-    };
-    Ok(ProviderSetup::Bedrock {
-        region,
-        auth,
-        endpoint: env.base_urls.get("amazon-bedrock").cloned(),
-    })
-}
-
 fn vertex_setup(
     args: &Args,
     env: &Environment,
@@ -397,8 +309,6 @@ pub fn resolve_provider(
                 api_key: connection.api_key,
             }))
         }
-        "azure" => azure_setup(args, env, &store).map(resolved),
-        "amazon-bedrock" => bedrock_setup(env).map(resolved),
         "google-vertex" => vertex_setup(args, env, &store).map(resolved),
         _ => {
             if let Some(def) = provider_def(provider) {
@@ -468,8 +378,7 @@ fn setup_for_api(
             max_tokens,
         },
         Api::GoogleGenerativeAi => ProviderSetup::Google { base_url, api_key },
-        Api::MistralConversations => ProviderSetup::Mistral { base_url, api_key },
-        Api::AzureOpenAiResponses | Api::GoogleVertex | Api::BedrockConverse => {
+        Api::GoogleVertex => {
             return Err("this provider needs its own settings".to_owned());
         }
     })
@@ -520,8 +429,6 @@ pub fn credential_available(provider: &str, env: &Environment, agent_dir: &Path)
     let no_flags = crate::args::parse_args(&[]);
     match provider {
         CPA_PROVIDER => cpa_connection(None, env, agent_dir).is_ok(),
-        "azure" => azure_setup(&no_flags, env, &store).is_ok(),
-        "amazon-bedrock" => bedrock_setup(env).is_ok(),
         "google-vertex" => vertex_setup(&no_flags, env, &store).is_ok(),
         other => {
             let env_keys: &[&str] = if other == "anthropic" {
@@ -626,15 +533,6 @@ pub fn build_provider(
             ProviderSetup::OpenAiResponses { base_url, api_key } => Box::new(
                 OpenAiResponsesProvider::new(id, base_url, Some(api_key), handle)?,
             ),
-            ProviderSetup::Azure {
-                base_url,
-                api_key,
-                api_version,
-                deployments,
-            } => Box::new(
-                OpenAiResponsesProvider::azure(id, &base_url, Some(api_key), &api_version, handle)?
-                    .with_deployments(deployments),
-            ),
             ProviderSetup::Anthropic {
                 base_url,
                 api_key,
@@ -651,20 +549,6 @@ pub fn build_provider(
             ),
             ProviderSetup::Vertex { base_url, auth } => {
                 Box::new(GoogleVertexProvider::new(id, base_url, Some(auth), handle)?)
-            }
-            ProviderSetup::Mistral { base_url, api_key } => Box::new(
-                MistralConversationsProvider::new(id, base_url, Some(api_key), handle)?,
-            ),
-            ProviderSetup::Bedrock {
-                region,
-                auth,
-                endpoint,
-            } => {
-                let provider = BedrockConverseProvider::new(id, region, auth, handle)?;
-                Box::new(match endpoint {
-                    Some(endpoint) => provider.with_endpoint(endpoint),
-                    None => provider,
-                })
             }
         };
     Ok(SingleProvider(provider))
@@ -708,44 +592,9 @@ mod tests {
     }
 
     #[test]
-    fn an_azure_resource_name_expands_to_its_public_openai_v1_endpoint() {
-        let Ok(ProviderSetup::Azure {
-            base_url,
-            api_version,
-            ..
-        }) = resolve(
-            "azure",
-            &[
-                ("AZURE_OPENAI_API_KEY", "k"),
-                ("AZURE_OPENAI_RESOURCE_NAME", "myres"),
-            ],
-        )
-        else {
-            panic!("azure must resolve");
-        };
-        assert_eq!(base_url, "https://myres.openai.azure.com/openai/v1");
-        assert_eq!(api_version, "v1");
-    }
-
-    #[test]
-    fn an_explicit_azure_base_url_beats_the_resource_name() {
-        let Ok(ProviderSetup::Azure { base_url, .. }) = resolve(
-            "azure",
-            &[
-                ("AZURE_OPENAI_API_KEY", "k"),
-                ("AZURE_OPENAI_RESOURCE_NAME", "myres"),
-                ("AZURE_OPENAI_BASE_URL", "https://gateway.example.com/azure"),
-            ],
-        ) else {
-            panic!("azure must resolve");
-        };
-        assert_eq!(base_url, "https://gateway.example.com/azure");
-    }
-
-    #[test]
     fn every_generated_provider_resolves_with_its_documented_environment_key() {
         for def in nyan_coding_agent_models::table::PROVIDERS {
-            if matches!(def.id, "amazon-bedrock" | "google-vertex") {
+            if def.id == "google-vertex" {
                 continue;
             }
             let key = if def.id == "anthropic" {
@@ -763,8 +612,7 @@ mod tests {
             | ProviderSetup::Anthropic {
                 base_url, api_key, ..
             }
-            | ProviderSetup::Google { base_url, api_key }
-            | ProviderSetup::Mistral { base_url, api_key }) = setup
+            | ProviderSetup::Google { base_url, api_key }) = setup
             else {
                 panic!("{}: unexpected setup", def.id);
             };

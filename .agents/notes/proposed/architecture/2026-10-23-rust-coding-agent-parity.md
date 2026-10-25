@@ -127,3 +127,7 @@ Decision #47: `reqwest` with rustls on `tokio`, tokio confined to the network cr
 ### RS6 to RS8
 
 Not started.
+
+### Provider scope (decision #53, 2026-10-23)
+
+The owner narrowed provider support: `meta`, `azure`, `minimax`, `minimax-cn`, `kimi-coding`, `vercel-ai-gateway`, `mistral`, and `amazon-bedrock` are out of scope and unknown to the CLI, and `opencode-go` and `openai-codex` are required. The Azure, Bedrock, `SigV4`, event-stream, and Mistral code in `nyan-coding-agent-provider-http` is no longer reachable from the CLI and is kept only until the owner decides whether to delete it; statements above about those providers describe that code, not the CLI.

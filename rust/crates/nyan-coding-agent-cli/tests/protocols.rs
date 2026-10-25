@@ -4,7 +4,6 @@
 
 use std::fmt::Write as _;
 
-use nyan_coding_agent_provider_http::eventstream::crc32;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
@@ -29,34 +28,6 @@ fn named_sse(events: &[Value]) -> Vec<u8> {
         );
     }
     text.into_bytes()
-}
-
-fn frame(kind: &str, payload: &Value) -> Vec<u8> {
-    let headers = [(":message-type", "event"), (":event-type", kind)];
-    let mut header_bytes = Vec::new();
-    for (name, value) in headers {
-        header_bytes.push(u8::try_from(name.len()).expect("short"));
-        header_bytes.extend_from_slice(name.as_bytes());
-        header_bytes.push(7);
-        header_bytes.extend_from_slice(&u16::try_from(value.len()).expect("short").to_be_bytes());
-        header_bytes.extend_from_slice(value.as_bytes());
-    }
-    let payload = payload.to_string();
-    let total = 12 + header_bytes.len() + payload.len() + 4;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&u32::try_from(total).expect("size").to_be_bytes());
-    bytes.extend_from_slice(
-        &u32::try_from(header_bytes.len())
-            .expect("size")
-            .to_be_bytes(),
-    );
-    let prelude = crc32(&bytes);
-    bytes.extend_from_slice(&prelude.to_be_bytes());
-    bytes.extend_from_slice(&header_bytes);
-    bytes.extend_from_slice(payload.as_bytes());
-    let message = crc32(&bytes);
-    bytes.extend_from_slice(&message.to_be_bytes());
-    bytes
 }
 
 fn responses_reply() -> Vec<u8> {
@@ -90,15 +61,6 @@ fn chat_reply() -> Vec<u8> {
         .collect()
 }
 
-fn bedrock_reply() -> Vec<u8> {
-    let mut bytes = frame(
-        "contentBlockDelta",
-        &json!({"contentBlockIndex": 0, "delta": {"text": "Hi"}}),
-    );
-    bytes.extend(frame("messageStop", &json!({"stopReason": "end_turn"})));
-    bytes
-}
-
 struct Case {
     name: &'static str,
     model: &'static str,
@@ -117,21 +79,15 @@ fn run_case(case: &Case) -> Value {
     let server = stub(&runtime, case.content_type, case.reply.clone());
     let home = Home::new(case.name);
     let url = format!("http://{}", server.address);
-    let mut env = case.env.clone();
-    let bedrock_url;
+    let env = case.env.clone();
     if let Some(route) = case.route {
         let base = match route {
             "google" => format!("{url}/v1beta"),
             "google-vertex" => format!("{url}/v1/publishers/google"),
-            "azure" => format!("{url}/openai/v1"),
-            "amazon-bedrock" | "anthropic" | "mistral" => url.clone(),
+            "anthropic" => url.clone(),
             _ => format!("{url}/v1"),
         };
         home.route(route, &base);
-    }
-    if case.name == "azure" {
-        bedrock_url = format!("{url}/openai/v1");
-        env.push(("AZURE_OPENAI_BASE_URL", &bedrock_url));
     }
     let outcome = home.go(
         &["-p", "--no-session", "--model", case.model, "say hi"],
@@ -199,18 +155,6 @@ fn every_protocol_reaches_its_endpoint_with_its_own_auth_and_request_shape() {
     assert_eq!(google["contents"][0]["role"], "user");
     assert!(google["systemInstruction"]["parts"][0]["text"].is_string());
 
-    let mistral = run_case(&Case {
-        name: "mistral",
-        model: "mistral/mistral-x",
-        env: vec![("MISTRAL_API_KEY", "mis-key")],
-        route: Some("mistral"),
-        content_type: "text/event-stream",
-        reply: chat_reply(),
-        path_prefix: "POST /v1/chat/completions",
-        header: "authorization: bearer mis-key",
-    });
-    assert_eq!(mistral["messages"][0]["role"], "system");
-
     let groq = run_case(&Case {
         name: "groq",
         model: "groq/llama-x",
@@ -225,26 +169,7 @@ fn every_protocol_reaches_its_endpoint_with_its_own_auth_and_request_shape() {
 }
 
 #[test]
-fn azure_vertex_and_bedrock_reach_their_endpoints_with_their_own_auth() {
-    let azure = run_case(&Case {
-        name: "azure",
-        model: "azure/gpt-x",
-        env: vec![
-            ("AZURE_OPENAI_API_KEY", "az-key"),
-            (
-                "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
-                "gpt-x=prod-gpt, other=o",
-            ),
-            ("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
-        ],
-        route: None,
-        content_type: "text/event-stream",
-        reply: responses_reply(),
-        path_prefix: "POST /openai/v1/responses?api-version=2025-04-01-preview",
-        header: "api-key: az-key",
-    });
-    assert_eq!(azure["model"], "prod-gpt");
-
+fn vertex_reaches_its_endpoint_with_its_own_auth() {
     let vertex = run_case(&Case {
         name: "google-vertex",
         model: "google-vertex/gemini-x",
@@ -256,79 +181,6 @@ fn azure_vertex_and_bedrock_reach_their_endpoints_with_their_own_auth() {
         header: "x-goog-api-key: vx-key",
     });
     assert_eq!(vertex["contents"][0]["role"], "user");
-
-    let bedrock = run_case(&Case {
-        name: "amazon-bedrock",
-        model: "amazon-bedrock/anthropic.claude-x:0",
-        env: vec![
-            ("AWS_REGION", "us-west-2"),
-            ("AWS_BEARER_TOKEN_BEDROCK", "bk-token"),
-        ],
-        route: Some("amazon-bedrock"),
-        content_type: "application/vnd.amazon.eventstream",
-        reply: bedrock_reply(),
-        path_prefix: "POST /model/anthropic.claude-x%3A0/converse-stream",
-        header: "authorization: bearer bk-token",
-    });
-    assert_eq!(bedrock["messages"][0]["role"], "user");
-    assert!(bedrock["system"][0]["text"].is_string());
-}
-
-#[test]
-fn bedrock_with_iam_keys_signs_the_request_and_without_credentials_says_what_is_missing() {
-    let runtime = Runtime::new().expect("runtime");
-    let server = stub(
-        &runtime,
-        "application/vnd.amazon.eventstream",
-        bedrock_reply(),
-    );
-    let home = Home::new("bedrock-iam");
-    home.route("amazon-bedrock", &format!("http://{}", server.address));
-    let env = [
-        ("AWS_REGION", "eu-central-1"),
-        ("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE"),
-        ("AWS_SECRET_ACCESS_KEY", "secret"),
-        ("AWS_SESSION_TOKEN", "tok"),
-    ];
-    let outcome = home.go(
-        &["-p", "--no-session", "--model", "amazon-bedrock/m", "hi"],
-        &env,
-        &[],
-    );
-    assert_eq!(outcome.code, 0, "{}", outcome.stderr);
-    let request = server.requests.lock().expect("lock")[0].to_ascii_lowercase();
-    assert!(
-        request.contains("authorization: aws4-hmac-sha256 credential=akidexample/"),
-        "{request}"
-    );
-    assert!(
-        request.contains("/eu-central-1/bedrock/aws4_request"),
-        "{request}"
-    );
-    assert!(request.contains("x-amz-security-token: tok"), "{request}");
-
-    let no_region = home.go(
-        &["-p", "--no-session", "--model", "amazon-bedrock/m", "hi"],
-        &[],
-        &[],
-    );
-    assert_eq!(
-        no_region.stderr,
-        "Error: no AWS region for amazon-bedrock: set AWS_REGION (or AWS_DEFAULT_REGION)\n"
-    );
-    let no_creds = home.go(
-        &["-p", "--no-session", "--model", "amazon-bedrock/m", "hi"],
-        &[("AWS_REGION", "us-east-1")],
-        &[],
-    );
-    assert!(
-        no_creds.stderr.contains(
-            "set AWS_BEARER_TOKEN_BEDROCK, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-        ),
-        "{}",
-        no_creds.stderr
-    );
-    home.cleanup();
 }
 
 #[test]
@@ -370,7 +222,9 @@ fn providers_that_cannot_be_called_correctly_are_refused_with_the_reason() {
     assert!(
         unknown.contains("anthropic")
             && unknown.contains("cliproxyapi")
-            && unknown.contains("amazon-bedrock"),
+            && !unknown.contains("amazon-bedrock")
+            && !unknown.contains("mistral")
+            && !unknown.contains("azure"),
         "{unknown}"
     );
     let oauth = ask(
@@ -381,20 +235,33 @@ fn providers_that_cannot_be_called_correctly_are_refused_with_the_reason() {
         oauth.contains("is an OAuth token, which this build does not support yet"),
         "{oauth}"
     );
-    let no_key = ask("mistral/m", &[]);
+    let no_key = ask("deepseek/m", &[]);
     assert_eq!(
         no_key,
-        "Error: no API key for provider \"mistral\": set MISTRAL_API_KEY, pass --api-key, or run `nyan login mistral`\n"
+        "Error: no API key for provider \"deepseek\": set DEEPSEEK_API_KEY, pass --api-key, or run `nyan login deepseek`\n"
     );
+    for removed in [
+        "azure",
+        "mistral",
+        "amazon-bedrock",
+        "meta",
+        "minimax",
+        "minimax-cn",
+        "kimi-coding",
+        "vercel-ai-gateway",
+    ] {
+        let error = ask(&format!("{removed}/m"), &[]);
+        assert!(
+            error.contains(&format!(
+                "provider \"{removed}\" is not supported by the Rust preview yet"
+            )),
+            "{removed}: {error}"
+        );
+    }
     let vertex = ask("google-vertex/m", &[]);
     assert!(
         vertex.contains("Application Default Credentials are not supported yet"),
         "{vertex}"
-    );
-    let azure = ask("azure/m", &[("AZURE_OPENAI_API_KEY", "k")]);
-    assert!(
-        azure.contains("set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME"),
-        "{azure}"
     );
     home.cleanup();
 }
@@ -434,30 +301,6 @@ fn the_key_comes_from_the_flag_then_the_environment_then_the_stored_login() {
         &[("GROQ_API_KEY", "env-key")],
     );
     assert!(from_flag.contains("bearer flag-key"), "{from_flag}");
-    home.cleanup();
-}
-
-#[test]
-fn azure_defaults_to_api_version_v1() {
-    let runtime = Runtime::new().expect("runtime");
-    let server = stub(&runtime, "text/event-stream", responses_reply());
-    let home = Home::new("azure-default");
-    let base = format!("http://{}/openai/v1", server.address);
-    let outcome = home.go(
-        &["-p", "--no-session", "--model", "azure/gpt-x", "hi"],
-        &[
-            ("AZURE_OPENAI_API_KEY", "k"),
-            ("AZURE_OPENAI_BASE_URL", &base),
-        ],
-        &[],
-    );
-    assert_eq!(outcome.code, 0, "{}", outcome.stderr);
-    let request = server.requests.lock().expect("lock")[0].clone();
-    assert!(
-        request.starts_with("POST /openai/v1/responses?api-version=v1 HTTP/1.1"),
-        "{request}"
-    );
-
     home.cleanup();
 }
 
@@ -506,10 +349,10 @@ fn login_stores_an_api_key_for_any_key_provider_and_the_next_run_uses_it() {
     );
     assert!(request.contains("\"model\":\"llama-x\""), "{request}");
 
-    let empty = home.go(&["login", "mistral"], &[], &["   "]);
+    let empty = home.go(&["login", "deepseek"], &[], &["   "]);
     assert_eq!(empty.code, 1);
     assert_eq!(empty.stderr, "Error: the API key cannot be empty\n");
-    assert!(home.json("auth.json").get("mistral").is_none());
+    assert!(home.json("auth.json").get("deepseek").is_none());
     let menu = home.go(&["login"], &[], &["groq", "gsk-2", ""]);
     assert_eq!(menu.code, 0, "{}", menu.stderr);
     assert!(

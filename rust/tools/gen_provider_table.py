@@ -19,20 +19,25 @@ commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=ro
 API = {
     "openai-completions": "OpenAiCompletions",
     "openai-responses": "OpenAiResponses",
-    "azure-openai-responses": "AzureOpenAiResponses",
     "anthropic-messages": "AnthropicMessages",
     "google-generative-ai": "GoogleGenerativeAi",
     "google-vertex": "GoogleVertex",
-    "mistral-conversations": "MistralConversations",
-    "bedrock-converse-stream": "BedrockConverse",
 }
 NON_CHAT = {
     "openai-decisions", "typesafe-system-one", "openrouter-images",
     "cloudflare-workers-ai-system-one", "llama-cpp-classify",
 }
+# Providers the owner chose not to support (decision #53). They are left out of every
+# list below, so a request for one reports it as unknown.
+OWNER_EXCLUDED = {
+    "meta", "azure", "minimax", "minimax-cn", "kimi-coding",
+    "vercel-ai-gateway", "mistral", "amazon-bedrock",
+}
 supported, mixed, other = [], [], []
 for path in sorted(glob.glob(os.path.join(providers, "data", "*.json"))):
     pid = os.path.basename(path)[:-5]
+    if pid in OWNER_EXCLUDED:
+        continue
     data = json.load(open(path))
     combos = collections.Counter()
     for api, models in data.items():

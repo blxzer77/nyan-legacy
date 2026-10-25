@@ -90,67 +90,6 @@ fn aliased_sources_feed_their_providers() {
 }
 
 #[test]
-fn openai_is_mirrored_to_azure_with_the_azure_context_windows() {
-    let catalog = Catalog::from_models_dev(&dev(&json!({"openai": {"models": {
-        "gpt-5.5": model(true), "gpt-5.6": model(true), "gpt-x": model(true),
-    }}})));
-    let openai: Vec<_> = only(&catalog, "openai")
-        .iter()
-        .map(|m| m.id.clone())
-        .collect();
-    assert_eq!(
-        openai,
-        ["gpt-5.5", "gpt-x"],
-        "gpt-5.6 is unsupported on the API"
-    );
-    assert!(openai.iter().all(|_| true));
-    let azure = only(&catalog, "azure");
-    assert_eq!(azure.len(), 2);
-    assert!(
-        azure
-            .iter()
-            .all(|m| m.api == WireApi::AzureOpenAiResponses && m.base_url.is_empty())
-    );
-    assert_eq!(azure[0].context_window, 1_050_000);
-    assert_eq!(azure[1].context_window, 200_000);
-    assert_eq!(
-        only(&catalog, "openai")[0].context_window,
-        200_000,
-        "OpenAI itself is unchanged"
-    );
-}
-
-#[test]
-fn bedrock_skips_known_unusable_models_and_routes_eu_ids_to_frankfurt() {
-    let catalog = Catalog::from_models_dev(&dev(&json!({"amazon-bedrock": {"models": {
-        "anthropic.claude-opus-5": model(true),
-        "ai21.jamba-1": model(true),
-        "mistral.mistral-7b-instruct-v0:2": model(true),
-        "eu.anthropic.claude-x": model(true),
-        "anthropic.claude-y": model(true),
-    }}})));
-    let models = only(&catalog, "amazon-bedrock");
-    let urls: Vec<(&str, &str)> = models
-        .iter()
-        .map(|m| (m.id.as_str(), m.base_url.as_str()))
-        .collect();
-    assert_eq!(
-        urls,
-        [
-            (
-                "anthropic.claude-y",
-                "https://bedrock-runtime.us-east-1.amazonaws.com"
-            ),
-            (
-                "eu.anthropic.claude-x",
-                "https://bedrock-runtime.eu-central-1.amazonaws.com"
-            ),
-        ]
-    );
-    assert!(models.iter().all(|m| m.api == WireApi::BedrockConverse));
-}
-
-#[test]
 fn vertex_lists_only_gemini_models_and_resolves_latest_aliases() {
     let mut flash = model(true);
     flash["limit"] = json!({"context": 1_000_000, "output": 65_000});
@@ -346,46 +285,6 @@ fn fireworks_splits_glm_and_kimi_k3_from_the_anthropic_compatible_rest() {
 }
 
 #[test]
-fn kimi_aliases_collapse_into_the_canonical_id_only_when_it_exists() {
-    let with_canonical =
-        Catalog::from_models_dev(&dev(&json!({"kimi-code-plan-global": {"models": {
-            "kimi-for-coding": model(true), "k2p6": model(true), "k3": model(true),
-        }}})));
-    let ids: Vec<String> = only(&with_canonical, "kimi-coding")
-        .into_iter()
-        .map(|m| m.id)
-        .collect();
-    assert_eq!(ids, ["k3", "kimi-for-coding"]);
-    let without = Catalog::from_models_dev(&dev(&json!({"kimi-code-plan-global": {"models": {
-        "k2p6": model(true),
-    }}})));
-    let only_alias = only(&without, "kimi-coding");
-    assert_eq!(
-        (only_alias[0].id.as_str(), only_alias[0].name.as_str()),
-        ("kimi-for-coding", "Kimi For Coding")
-    );
-}
-
-#[test]
-fn mistral_derives_a_cache_price_only_when_models_dev_has_none() {
-    let mut priced = model(true);
-    priced["cost"] = json!({"input": 2.0, "output": 6.0, "cache_read": 0.5});
-    let mut unpriced = model(true);
-    unpriced["cost"] = json!({"input": 2.0, "output": 6.0});
-    let catalog = Catalog::from_models_dev(&dev(&json!({"mistral": {"models": {
-        "a": priced, "b": unpriced,
-    }}})));
-    assert_eq!(
-        catalog.find("mistral", "a").expect("a").cost.cache_read,
-        0.5
-    );
-    assert_eq!(
-        catalog.find("mistral", "b").expect("b").cost.cache_read,
-        0.2
-    );
-}
-
-#[test]
 fn providers_without_a_source_and_an_empty_map_yield_nothing_and_every_source_is_listed_once() {
     assert_eq!(Catalog::from_models_dev(&Map::new()).models(), &[]);
     let catalog =
@@ -406,7 +305,7 @@ fn deprecated_models_are_dropped_only_where_the_generator_drops_them() {
     let old = json!({"tool_call": true, "status": "deprecated"});
     let catalog = Catalog::from_models_dev(&dev(&json!({
         "openai": {"models": {"old": old.clone(), "new": model(true)}},
-        "mistral": {"models": {"old": old.clone()}},
+        "groq": {"models": {"old": old.clone()}},
         "togetherai": {"models": {"old": old.clone(), "new": model(true)}},
         "opencode": {"models": {"old": old.clone()}},
         "xiaomi": {"models": {"old": old}},
@@ -422,7 +321,7 @@ fn deprecated_models_are_dropped_only_where_the_generator_drops_them() {
         ["new", "old"],
         "kept: the generator keeps them for OpenAI"
     );
-    assert_eq!(ids("mistral"), ["old"]);
+    assert_eq!(ids("groq"), ["old"]);
     assert_eq!(ids("together"), ["new"], "dropped for Together");
     assert_eq!(ids("opencode"), Vec::<String>::new());
     assert_eq!(ids("xiaomi"), Vec::<String>::new());
@@ -435,4 +334,13 @@ fn xai_leaves_out_the_models_the_generator_excludes() {
     }}})));
     let ids: Vec<String> = only(&catalog, "xai").into_iter().map(|m| m.id).collect();
     assert_eq!(ids, ["grok-4"]);
+}
+
+#[test]
+fn openai_leaves_out_the_model_its_api_does_not_serve() {
+    let catalog = Catalog::from_models_dev(&dev(&json!({"openai": {"models": {
+        "gpt-5.6": model(true), "gpt-x": model(true),
+    }}})));
+    let ids: Vec<String> = only(&catalog, "openai").into_iter().map(|m| m.id).collect();
+    assert_eq!(ids, ["gpt-x"]);
 }

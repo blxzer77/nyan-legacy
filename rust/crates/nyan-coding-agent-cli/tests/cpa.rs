@@ -213,7 +213,7 @@ fn a_cancelled_login_stores_nothing_and_exits_one() {
     assert!(
         unknown
             .stderr
-            .contains("cannot log in to \"nowhere\" (available: cliproxyapi, azure, "),
+            .contains("cannot log in to \"nowhere\" (available: cliproxyapi, ant-ling, "),
         "{}",
         unknown.stderr
     );

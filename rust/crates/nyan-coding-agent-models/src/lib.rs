@@ -19,18 +19,12 @@ pub enum WireApi {
     OpenAiCompletions,
     /// `OpenAI` Responses.
     OpenAiResponses,
-    /// Azure `OpenAI` Responses.
-    AzureOpenAiResponses,
     /// Anthropic Messages.
     AnthropicMessages,
     /// Google Generative AI.
     GoogleGenerativeAi,
     /// Google Vertex AI.
     GoogleVertex,
-    /// Mistral Conversations.
-    MistralConversations,
-    /// Amazon Bedrock `ConverseStream`.
-    BedrockConverse,
 }
 
 impl WireApi {
@@ -40,12 +34,9 @@ impl WireApi {
         match self {
             Self::OpenAiCompletions => "openai-completions",
             Self::OpenAiResponses => "openai-responses",
-            Self::AzureOpenAiResponses => "azure-openai-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
             Self::GoogleVertex => "google-vertex",
-            Self::MistralConversations => "mistral-conversations",
-            Self::BedrockConverse => "bedrock-converse-stream",
         }
     }
 }
