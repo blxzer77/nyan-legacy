@@ -2073,6 +2073,53 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_queue_starts_another_turn_after_settling() {
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::from([
+                    vec![
+                        ProviderStreamEvent::TextDelta {
+                            text: "first".to_owned(),
+                        },
+                        ProviderStreamEvent::Finished {
+                            reason: ProviderStopReason::Stop,
+                        },
+                    ],
+                    vec![
+                        ProviderStreamEvent::TextDelta {
+                            text: "second".to_owned(),
+                        },
+                        ProviderStreamEvent::Finished {
+                            reason: ProviderStopReason::Stop,
+                        },
+                    ],
+                ])),
+                failures: Mutex::new(0),
+            },
+        };
+        let tools = Tools { echo: EchoTool };
+        let mut runtime = AgentRuntime::new(
+            &providers,
+            &tools,
+            RuntimeConfig::new(
+                ProviderModel {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                },
+                "/tmp/project",
+            ),
+        );
+        let control = runtime.control();
+        control.follow_up(Message::text(MessageRole::User, "again"));
+        assert_eq!(control.snapshot().follow_up.len(), 1);
+        let (result, _) = run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
+        assert_eq!(result.outcome, AgentOutcome::Completed);
+        assert_eq!(result.messages.len(), 4);
+        assert_eq!(result.messages[2].text, "again");
+        assert!(control.snapshot().follow_up.is_empty());
+    }
+
+    #[test]
     fn persistent_run_commits_messages_and_continues_after_reopen() {
         let root = persistent_root("continue");
         let store = nyan_coding_agent_session::FileSessionStore::new(&root);
