@@ -1,227 +1,193 @@
 # Rust Coding Agent 交接：core-first parity preview（2026-10-26）
 
-这是从公司环境继续工作的入口。代码已经提交到本地 `main`，但没有直接推送受保护的 `main`；本页提交后会把完整历史推送到远端 `rust-core-preview`。
+这是当前 `rust-core-preview` 的交接入口。后续工作继续保持 Rust-only、core-first；不要把这条线直接推到受保护的 `main`。
 
-## 到公司后的第一步
+## 接手后的第一步
 
 ```bash
 git fetch origin rust-core-preview
-git switch -c rust-core-preview --track origin/rust-core-preview
-# 或者已经有同名分支时：
 git switch rust-core-preview
 git pull --ff-only
-
-sed -n '1,320p' ROADMAP.md
 sed -n '1,360p' docs/handoff/2026-10-26-rust-core-preview.md
+sed -n '1,260p' ROADMAP.md
+git status --short --branch
 ```
 
-不要把这条线直接推到 `main`。`main` 受保护，必须通过 PR 的 Merge gate。
+目标分支是 `origin/rust-core-preview`。`main` 受保护，必须通过 PR 的 Merge gate。
 
 ## 当前状态快照
 
 | 项 | 状态 |
 | --- | --- |
-| 产品方向 | Rust-only、core-first；TUI/GPUI 最后做，Rust CLI 普通运行路径不依赖 Node |
-| 当前本地分支 | `main`，相对 `origin/main` ahead 45；推送目标是 `origin/rust-core-preview` |
-| 最新功能提交 | `9c532c706 feat: replay multimodal content in Responses requests` |
-| 本交接提交 | 本文件所在提交（拉取远端后以 `git log` 为准） |
-| Rust 测试 | workspace 358 个测试通过 |
-| Linux 检查 | `cargo fmt`、workspace `cargo clippy --all-targets --locked -- -D warnings`、workspace `cargo test --workspace --locked` 通过 |
-| 仓库检查 | `npm run check` 通过；每个提交的 pre-commit hook 也通过 |
-| Windows | 尚未在真实 Windows runner 执行；本机交叉检查因缺少 `x86_64-w64-mingw32-gcc` 被 `aws-lc-sys` 阻塞 |
-| 凭据/真实 provider | 没有使用真实 provider 凭据；provider 测试使用 loopback/fake server |
-| 发布/推送 | 没有发布、没有 tag、没有 push 到 `main` |
+| 当前分支 | `rust-core-preview` |
+| 最新提交 | 见 `git log --oneline -12`；本交接提交位于 `99eda5bc9` 之后 |
+| 已推送提交 | 本交接完成后，当前分支的全部已跟踪修改推送到 `origin/rust-core-preview` |
+| Rust 方向 | Rust-only、core-first；TUI/GPUI 最后做，普通 Rust 运行路径不依赖 Node |
+| 验证 | `cargo fmt`、workspace clippy、workspace tests、`npm run check` 全部通过 |
+| Windows | 尚未获得真实 Windows runner 证据；按当前约定暂不阻塞本阶段 |
+| provider/凭据 | 只使用 loopback/fake provider；没有使用真实 provider 凭据 |
+| 未跟踪目录 | `eval/` 是外部未跟踪目录，不能修改、暂不加入提交，也不应删除 |
+| 发布 | 没有 tag、没有 npm publish；只推送 preview 分支 |
 
-## 已完成的路线图工作
+## 已完成工作
 
 ### RS0–RS2 基础
 
-已完成并已有历史提交：
-
-- Rust workspace、core/runtime/provider/session/tools/protocol/CLI crate 边界；
-- agent loop、sequential/parallel tools、retry backoff、取消和未知结果；
-- POSIX 信号取消，Windows 代码已完成交叉编译检查但没有真实 runner 证据；
+- Rust workspace 和 crate 边界：core、runtime、provider、provider-http、session、tools、protocol、CLI 等；
+- agent loop、顺序/并行工具执行、retry backoff、取消、未知结果和进程组生命周期；
 - OpenAI Completions/Responses、Anthropic Messages、Gemini Generative AI/Vertex、OpenAI Codex Responses；
-- auth、OAuth/Codex 登录刷新、models.dev catalog/cache、内置工具、print/JSON 模式；
-- 删除 owner 明确不需要的 Azure、Bedrock、SigV4、event-stream、Mistral 代码。
+- auth、OAuth/Codex 登录刷新、models.dev catalog/cache、内置工具、print/JSON 模式、信号退出；
+- crash-safe session/auth locks、原子文件替换、symlink/mode 保留、Windows rename retry；
+- `read` 的 regular-file/device/FIFO/size/UTF-16 BOM 防护，`edit` 拒绝非法 UTF-8。
 
-### RS4 crash safety / filesystem
+### RS3 model/request parity
 
-已完成：
+- 有序 `ContentBlock`：text、thinking、redacted thinking、image、tool call；
+- thinking 流式更新、signature/redacted block、ordered content replay；
+- OpenAI、Anthropic、Gemini/Vertex 的 reasoning usage；
+- reasoning effort、prompt-cache controls、service tier、output limits；
+- context overflow 时只缩小显式配置的 output limit；
+- catalog-priced usage cost，以 fixed-point micro-dollar 持久化；
+- OpenAI Chat/Responses/Codex、Anthropic、Gemini/Vertex 请求体和非流式 JSON fallback；
+- provider retry/error classification、loopback tests。
 
-- session 使用 OS advisory lock；进程被杀死后内核释放锁；
-- auth 使用 `auth.json.flock` OS lock；
-- 新增 `rust/crates/nyan-coding-agent-fs` 原子替换 helper；
-- `write`/`edit`/auth 使用原子写，保留 symlink/mode，并包含 Windows rename retry；
-- `edit` 拒绝非法 UTF-8，避免有损写回；
-- session crash-lock 测试会杀死持锁进程并验证后续可以重新打开。
+### RS4 sessions
 
-### RS3 message/content/retry
+- canonical cwd sidecar：原子写入、`0600` 权限、稳定 `session_cwd_sidecar` 错误；
+- `SessionCommand`：`GetEntries`、`GetTree`、`GetForkMessages`、`GetSessionName`、`GetSessionStats`、`SetSessionName`；
+- session entries/tree projection、stats、entry-based fork、clone、CLI `--fork`；
+- `SessionSummary`、lock-free session listing、resume data；
+- Rust JSONL export/import、legacy TypeScript JSONL importer、provider-free `--export`；
+- journal replay、locks、incomplete-run recovery、corruption handling。
 
-已完成的可逆基础：
+### RS5 agent behavior
 
-- `ContentBlock`：`Text`、`Thinking`、`Image`、`ToolCall`；
-- `Message.content` 有序内容；旧 `text`/`tool_calls` 字段暂时保留为迁移兼容视图，不能宣称已经完成最终模型切换；
-- runtime 流式文本、tool call 会同步写入有序 content 和兼容字段；
-- session message codec v3，支持 content blocks；可读取旧 v2 flat message；
-- Anthropic 历史请求 replay：thinking、redacted thinking、image、text、tool use；
-- Gemini/Vertex 历史请求 replay：text、image、functionCall；thinking 仍按现有规则隐藏；
-- OpenAI Chat Completions 历史 replay：user/system multimodal parts、assistant text/tool calls、tool output；
-- OpenAI Responses 历史 replay：input text/image、assistant output text/function call、tool output；Codex Responses 共享该输入路径；
-- `Retry-After` 支持 milliseconds、seconds 和 HTTP-date；server delay 覆盖本地指数退避，并受 runtime cap 限制；
-- provider 错误分类：rate limit、overload、context overflow、media too large、tool pairing、connection，以及原有 auth/model/request/stream；
-- runtime 稳定错误 code 已覆盖新分类；
-- 新测试均做过 mutation check，删除关键逻辑会使对应测试失败。
+- `AgentControl::steer`、`follow_up`、`snapshot`、`clear_queue`、`abort`；
+- `QueueMode::{OneAtATime, All}` 和 `queue_update` JSONL event；
+- follow-up turn 与 safe turn-boundary steering injection；
+- thinking levels：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；
+- query/set/cycle API，以及 `thinking_level_changed` event；
+- `RuntimeHooks::before_agent_start`、`before_tool_call`、`after_tool_call`；
+- before-hook fail-closed，blocked tool 变成 model-visible error，不执行外部 effect；
+- 手动 summary compaction：保留 system prompt、插入 summary、保留 suffix，发出 compaction events；
+- 自动 compaction：`CompactionPolicy`、context token estimate、`ContextCompactor` owner；
+- context overflow 时优先尝试 compaction，再尝试 output-limit shrink retry。
 
-### RS7 read guards
+## 最近提交
 
-已完成：
+```text
+99eda5bc9 feat(runtime): add automatic compaction owner
+5192a5c26 feat(runtime): add summary-based compaction
+b034a458b feat(runtime): add lifecycle hooks
+7f6b98952 feat(runtime): add thinking level control
+f3a447781 test(runtime): cover queued follow-up turns
+a51245cf5 feat(runtime): add steering and follow-up queues
+c23fb726e feat(session): add export import and resume data
+85901cab6 docs: update Rust session option status
+875927b8e feat(session): enable entry-based forks
+9eb323e93 feat(session): add neutral session commands
+9ed01dfba feat(session): add cwd sidecars
+4c61020f1 feat(provider): support non-streaming responses
+```
 
-- `read` 在打开前拒绝目录、设备、FIFO 等非 regular file，避免 FIFO 阻塞；
-- 16 MiB 输入上限，防止任意大文件进入 agent 进程；
-- UTF-16 little-endian/big-endian BOM 解码；
-- 保留现有文本截断和 image refusal 行为。
+## Compaction 当前设计
 
-### RS4 entry projection
+`rust/crates/nyan-coding-agent-runtime/src/lib.rs` 提供：
 
-已完成最小线性模型：
+```rust
+pub struct CompactionPolicy {
+    pub context_window: u64,
+    pub reserve_tokens: u64,
+    pub keep_recent_messages: usize,
+}
 
-- `SessionEntryId` 由 journal sequence 稳定生成；
-- `SessionEntry` 包含 `id`、`parent_id`、sequence、kind、原始 payload、可选 decoded message；
-- `SessionJournal::entries()`；
-- `NativeSession::get_entries()`、`get_tree()`、`get_fork_messages()`；
-- 当前 journal 没有 branch records，因此 tree 是线性 parent chain；不能宣称已经完成 TypeScript tree/fork parity。
+pub trait ContextCompactor: Send + Sync {
+    fn summarize(
+        &self,
+        messages: Vec<Message>,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<Result<String, String>>;
+}
+```
 
-## 关键设计约束
+runtime 不直接决定 provider summarization 请求格式；宿主通过 `with_compactor` 注入 summary owner。这样可以继续明确 provider admission、重试、取消和持久化责任，避免在 agent loop 中硬编码 provider 行为。
 
-1. **core 先于前端。** 不要现在开始 TUI/GPUI；先完成 model/session/behavior/resources/tools/MCP/session API。
-2. **不要把 compatibility fields 当最终模型。** Provider request builders 正在逐个迁移到 `Message::model_content()`；后续应继续移除读取旧字段的路径，最终再考虑删除兼容字段。
-3. **所有 provider 测试走 loopback/fake server。** 不启用真实 API key，不做真实 token 消费。
-4. **新增测试必须有 mutation evidence。** 测试必须验证契约，不要只验证 mock call。
-5. **Rust workspace 仍按 exact dependency、`default-features = false`、`unsafe_code = forbid` 执行。**
-6. **不要直接修改全局 Agent 配置，不要从 Pi/Rebon/Comet 复制代码。**
+当前还没有完成：
 
-## 下一步，按顺序继续
+- 真实 summarization provider request 和 bounded retry；
+- summarization retry events；
+- compaction journal/session persistence 和 crash recovery；
+- 大 tool result spill-to-file；
+- automatic compaction 的 TypeScript differential fixture。
 
-### 1. RS3 streaming content events
+## 接下来优先级
 
-当前 provider stream 仍主要只有：
+### 1. 完成 RS5 compaction 生命周期
 
-- `TextDelta`；
-- complete `ToolCall`；
-- `Usage`；
-- `Finished`。
+- 将 compaction summary 写入 session journal，而不是只修改 runtime memory；
+- session reopen 后保留 summary 和 retained suffix，且 metadata/recovery 可重建；
+- 为 summarization provider 调用加入 cancellation、bounded retry、context-overflow retry；
+- 明确 summary request 的失败和 unknown outcome，禁止误报成功；
+- 增加 overflow → compaction → retry、compaction failure、cancel during summary 的 mutation-oriented tests。
 
-下一步应增加 neutral streaming events：
+### 2. 实现 shell command parity
 
-- thinking start/delta/end；
-- toolcall start/delta/end；
-- thinking signature/redacted payload；
-- usage extensions（reasoning/cost 后续再处理）。
+- `!`：执行 bash 并把结果作为用户侧事件/消息处理；
+- `!!`：执行 bash 并把结果注入后续 agent turn；
+- `bash_execution_update` JSONL events；
+- `abort_bash` control path；
+- 取消、超时、进程组终止和 unknown-outcome 语义；
+- 不执行真实 provider，使用 fake/loopback provider 验证完整事件序列。
 
-推荐先做 Anthropic streaming thinking：
+### 3. 完成 provider thinking capability mapping
 
-- `content_block_start` 的 `thinking` / `redacted_thinking` 记录 block 状态；
-- `content_block_delta` 支持 `thinking_delta`；
-- runtime 用有序 `ContentBlock::Thinking` 累积；
-- JSON/protocol 层之后再补 `thinking_*` 事件，避免一次把所有 surface 改完。
+- catalog/provider/model 的支持 level 映射；
+- provider-specific normalization；
+- unsupported thinking request 的稳定错误；
+- model switch 和 level cycle 的行为测试。
 
-必须补：loopback fixtures、runtime state-machine tests、mutation checks，并确认 signed/redacted thinking replay 规则。
+### 4. 开始 RS6（与 RS5 非重叠部分可并行）
 
-### 2. RS3 remaining model data
+建议新增 `rust/crates/nyan-coding-agent-config` 和 `rust/crates/nyan-coding-agent-resources`，不要把配置逻辑放进 agent loop：
 
-- usage cost/reasoning/cache retention fields；
-- provider model thinking capabilities；
-- Codex `reasoning`/service tier；
-- prompt-cache control；
-- error classification 的 provider-specific body matrix；
-- stream watchdog 和 non-streaming fallback；
-- `max_tokens` context overflow shrink retry（不计入普通 backoff）。
+- global/project `settings.json` merge；
+- per-key invalid tolerance；
+- unknown fields preservation；
+- atomic write 和 cross-process lock；
+- `models.json`、trust store、`SYSTEM.md`、`APPEND_SYSTEM.md`；
+- skills/prompt-template discovery、frontmatter、de-duplication；
+- themes/keybindings parse/validate；
+- proxy、NO_PROXY、SOCKS、extra CA；
+- loopback proxy/CA 和 untrusted-project fixtures。
 
-### 3. RS4 cwd sidecar and session API wiring
+RS6 写集按 `ROADMAP.md`：新 config/resources crates 和 `-auth`；不要修改 runtime/session-api surfaces，除非先协调写集。
 
-当前 cwd key 已 canonicalize、处理 symlink 和 Windows `\\?\\`/case 规则，但还没有 sidecar 记录真实 cwd。继续做：
+### 5. RS8/RPC 后续
 
-- 在 cwd-hash session directory 写入原子 sidecar，记录真实 cwd；
-- sidecar 读取失败要明确报告，不要静默切换到其他 cwd；
-- 将 `get_entries`/`get_tree`/`get_fork_messages` 接入后续 front-end-neutral session API；
-- 再做 `--resume` listing、`--fork`、export/import。
+将 queue control、compaction、session listing/stats、export/fork 等接入统一 front-end-neutral session API 和 RPC。当前 JSONL/runtime primitives 已存在，但完整 RPC/interactive surface 还未完成。
 
-### 4. Track T0/T1
+## 约束
 
-- T0 需要 owner/外部协作：从 `rust-core-preview` 开 PR，让 GitHub Windows runner 真实执行 `rust.yml`；不要直接 push `main`。
-- 本地 Windows cross check 目前缺少 MinGW C compiler，不能把本机失败修成“代码失败”；应记录为环境限制。
-- T1 differential harness：先选一个 wire API，录制 TypeScript/Rust request/event/session fixture，normalize timestamps/ids 后比较。
+1. 只在 `rust-core-preview` 工作；不要修改 protected `main`。
+2. 不修改、不 staging、不删除 `eval/`。
+3. provider 测试使用 loopback/fake server；不要读取或写入真实凭据。
+4. 新测试必须是 mutation-oriented，验证行为契约而非 mock 调用。
+5. 修复 clippy/lint，不使用 suppression 掩盖问题。
+6. 依赖继续使用 exact version、`default-features = false`、crate `unsafe_code = forbid`。
+7. 不运行 `npm run build` 或全量 `npm test`，除非 owner 明确要求。
+8. 不使用 `git reset --hard`、`git checkout .`、`git clean -fd`、`git stash`、`git add -A`、`git add .` 或 force-push。
+9. 不自行关闭 `ROADMAP.md` 中的 owner decisions #54–#62。
 
-### 5. 后续阶段
-
-- RS5：steer/follow-up queues、thinking levels、compaction、shell commands、hooks；
-- RS6：settings/resources/trust/skills/prompt templates/proxy/CA；
-- RS7：PowerShell、tool_search、MCP client、MCP OAuth/SSRF/reconnect/trust；
-- RS8：front-end-neutral session API、render projection、23 events、33 RPC commands；
-- RS9：extension boundary，等待 decision #56；
-- RS10：Windows evidence、fuzzing、packaging/headless preview；
-- RS11：最后再做 terminal TUI；GPUI 只能作为额外 desktop client spike，不能替代 terminal mode。
-
-## Owner decisions：不要自行关闭
-
-这些决定按 `ROADMAP.md` 保持开放，继续做推荐的可逆部分：
-
-- **#54 Rust MSRV**：当前已按 `rust-version = 1.89` 实现 `File::try_lock`，等待 owner 最终确认；
-- **#55 terminal UI / GPUI / both**：在 G-UI spike 决定；terminal parity 不能被 GPUI 替代；
-- **#56 extension boundary**：推荐 typed JSONL out-of-process bridge；
-- **#57 codemode**：暂不把 JS engine 放进 core；
-- **#58 tasks/agents**：M1 out of scope；
-- **#59 SQLite import**：推荐先做 legacy JSONL importer；
-- **#60 provider long tail**：按需逐个添加；
-- **#61 plain REPL**：可作为开发工具，默认关闭；
-- **#62 release signing/update channel**：当前先 SHA-256 + provenance，签名后置。
-
-## Rebon-Code / CometixCode 研究边界
-
-### Rebon-Code
-
-可以继续学习：
-
-- projection 与 paint 分离；
-- streaming Markdown stable-prefix；
-- selector/keybinding/paste state machine；
-- shell policy、truncation、atomic write、Retry-After、MCP 安全边界；
-- session tail metadata 和 compaction recovery。
-
-不要直接搬：engine/kernel/seat、Boa/Verve、Windows sandbox、SSE parser，以及默认 hosted endpoints/第三方 OAuth client id。只有明确 Apache-2.0 且确实是小型原创模块时，才可保留版权/NOTICE 并标记改动。
-
-### CometixCode
-
-按 clean-room 学习行为、边界、fixture、golden transcript、edge-case checklist 和偏差登记；不逐文件翻译源码，不把其 Claude Code-specific prompt/tool description 当作 Nyan 契约。
-
-## 重要检查命令
+## 验证命令
 
 ```bash
-cargo fmt --manifest-path rust/Cargo.toml --all
+. "$HOME/.cargo/env"
+cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --locked -- -D warnings
 cargo test --manifest-path rust/Cargo.toml --workspace --locked
 npm run check
-
+git diff --check
 git status --short --branch
-git log --oneline -12
 ```
 
-不要运行 `npm run build` 或全量 `npm test`，除非 owner 明确要求。不要使用 `git reset --hard`、`git clean`、`git stash`、`git add -A`、`git add .` 或 force-push。
-
-## 当前提交线
-
-从较近到较早：
-
-```text
-9c532c706 feat: replay multimodal content in Responses requests
-11566f712 feat: replay multimodal content in OpenAI chat requests
-a61dd4a48 feat: replay ordered content blocks in Gemini requests
-6150e741e feat: replay ordered content blocks in Anthropic requests
-60862de90 feat: classify provider failures for stable retry outcomes
-ca30931ef feat: add linear session entry projections
-c87d59839 feat: extend core content, retry, session, and read safety
-6cb9159b2 feat: crash-safe session and credential locks, atomic file replacement, edit refuses non-UTF-8 files
-```
-
-本交接文档的提交会在这些提交之后。拉取远端后以 `git log` 为准。
+本次交接前已运行以上完整 Rust/TypeScript gates，结果全部通过。Windows runner evidence 仍未验证。
