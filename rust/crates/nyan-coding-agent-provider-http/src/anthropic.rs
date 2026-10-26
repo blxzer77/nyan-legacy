@@ -1,10 +1,8 @@
 //! Anthropic Messages streaming provider.
 //!
 //! This adapter keeps Anthropic's message/content-block protocol separate from
-//! OpenAI-shaped requests. It supports text, tool use, tool results, streaming
-//! JSON arguments, usage, and the terminal stop reasons. Thinking blocks are
-//! accepted and ignored at the provider boundary because the current neutral
-//! `ProviderStreamEvent` has no thinking event.
+//! OpenAI-shaped requests. It supports text, thinking, tool use, tool results,
+//! streaming JSON arguments, usage, and the terminal stop reasons.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -12,7 +10,7 @@ use std::time::Duration;
 use nyan_coding_agent_core::{BoxFuture, ContentBlock, MessageRole, Usage};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
-    ToolCallRequest, ToolSpec,
+    ProviderStreamEvent, ToolCallRequest, ToolSpec,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
@@ -258,8 +256,17 @@ struct PendingTool {
 }
 
 #[derive(Default)]
+struct PendingThinking {
+    text: String,
+    signature: String,
+    redacted: bool,
+    done: bool,
+}
+
+#[derive(Default)]
 struct AnthropicStream {
     tools: BTreeMap<u64, PendingTool>,
+    thinking: BTreeMap<u64, PendingThinking>,
     terminal: Option<ProviderStopReason>,
     usage: Option<Usage>,
 }
@@ -282,9 +289,11 @@ impl AnthropicStream {
             let output = count(usage, "/output_tokens");
             let cache_read = count(usage, "/cache_read_input_tokens");
             let cache_write = count(usage, "/cache_creation_input_tokens");
+            let reasoning = count(usage, "/output_tokens_details/thinking_tokens");
             self.usage = Some(Usage {
                 input,
                 output,
+                reasoning,
                 cache_read,
                 cache_write,
                 total_tokens: input
@@ -295,28 +304,85 @@ impl AnthropicStream {
         }
     }
 
-    fn apply_block_start(&mut self, event: &Value) {
+    fn apply_block_start(&mut self, event: &Value) -> Result<Applied, ProviderError> {
         let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let content_index = usize::try_from(index)
+            .map_err(|_| stream_error("Anthropic content-block index is too large"))?;
         let block = event.get("content_block").unwrap_or(&Value::Null);
-        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-            return;
-        }
-        let tool = self.tools.entry(index).or_default();
-        if let Some(id) = block.get("id").and_then(Value::as_str) {
-            id.clone_into(&mut tool.id);
-        }
-        if let Some(name) = block.get("name").and_then(Value::as_str) {
-            name.clone_into(&mut tool.name);
-        }
-        if let Some(input) = block.get("input")
-            && (!input.is_object() || input.as_object().is_some_and(|object| !object.is_empty()))
-        {
-            tool.arguments = input.to_string();
+        match block.get("type").and_then(Value::as_str) {
+            Some("thinking") => {
+                let text = block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let signature = block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.thinking.insert(
+                    index,
+                    PendingThinking {
+                        text: text.clone(),
+                        signature: signature.clone(),
+                        redacted: false,
+                        done: false,
+                    },
+                );
+                Ok(Applied::Event(ProviderStreamEvent::ThinkingStart {
+                    content_index,
+                    text,
+                    signature: (!signature.is_empty()).then_some(signature),
+                    redacted: false,
+                }))
+            }
+            Some("redacted_thinking") => {
+                let signature = block
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.thinking.insert(
+                    index,
+                    PendingThinking {
+                        text: String::new(),
+                        signature: signature.clone(),
+                        redacted: true,
+                        done: false,
+                    },
+                );
+                Ok(Applied::Event(ProviderStreamEvent::ThinkingStart {
+                    content_index,
+                    text: String::new(),
+                    signature: (!signature.is_empty()).then_some(signature),
+                    redacted: true,
+                }))
+            }
+            Some("tool_use") => {
+                let tool = self.tools.entry(index).or_default();
+                if let Some(id) = block.get("id").and_then(Value::as_str) {
+                    id.clone_into(&mut tool.id);
+                }
+                if let Some(name) = block.get("name").and_then(Value::as_str) {
+                    name.clone_into(&mut tool.name);
+                }
+                if let Some(input) = block.get("input")
+                    && (!input.is_object()
+                        || input.as_object().is_some_and(|object| !object.is_empty()))
+                {
+                    tool.arguments = input.to_string();
+                }
+                Ok(Applied::Nothing)
+            }
+            _ => Ok(Applied::Nothing),
         }
     }
 
     fn apply_block_delta(&mut self, event: &Value) -> Result<Applied, ProviderError> {
         let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let content_index = usize::try_from(index)
+            .map_err(|_| stream_error("Anthropic content-block index is too large"))?;
         let delta = event.get("delta").unwrap_or(&Value::Null);
         match delta.get("type").and_then(Value::as_str) {
             Some("text_delta") => Ok(delta
@@ -324,6 +390,32 @@ impl AnthropicStream {
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
                 .map_or(Applied::Nothing, |text| Applied::Text(text.to_owned()))),
+            Some("thinking_delta") => {
+                let text = delta
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let thinking = self
+                    .thinking
+                    .get_mut(&index)
+                    .ok_or_else(|| stream_error("thinking text arrived for an unknown block"))?;
+                thinking.text.push_str(text);
+                Ok(Applied::Event(ProviderStreamEvent::ThinkingDelta {
+                    content_index,
+                    delta: text.to_owned(),
+                }))
+            }
+            Some("signature_delta") => {
+                let signature = delta
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let thinking = self.thinking.get_mut(&index).ok_or_else(|| {
+                    stream_error("thinking signature arrived for an unknown block")
+                })?;
+                thinking.signature.push_str(signature);
+                Ok(Applied::Nothing)
+            }
             Some("input_json_delta") => {
                 let partial = delta
                     .get("partial_json")
@@ -361,6 +453,12 @@ impl AnthropicStream {
                 .get("output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(current.output);
+            if let Some(reasoning) = usage
+                .pointer("/output_tokens_details/thinking_tokens")
+                .and_then(Value::as_u64)
+            {
+                current.reasoning = reasoning;
+            }
             current.cache_read = usage
                 .get("cache_read_input_tokens")
                 .and_then(Value::as_u64)
@@ -392,16 +490,23 @@ impl AnthropicStream {
                 self.apply_message_start(event);
                 Ok(Applied::Nothing)
             }
-            "content_block_start" => {
-                self.apply_block_start(event);
-                Ok(Applied::Nothing)
-            }
+            "content_block_start" => self.apply_block_start(event),
             "content_block_delta" => self.apply_block_delta(event),
             "content_block_stop" => {
-                if let Some(tool) = self
-                    .tools
-                    .get_mut(&event.get("index").and_then(Value::as_u64).unwrap_or(0))
-                {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(thinking) = self.thinking.get_mut(&index) {
+                    thinking.done = true;
+                    return Ok(Applied::Event(ProviderStreamEvent::ThinkingEnd {
+                        content_index: usize::try_from(index).map_err(|_| {
+                            stream_error("Anthropic content-block index is too large")
+                        })?,
+                        content: thinking.text.clone(),
+                        signature: (!thinking.signature.is_empty())
+                            .then_some(thinking.signature.clone()),
+                        redacted: thinking.redacted,
+                    }));
+                }
+                if let Some(tool) = self.tools.get_mut(&index) {
                     tool.done = true;
                 }
                 Ok(Applied::Nothing)
@@ -437,6 +542,17 @@ impl StreamProtocol for AnthropicStream {
     }
 
     fn finish(self) -> Finished {
+        let unfinished_thinking = self.thinking.values().find(|thinking| !thinking.done);
+        if unfinished_thinking.is_some() {
+            return Finished {
+                usage: self.usage,
+                calls: Vec::new(),
+                reason: ProviderStopReason::Error {
+                    message: "the Anthropic response ended with an unfinished thinking block"
+                        .to_owned(),
+                },
+            };
+        }
         let unfinished = self.tools.values().find(|tool| !tool.done);
         if let Some(tool) = unfinished {
             return Finished {

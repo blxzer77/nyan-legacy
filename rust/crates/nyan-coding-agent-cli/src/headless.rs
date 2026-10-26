@@ -221,7 +221,7 @@ pub async fn run_headless(
         .lock()
         .ok()
         .map(|guard| guard.session().descriptor.id.as_str().to_owned());
-    config.retry_sleep = options.retry_sleep.clone();
+    config.retry_sleep.clone_from(&options.retry_sleep);
     let mut runtime =
         AgentRuntime::new(providers, tools, config).with_cancellation(options.cancellation.clone());
     if let Err(message) = prepare_session(&session, options.system_prompt.as_deref()) {

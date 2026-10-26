@@ -397,8 +397,13 @@ fn arguments_json(arguments: &str) -> String {
 
 fn usage_json(usage: Usage) -> String {
     format!(
-        "{{\"input\":{},\"output\":{},\"cacheRead\":{},\"cacheWrite\":{},\"totalTokens\":{}}}",
-        usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total_tokens
+        "{{\"input\":{},\"output\":{},\"reasoning\":{},\"cacheRead\":{},\"cacheWrite\":{},\"totalTokens\":{}}}",
+        usage.input,
+        usage.output,
+        usage.reasoning,
+        usage.cache_read,
+        usage.cache_write,
+        usage.total_tokens
     )
 }
 
@@ -415,8 +420,9 @@ const fn stop_reason_name(reason: StopReason) -> &'static str {
 /// Encodes a message in the documented wire shape.
 ///
 /// Parity gaps: assistant `usage` omits `cost` (the Rust model registry has no
-/// pricing yet) and `api` is omitted (the runtime has no API-kind concept).
-/// Image and thinking content blocks do not exist in the Rust `Message`.
+/// pricing yet), `api` is omitted (the runtime has no API-kind concept), and the
+/// JSON message encoder still exposes only the legacy text/tool-call views rather
+/// than every ordered image and thinking block.
 #[must_use]
 pub fn encode_message(message: &Message) -> String {
     let mut out = String::from("{\"role\":");
@@ -567,6 +573,34 @@ fn assistant_event_json(event: &AssistantEvent) -> String {
             push_json_string(&mut out, content);
             out.push('}');
         }
+        AssistantEvent::ThinkingStart { content_index } => {
+            let _ = write!(
+                out,
+                "{{\"type\":\"thinking_start\",\"contentIndex\":{content_index}}}"
+            );
+        }
+        AssistantEvent::ThinkingDelta {
+            content_index,
+            delta,
+        } => {
+            let _ = write!(
+                out,
+                "{{\"type\":\"thinking_delta\",\"contentIndex\":{content_index},\"delta\":"
+            );
+            push_json_string(&mut out, delta);
+            out.push('}');
+        }
+        AssistantEvent::ThinkingEnd {
+            content_index,
+            content,
+        } => {
+            let _ = write!(
+                out,
+                "{{\"type\":\"thinking_end\",\"contentIndex\":{content_index},\"content\":"
+            );
+            push_json_string(&mut out, content);
+            out.push('}');
+        }
         AssistantEvent::ToolCallStart {
             content_index,
             id,
@@ -622,7 +656,7 @@ pub fn event_to_jsonl(event: &AgentEvent) -> String {
         AgentEvent::MessageUpdate { message, event } => {
             let usage = message.usage.map_or_else(
                 || {
-                    "{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0}"
+                    "{\"input\":0,\"output\":0,\"reasoning\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0}"
                         .to_owned()
                 },
                 usage_json,
@@ -854,6 +888,7 @@ mod tests {
         message.usage = Some(Usage {
             input: 10,
             output: 2,
+            reasoning: 1,
             cache_read: 1,
             cache_write: 0,
             total_tokens: 12,
@@ -870,7 +905,7 @@ mod tests {
                 "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"},",
                 "{\"type\":\"toolCall\",\"id\":\"c1\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}],",
                 "\"provider\":\"openai\",\"model\":\"gpt-test\",",
-                "\"usage\":{\"input\":10,\"output\":2,\"cacheRead\":1,\"cacheWrite\":0,\"totalTokens\":12},",
+                "\"usage\":{\"input\":10,\"output\":2,\"reasoning\":1,\"cacheRead\":1,\"cacheWrite\":0,\"totalTokens\":12},",
                 "\"stopReason\":\"toolUse\",\"timestamp\":9}"
             )
         );
@@ -909,7 +944,7 @@ mod tests {
                 event,
             })
         };
-        let zero_usage = "\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0}";
+        let zero_usage = "\"usage\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0}";
         assert_eq!(
             update(AssistantEvent::TextDelta {
                 content_index: 0,
@@ -919,6 +954,13 @@ mod tests {
                 "{{\"type\":\"message_update\",{zero_usage},\"assistantMessageEvent\":{{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"Hel\\\"lo\"}}}}\n"
             )
         );
+        let thinking = update(AssistantEvent::ThinkingEnd {
+            content_index: 0,
+            content: "reason".to_owned(),
+        });
+        assert!(thinking.contains(
+            "\"assistantMessageEvent\":{\"type\":\"thinking_end\",\"contentIndex\":0,\"content\":\"reason\"}"
+        ));
         let ended = update(AssistantEvent::ToolCallEnd {
             content_index: 1,
             tool_call: ToolCall {

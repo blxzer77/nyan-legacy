@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::path::PathBuf;
@@ -14,8 +15,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use nyan_coding_agent_core::{
-    BoxFuture, CancellationToken, CoreError, ExecutionContext, Message, MessageRole, StopReason,
-    ToolCall, ToolCallId, ToolResult, ToolUpdateSink,
+    BoxFuture, CancellationToken, ContentBlock, CoreError, ExecutionContext, Message, MessageRole,
+    StopReason, ToolCall, ToolCallId, ToolResult, ToolUpdateSink,
 };
 use nyan_coding_agent_provider::{
     ProviderError, ProviderModel, ProviderRegistry, ProviderRequest, ProviderStopReason,
@@ -138,6 +139,25 @@ pub enum AssistantEvent {
         /// Index of the block in the message content.
         content_index: usize,
         /// The complete block text.
+        content: String,
+    },
+    /// A thinking block started.
+    ThinkingStart {
+        /// Index of the block in the message content.
+        content_index: usize,
+    },
+    /// Thinking text was appended to a block.
+    ThinkingDelta {
+        /// Index of the block in the message content.
+        content_index: usize,
+        /// The appended thinking text.
+        delta: String,
+    },
+    /// A thinking block ended with its authoritative content.
+    ThinkingEnd {
+        /// Index of the block in the message content.
+        content_index: usize,
+        /// The complete block text; empty for a redacted block.
         content: String,
     },
     /// A tool-call block started.
@@ -313,6 +333,15 @@ impl StreamAttemptError {
                 &self.error,
                 RuntimeError::Provider(error) if error.is_retryable()
             )
+    }
+
+    fn invalid_state(message: impl Into<String>, emitted: bool) -> Self {
+        Self {
+            error: RuntimeError::Core(CoreError::InvalidState {
+                message: message.into(),
+            }),
+            emitted,
+        }
     }
 }
 
@@ -872,6 +901,140 @@ impl<'a> AgentRuntime<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // The transition owns the message and both provider-index maps.
+    fn consume_thinking_start(
+        &mut self,
+        assistant: &mut Message,
+        provider_index: usize,
+        text: String,
+        signature: Option<String>,
+        redacted: bool,
+        thinking_indices: &mut BTreeMap<usize, usize>,
+        sink: &dyn EventSink,
+    ) -> Result<(), StreamAttemptError> {
+        if thinking_indices.contains_key(&provider_index) {
+            return Err(StreamAttemptError::invalid_state(
+                format!("thinking block {provider_index} started more than once"),
+                true,
+            ));
+        }
+        let content_index = assistant.start_thinking(text, signature, redacted);
+        thinking_indices.insert(provider_index, content_index);
+        self.replace_last_message(assistant);
+        sink.emit(AgentEvent::MessageUpdate {
+            message: assistant.clone(),
+            event: AssistantEvent::ThinkingStart { content_index },
+        });
+        Ok(())
+    }
+
+    fn consume_thinking_delta(
+        &mut self,
+        assistant: &mut Message,
+        provider_index: usize,
+        delta: String,
+        thinking_indices: &BTreeMap<usize, usize>,
+        sink: &dyn EventSink,
+    ) -> Result<(), StreamAttemptError> {
+        let Some(&content_index) = thinking_indices.get(&provider_index) else {
+            return Err(StreamAttemptError::invalid_state(
+                format!(
+                    "thinking delta for provider content block {provider_index} without a start"
+                ),
+                true,
+            ));
+        };
+        assistant
+            .append_thinking(content_index, &delta)
+            .map_err(|error| StreamAttemptError {
+                error: error.into(),
+                emitted: true,
+            })?;
+        self.replace_last_message(assistant);
+        sink.emit(AgentEvent::MessageUpdate {
+            message: assistant.clone(),
+            event: AssistantEvent::ThinkingDelta {
+                content_index,
+                delta,
+            },
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // The transition owns the message and both provider-index maps.
+    fn consume_thinking_end(
+        &mut self,
+        assistant: &mut Message,
+        provider_index: usize,
+        content: String,
+        signature: Option<String>,
+        redacted: bool,
+        thinking_indices: &mut BTreeMap<usize, usize>,
+        sink: &dyn EventSink,
+    ) -> Result<(), StreamAttemptError> {
+        let Some(content_index) = thinking_indices.remove(&provider_index) else {
+            return Err(StreamAttemptError::invalid_state(
+                format!("thinking block {provider_index} ended without a start"),
+                true,
+            ));
+        };
+        assistant
+            .finish_thinking(content_index, content.clone(), signature, redacted)
+            .map_err(|error| StreamAttemptError {
+                error: error.into(),
+                emitted: true,
+            })?;
+        self.replace_last_message(assistant);
+        sink.emit(AgentEvent::MessageUpdate {
+            message: assistant.clone(),
+            event: AssistantEvent::ThinkingEnd {
+                content_index,
+                content,
+            },
+        });
+        Ok(())
+    }
+
+    fn finish_stream(
+        &mut self,
+        assistant: &mut Message,
+        reason: ProviderStopReason,
+        started: bool,
+        text_indices: &[usize],
+        thinking_indices: &BTreeMap<usize, usize>,
+        sink: &dyn EventSink,
+    ) -> Result<(Message, ProviderStopReason), StreamAttemptError> {
+        if !thinking_indices.is_empty() {
+            return Err(StreamAttemptError::invalid_state(
+                "provider finished with an active thinking block",
+                started,
+            ));
+        }
+        record_stop_reason(assistant, &reason);
+        self.start_message(started, assistant, sink);
+        for &content_index in text_indices {
+            let Some(ContentBlock::Text { text, .. }) = assistant.content.get(content_index) else {
+                return Err(StreamAttemptError::invalid_state(
+                    format!("text block {content_index} disappeared before stream end"),
+                    started,
+                ));
+            };
+            sink.emit(AgentEvent::MessageUpdate {
+                message: assistant.clone(),
+                event: AssistantEvent::TextEnd {
+                    content_index,
+                    content: text.clone(),
+                },
+            });
+        }
+        self.replace_last_message(assistant);
+        sink.emit(AgentEvent::MessageEnd {
+            message: assistant.clone(),
+        });
+        Ok((assistant.clone(), reason))
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the provider event state machine in one ordered transition.
     async fn consume_stream(
         &mut self,
         stream: &mut dyn nyan_coding_agent_provider::ProviderStream,
@@ -881,28 +1044,23 @@ impl<'a> AgentRuntime<'a> {
         assistant.provider = Some(self.config.model.provider.clone());
         assistant.model = Some(self.config.model.model.clone());
         let mut started = false;
-        let mut blocks = 0_usize;
-        let mut text_index: Option<usize> = None;
+        let mut text_indices = Vec::new();
+        let mut thinking_indices = BTreeMap::new();
         loop {
             let event = self.next_provider_event(stream, started).await?;
             match event {
                 ProviderStreamEvent::TextDelta { text } => {
                     started = self.start_message(started, &assistant, sink);
-                    let content_index = if let Some(index) = text_index {
-                        index
-                    } else {
-                        let index = blocks;
-                        blocks += 1;
-                        text_index = Some(index);
+                    let is_new_block =
+                        !matches!(assistant.content.last(), Some(ContentBlock::Text { .. }));
+                    let content_index = assistant.append_text_block(&text);
+                    if is_new_block {
+                        text_indices.push(content_index);
                         sink.emit(AgentEvent::MessageUpdate {
                             message: assistant.clone(),
-                            event: AssistantEvent::TextStart {
-                                content_index: index,
-                            },
+                            event: AssistantEvent::TextStart { content_index },
                         });
-                        index
-                    };
-                    assistant.append_text(&text);
+                    }
                     self.replace_last_message(&assistant);
                     sink.emit(AgentEvent::MessageUpdate {
                         message: assistant.clone(),
@@ -912,14 +1070,60 @@ impl<'a> AgentRuntime<'a> {
                         },
                     });
                 }
+                ProviderStreamEvent::ThinkingStart {
+                    content_index,
+                    text,
+                    signature,
+                    redacted,
+                } => {
+                    started = self.start_message(started, &assistant, sink);
+                    self.consume_thinking_start(
+                        &mut assistant,
+                        content_index,
+                        text,
+                        signature,
+                        redacted,
+                        &mut thinking_indices,
+                        sink,
+                    )?;
+                }
+                ProviderStreamEvent::ThinkingDelta {
+                    content_index,
+                    delta,
+                } => {
+                    started = self.start_message(started, &assistant, sink);
+                    self.consume_thinking_delta(
+                        &mut assistant,
+                        content_index,
+                        delta,
+                        &thinking_indices,
+                        sink,
+                    )?;
+                }
+                ProviderStreamEvent::ThinkingEnd {
+                    content_index,
+                    content,
+                    signature,
+                    redacted,
+                } => {
+                    started = self.start_message(started, &assistant, sink);
+                    self.consume_thinking_end(
+                        &mut assistant,
+                        content_index,
+                        content,
+                        signature,
+                        redacted,
+                        &mut thinking_indices,
+                        sink,
+                    )?;
+                }
                 ProviderStreamEvent::ToolCall(call) => {
                     started = self.start_message(started, &assistant, sink);
                     let id = ToolCallId::new(call.id).map_err(|error| StreamAttemptError {
                         error: error.into(),
                         emitted: started,
                     })?;
-                    let content_index = blocks;
-                    blocks += 1;
+                    let content_index = assistant.content.len();
                     let tool_call = ToolCall {
                         id,
                         name: call.name,
@@ -945,22 +1149,14 @@ impl<'a> AgentRuntime<'a> {
                 }
                 ProviderStreamEvent::Usage(usage) => assistant.usage = Some(usage),
                 ProviderStreamEvent::Finished { reason } => {
-                    record_stop_reason(&mut assistant, &reason);
-                    self.start_message(started, &assistant, sink);
-                    if let Some(content_index) = text_index {
-                        sink.emit(AgentEvent::MessageUpdate {
-                            message: assistant.clone(),
-                            event: AssistantEvent::TextEnd {
-                                content_index,
-                                content: assistant.text.clone(),
-                            },
-                        });
-                    }
-                    self.replace_last_message(&assistant);
-                    sink.emit(AgentEvent::MessageEnd {
-                        message: assistant.clone(),
-                    });
-                    return Ok((assistant, reason));
+                    return self.finish_stream(
+                        &mut assistant,
+                        reason,
+                        started,
+                        &text_indices,
+                        &thinking_indices,
+                        sink,
+                    );
                 }
             }
         }
@@ -1850,6 +2046,7 @@ mod tests {
         let usage = nyan_coding_agent_core::Usage {
             input: 11,
             output: 4,
+            reasoning: 1,
             cache_read: 2,
             cache_write: 0,
             total_tokens: 15,
@@ -1930,6 +2127,99 @@ mod tests {
             })
             .expect("agent end");
         assert_eq!(end.len(), 2, "the prompt and the assistant message");
+    }
+
+    #[test]
+    fn thinking_stream_updates_ordered_content_and_events() {
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::from([vec![
+                    ProviderStreamEvent::ThinkingStart {
+                        content_index: 4,
+                        text: String::new(),
+                        signature: None,
+                        redacted: false,
+                    },
+                    ProviderStreamEvent::ThinkingDelta {
+                        content_index: 4,
+                        delta: "reason".to_owned(),
+                    },
+                    ProviderStreamEvent::ThinkingEnd {
+                        content_index: 4,
+                        content: "reason".to_owned(),
+                        signature: Some("sig".to_owned()),
+                        redacted: false,
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        text: "answer".to_owned(),
+                    },
+                    ProviderStreamEvent::Finished {
+                        reason: ProviderStopReason::Stop,
+                    },
+                ]])),
+                failures: Mutex::new(0),
+            },
+        };
+        let tools = Tools { echo: EchoTool };
+        let mut runtime = AgentRuntime::new(
+            &providers,
+            &tools,
+            RuntimeConfig::new(
+                ProviderModel {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                },
+                "/tmp/project",
+            ),
+        );
+        let (result, events) =
+            run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
+
+        let assistant = result.messages.last().expect("assistant message");
+        assert_eq!(
+            assistant.content,
+            vec![
+                nyan_coding_agent_core::ContentBlock::Thinking {
+                    text: "reason".to_owned(),
+                    signature: Some("sig".to_owned()),
+                    redacted: false,
+                },
+                nyan_coding_agent_core::ContentBlock::Text {
+                    text: "answer".to_owned(),
+                    signature: None,
+                },
+            ]
+        );
+        let updates: Vec<&AssistantEvent> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageUpdate { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            updates,
+            [
+                &AssistantEvent::ThinkingStart { content_index: 0 },
+                &AssistantEvent::ThinkingDelta {
+                    content_index: 0,
+                    delta: "reason".to_owned(),
+                },
+                &AssistantEvent::ThinkingEnd {
+                    content_index: 0,
+                    content: "reason".to_owned(),
+                },
+                &AssistantEvent::TextStart { content_index: 1 },
+                &AssistantEvent::TextDelta {
+                    content_index: 1,
+                    delta: "answer".to_owned(),
+                },
+                &AssistantEvent::TextEnd {
+                    content_index: 1,
+                    content: "answer".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

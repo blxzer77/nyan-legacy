@@ -175,6 +175,7 @@ pub struct ProcessOutput {
 /// [`ToolError::Cancelled`] when cancellation happens before spawn, and
 /// [`ToolError::UnknownOutcome`] when a running process group is terminated by
 /// cancellation or its completion cannot be proven.
+#[must_use]
 pub fn run_process(
     spec: ProcessSpec,
     cancellation: CancellationToken,

@@ -76,7 +76,8 @@ fn text_streams_and_the_request_is_a_stateless_responses_call() {
             json!({"type": "response.output_text.delta", "delta": "lo"}),
             completed(
                 &json!({"input_tokens": 12, "output_tokens": 3, "total_tokens": 15,
-                "input_tokens_details": {"cached_tokens": 4}}),
+                "input_tokens_details": {"cached_tokens": 4},
+                "output_tokens_details": {"reasoning_tokens": 1}}),
             ),
         ],
     );
@@ -92,6 +93,7 @@ fn text_streams_and_the_request_is_a_stateless_responses_call() {
             ProviderStreamEvent::Usage(Usage {
                 input: 8,
                 output: 3,
+                reasoning: 1,
                 cache_read: 4,
                 cache_write: 0,
                 total_tokens: 15,
@@ -222,6 +224,7 @@ fn a_function_call_is_assembled_from_argument_deltas_and_ends_in_tool_use() {
             ProviderStreamEvent::Usage(Usage {
                 input: 5,
                 output: 2,
+                reasoning: 0,
                 cache_read: 0,
                 cache_write: 0,
                 total_tokens: 7,

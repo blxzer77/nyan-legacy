@@ -76,7 +76,7 @@ pub enum SessionState {
 pub enum SessionFormat {
     /// The Rust-native versioned format.
     RustNative,
-    /// The current durable SQLite format, read during migration.
+    /// The current durable `SQLite` format, read during migration.
     DurableSqlite,
     /// The historical JSONL format, read-only during migration.
     LegacyJsonl,
@@ -277,10 +277,11 @@ const BLOCK_THINKING: u8 = 1;
 const BLOCK_IMAGE: u8 = 2;
 const BLOCK_TOOL_CALL: u8 = 3;
 
-/// Usage record kinds. Kind 1 is the five token counts; later kinds extend it in place,
-/// so adding cost does not need a new codec version.
+/// Usage record kinds. Kind 1 is the original five token counts; kind 2 adds
+/// reasoning tokens without changing the message codec version.
 const USAGE_NONE: u8 = 0;
 const USAGE_BASIC: u8 = 1;
+const USAGE_WITH_REASONING: u8 = 2;
 
 /// Encodes one provider-neutral message into a stable Rust-native payload.
 ///
@@ -341,10 +342,11 @@ pub fn encode_message(message: &Message) -> Result<Vec<u8>, SessionMessageError>
     put_optional_string(&mut bytes, message.model.as_deref())?;
     match message.usage {
         Some(usage) => {
-            bytes.push(USAGE_BASIC);
+            bytes.push(USAGE_WITH_REASONING);
             for value in [
                 usage.input,
                 usage.output,
+                usage.reasoning,
                 usage.cache_read,
                 usage.cache_write,
                 usage.total_tokens,
@@ -401,6 +403,15 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
         USAGE_BASIC => Some(Usage {
             input: cursor.u64()?,
             output: cursor.u64()?,
+            reasoning: 0,
+            cache_read: cursor.u64()?,
+            cache_write: cursor.u64()?,
+            total_tokens: cursor.u64()?,
+        }),
+        USAGE_WITH_REASONING => Some(Usage {
+            input: cursor.u64()?,
+            output: cursor.u64()?,
+            reasoning: cursor.u64()?,
             cache_read: cursor.u64()?,
             cache_write: cursor.u64()?,
             total_tokens: cursor.u64()?,
@@ -1718,6 +1729,7 @@ mod tests {
             usage: Some(Usage {
                 input: 100,
                 output: 20,
+                reasoning: 4,
                 cache_read: 5,
                 cache_write: 3,
                 total_tokens: 120,

@@ -164,7 +164,7 @@ fn usage_is_reported_before_the_terminal_event() {
             (
                 0,
                 sse(
-                    r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":4}}}"#,
+                    r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":1}}}"#,
                 ),
             ),
             (0, sse("[DONE]")),
@@ -182,6 +182,7 @@ fn usage_is_reported_before_the_terminal_event() {
             ProviderStreamEvent::Usage(nyan_coding_agent_core::Usage {
                 input: 8,
                 output: 3,
+                reasoning: 1,
                 cache_read: 4,
                 cache_write: 0,
                 total_tokens: 15,

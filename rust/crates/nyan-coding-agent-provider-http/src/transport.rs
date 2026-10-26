@@ -30,6 +30,8 @@ pub(crate) enum Applied {
     Nothing,
     /// A chunk of assistant text.
     Text(String),
+    /// A provider-neutral incremental event.
+    Event(ProviderStreamEvent),
     /// The stream is complete; stop reading.
     Done,
 }
@@ -424,6 +426,7 @@ pub(crate) fn usage_from_counts(
     Usage {
         input,
         output,
+        reasoning: 0,
         cache_read,
         cache_write,
         total_tokens: input
@@ -488,6 +491,11 @@ async fn pump<P: StreamProtocol>(
                         .await
                         .is_err()
                     {
+                        return;
+                    }
+                }
+                Ok(Applied::Event(event)) => {
+                    if sender.send(Ok(event)).await.is_err() {
                         return;
                     }
                 }

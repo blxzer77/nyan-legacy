@@ -203,12 +203,14 @@ struct Accumulator {
 
 fn parse_usage(value: &Value) -> Usage {
     let count = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
-    usage_from_counts(
+    let mut parsed = usage_from_counts(
         count("/prompt_tokens"),
         count("/completion_tokens"),
         count("/prompt_tokens_details/cached_tokens"),
         count("/prompt_tokens_details/cache_write_tokens"),
-    )
+    );
+    parsed.reasoning = count("/completion_tokens_details/reasoning_tokens");
+    parsed
 }
 
 impl Accumulator {

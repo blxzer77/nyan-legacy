@@ -54,6 +54,35 @@ pub enum ProviderStreamEvent {
         /// Text content in this update.
         text: String,
     },
+    /// A thinking block started at the provider's content-block index.
+    ThinkingStart {
+        /// Provider content-block index, stable for the whole response.
+        content_index: usize,
+        /// Initial visible thinking text, usually empty for a streamed block.
+        text: String,
+        /// Initial opaque signature or redacted payload, when supplied at start.
+        signature: Option<String>,
+        /// Whether the provider withheld the thinking text.
+        redacted: bool,
+    },
+    /// A delta for an active thinking block.
+    ThinkingDelta {
+        /// Provider content-block index, stable for the whole response.
+        content_index: usize,
+        /// Thinking text appended by this update.
+        delta: String,
+    },
+    /// A thinking block ended with its authoritative content and signature.
+    ThinkingEnd {
+        /// Provider content-block index, stable for the whole response.
+        content_index: usize,
+        /// Complete visible thinking text; empty for a redacted block.
+        content: String,
+        /// Complete opaque signature or redacted payload.
+        signature: Option<String>,
+        /// Whether the provider withheld the thinking text.
+        redacted: bool,
+    },
     /// Token accounting for the response, which may arrive before the terminal event.
     Usage(Usage),
     /// A complete provider tool call.

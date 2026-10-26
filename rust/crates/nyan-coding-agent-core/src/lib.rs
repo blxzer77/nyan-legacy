@@ -159,8 +159,10 @@ pub enum ContentBlock {
 pub struct Usage {
     /// Input tokens.
     pub input: u64,
-    /// Output tokens.
+    /// Output tokens, including reasoning tokens when the provider reports them.
     pub output: u64,
+    /// Reasoning tokens included in the output count.
+    pub reasoning: u64,
     /// Input tokens served from the provider cache.
     pub cache_read: u64,
     /// Input tokens written to the provider cache.
@@ -305,14 +307,87 @@ impl Message {
 
     /// Appends streamed text while keeping both the ordered and legacy views in sync.
     pub fn append_text(&mut self, delta: &str) {
+        let _ = self.append_text_block(delta);
+    }
+
+    /// Appends streamed text and returns the ordered content-block index it changed.
+    pub fn append_text_block(&mut self, delta: &str) -> usize {
         self.text.push_str(delta);
-        if let Some(ContentBlock::Text { text, .. }) = self.content.last_mut() {
-            text.push_str(delta);
+        if matches!(self.content.last(), Some(ContentBlock::Text { .. })) {
+            let index = self.content.len() - 1;
+            if let ContentBlock::Text { text, .. } = &mut self.content[index] {
+                text.push_str(delta);
+            }
+            index
         } else {
+            let index = self.content.len();
             self.content.push(ContentBlock::Text {
                 text: delta.to_owned(),
                 signature: None,
             });
+            index
+        }
+    }
+
+    /// Starts a streamed thinking block and returns its ordered content-block index.
+    pub fn start_thinking(
+        &mut self,
+        text: impl Into<String>,
+        signature: Option<String>,
+        redacted: bool,
+    ) -> usize {
+        let index = self.content.len();
+        self.content.push(ContentBlock::Thinking {
+            text: text.into(),
+            signature,
+            redacted,
+        });
+        index
+    }
+
+    /// Appends a delta to an existing thinking block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidState`] when `index` does not identify a thinking block.
+    pub fn append_thinking(&mut self, index: usize, delta: &str) -> Result<(), CoreError> {
+        match self.content.get_mut(index) {
+            Some(ContentBlock::Thinking { text, .. }) => {
+                text.push_str(delta);
+                Ok(())
+            }
+            _ => Err(CoreError::InvalidState {
+                message: format!("content block {index} is not a thinking block"),
+            }),
+        }
+    }
+
+    /// Stores the authoritative final state of an existing thinking block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidState`] when `index` does not identify a thinking block.
+    pub fn finish_thinking(
+        &mut self,
+        index: usize,
+        content: impl Into<String>,
+        signature: Option<String>,
+        redacted: bool,
+    ) -> Result<(), CoreError> {
+        match self.content.get_mut(index) {
+            Some(ContentBlock::Thinking {
+                text,
+                signature: block_signature,
+                redacted: block_redacted,
+            }) => {
+                *text = content.into();
+                *block_signature = signature;
+                *block_redacted = redacted;
+                Ok(())
+            }
+            _ => Err(CoreError::InvalidState {
+                message: format!("content block {index} is not a thinking block"),
+            }),
         }
     }
 
@@ -546,6 +621,41 @@ mod tests {
                 ContentBlock::ToolCall(message.tool_calls[0].clone()),
                 ContentBlock::Text {
                     text: " tail".to_owned(),
+                    signature: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn streamed_thinking_can_be_updated_and_finalized_in_order() {
+        let mut message = Message::text(MessageRole::Assistant, "");
+        let thinking_index = message.start_thinking("", None, false);
+        message
+            .append_thinking(thinking_index, "reason")
+            .expect("thinking block");
+        message
+            .finish_thinking(
+                thinking_index,
+                "reason",
+                Some("signature".to_owned()),
+                false,
+            )
+            .expect("thinking block");
+        let text_index = message.append_text_block("answer");
+
+        assert_eq!(thinking_index, 0);
+        assert_eq!(text_index, 1);
+        assert_eq!(
+            message.content,
+            vec![
+                ContentBlock::Thinking {
+                    text: "reason".to_owned(),
+                    signature: Some("signature".to_owned()),
+                    redacted: false,
+                },
+                ContentBlock::Text {
+                    text: "answer".to_owned(),
                     signature: None,
                 },
             ]

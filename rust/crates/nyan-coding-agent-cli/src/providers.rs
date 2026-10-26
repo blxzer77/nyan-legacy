@@ -211,11 +211,11 @@ fn expand_template(
     let mut url = String::new();
     let mut rest = template;
     while let Some(start) = rest.find('{') {
-        let end = rest[start..]
+        let placeholder_end = rest[start..]
             .find('}')
             .map(|offset| start + offset)
             .ok_or_else(|| format!("malformed base URL template for \"{provider}\""))?;
-        let name = &rest[start + 1..end];
+        let name = &rest[start + 1..placeholder_end];
         let value = env_value(env, name)
             .or_else(|| {
                 stored
@@ -227,7 +227,7 @@ fn expand_template(
             })?;
         url.push_str(&rest[..start]);
         url.push_str(&value);
-        rest = &rest[end + 1..];
+        rest = &rest[placeholder_end + 1..];
     }
     url.push_str(rest);
     Ok(url)

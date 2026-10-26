@@ -113,6 +113,7 @@ fn request_uses_anthropic_headers_system_prompt_and_content_blocks() {
             ProviderStreamEvent::Usage(Usage {
                 input: 10,
                 output: 2,
+                reasoning: 0,
                 cache_read: 0,
                 cache_write: 0,
                 total_tokens: 12,
@@ -140,6 +141,126 @@ fn request_uses_anthropic_headers_system_prompt_and_content_blocks() {
     assert_eq!(body["system"][0]["text"], "be concise");
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["tools"][0]["name"], "echo");
+}
+
+fn thinking_server(runtime: &Runtime) -> Server {
+    let events = [
+        (
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 10, "output_tokens": 0}}
+            }),
+        ),
+        (
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "reason"}
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig"}
+            }),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": {"type": "redacted_thinking", "data": "opaque"}
+            }),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 1}),
+        ),
+        (
+            "message_delta",
+            json!({
+                "type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2, "output_tokens_details": {"thinking_tokens": 1}}
+            }),
+        ),
+        ("message_stop", json!({"type": "message_stop"})),
+    ];
+    serve(
+        runtime,
+        "200 OK",
+        events
+            .into_iter()
+            .map(|(kind, value)| (0, event(kind, value)))
+            .collect(),
+        false,
+    )
+}
+
+#[test]
+fn thinking_stream_emits_signed_and_redacted_blocks_in_order() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = thinking_server(&runtime);
+    let stream = runtime
+        .block_on(provider(&runtime, &server).stream(request(CancellationToken::new())))
+        .expect("stream");
+    let events = drain(&runtime, stream).expect("events");
+
+    assert_eq!(
+        events,
+        [
+            ProviderStreamEvent::ThinkingStart {
+                content_index: 0,
+                text: String::new(),
+                signature: None,
+                redacted: false,
+            },
+            ProviderStreamEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "reason".to_owned(),
+            },
+            ProviderStreamEvent::ThinkingEnd {
+                content_index: 0,
+                content: "reason".to_owned(),
+                signature: Some("sig".to_owned()),
+                redacted: false,
+            },
+            ProviderStreamEvent::ThinkingStart {
+                content_index: 1,
+                text: String::new(),
+                signature: Some("opaque".to_owned()),
+                redacted: true,
+            },
+            ProviderStreamEvent::ThinkingEnd {
+                content_index: 1,
+                content: String::new(),
+                signature: Some("opaque".to_owned()),
+                redacted: true,
+            },
+            ProviderStreamEvent::Usage(Usage {
+                input: 10,
+                output: 2,
+                reasoning: 1,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 12,
+            }),
+            ProviderStreamEvent::Finished {
+                reason: ProviderStopReason::Stop,
+            },
+        ]
+    );
 }
 
 #[test]

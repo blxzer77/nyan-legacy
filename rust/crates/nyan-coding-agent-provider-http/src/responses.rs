@@ -369,6 +369,7 @@ fn parse_usage(usage: &Value) -> nyan_coding_agent_core::Usage {
     if reported > 0 {
         parsed.total_tokens = reported;
     }
+    parsed.reasoning = count("/output_tokens_details/reasoning_tokens");
     parsed
 }
 

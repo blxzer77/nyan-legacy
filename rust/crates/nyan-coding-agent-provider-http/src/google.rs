@@ -327,17 +327,17 @@ impl GoogleStream {
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 .min(input);
+            let reasoning = usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             let output = usage
                 .get("candidatesTokenCount")
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
-                .saturating_add(
-                    usage
-                        .get("thoughtsTokenCount")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                );
+                .saturating_add(reasoning);
             let mut parsed = usage_from_counts(input, output, cache_read, 0);
+            parsed.reasoning = reasoning;
             if let Some(total) = usage.get("totalTokenCount").and_then(Value::as_u64) {
                 parsed.total_tokens = total;
             }

@@ -123,8 +123,11 @@ fn vertex_lists_only_gemini_models_and_resolves_latest_aliases() {
         (latest.context_window, latest.name.as_str()),
         (1_000_000, "Gemini Flash Latest")
     );
-    assert_eq!(vertex[0].cost.cache_read, 0.03, "the corrected cache price");
-    assert_eq!(vertex[0].cost.cache_write, 0.0);
+    assert!(
+        (vertex[0].cost.cache_read - 0.03).abs() < 1e-12,
+        "the corrected cache price"
+    );
+    assert!(vertex[0].cost.cache_write.abs() < f64::EPSILON);
     assert!(vertex.iter().all(|m| m.api == WireApi::GoogleVertex));
     let google_latest = catalog
         .find("google", "gemini-flash-latest")
