@@ -7,10 +7,11 @@ use nyan_coding_agent_core::{
     CancellationToken, ContentBlock, Message, MessageRole, ToolCall, ToolCallId, Usage,
 };
 use nyan_coding_agent_provider::{
-    ModelProvider, ProviderError, ProviderModel, ProviderRequest, ProviderStopReason,
-    ProviderStream, ProviderStreamEvent, ToolCallRequest, ToolSpec,
+    ModelProvider, ProviderError, ProviderModel, ProviderRequest, ProviderRequestOptions,
+    ProviderStopReason, ProviderStream, ProviderStreamEvent, ToolCallRequest, ToolSpec,
 };
 use nyan_coding_agent_provider_http::OpenAiResponsesProvider;
+use nyan_coding_agent_provider_http::responses::build_request_body;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
@@ -62,6 +63,24 @@ fn completed(usage: &Value) -> Value {
 fn body_of(server: &Server) -> Value {
     let captured = server.captured.lock().expect("lock").clone();
     serde_json::from_str(captured.split("\r\n\r\n").nth(1).expect("body")).expect("json body")
+}
+
+#[test]
+fn request_options_are_translated_to_responses_controls() {
+    let mut request = request(CancellationToken::new());
+    request.options = ProviderRequestOptions {
+        reasoning_effort: Some("high".to_owned()),
+        prompt_cache_retention: Some("24h".to_owned()),
+        prompt_cache_key: Some("cache-key".to_owned()),
+        service_tier: Some("priority".to_owned()),
+        max_output_tokens: Some(2048),
+    };
+    let body = build_request_body(&request, "developer");
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["prompt_cache_retention"], "24h");
+    assert_eq!(body["prompt_cache_key"], "cache-key");
+    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(body["max_output_tokens"], 2048);
 }
 
 #[test]
@@ -177,6 +196,7 @@ fn history_is_sent_as_responses_items_with_the_system_prompt_first() {
         tools: Vec::<ToolSpec>::new(),
         cancellation: CancellationToken::new(),
         session_id: None,
+        options: ProviderRequestOptions::default(),
     };
     let stream = runtime
         .block_on(provider(&runtime, &server).stream(request))

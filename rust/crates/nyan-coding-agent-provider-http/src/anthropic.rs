@@ -88,7 +88,11 @@ impl ModelProvider for AnthropicMessagesProvider {
     ) -> BoxFuture<Result<Box<dyn ProviderStream>, ProviderError>> {
         let post = Post {
             url: format!("{}/v1/messages", self.base_url),
-            body: build_request_body(&request, self.max_tokens).to_string(),
+            body: build_request_body(
+                &request,
+                request.options.max_output_tokens.unwrap_or(self.max_tokens),
+            )
+            .to_string(),
             bearer: None,
             headers: [
                 (

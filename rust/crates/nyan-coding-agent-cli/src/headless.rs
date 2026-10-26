@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use nyan_coding_agent_core::{CancellationToken, Message, MessageRole, StopReason, now_ms};
 use nyan_coding_agent_protocol::{event_to_jsonl, session_header_jsonl};
-use nyan_coding_agent_provider::{ProviderModel, ProviderRegistry};
+use nyan_coding_agent_provider::{ProviderModel, ProviderRegistry, ProviderRequestOptions};
 use nyan_coding_agent_runtime::{AgentEvent, AgentRuntime, EventSink, RetrySleep, RuntimeConfig};
 use nyan_coding_agent_session::{NativeSession, SessionRecordKind, SessionStoreError};
 use nyan_coding_agent_tools::ToolRegistry;
@@ -43,6 +43,8 @@ pub struct HeadlessOptions {
     pub cancellation: CancellationToken,
     /// How the run waits between provider retries.
     pub retry_sleep: Option<RetrySleep>,
+    /// Provider request controls selected by the CLI.
+    pub request_options: ProviderRequestOptions,
 }
 
 /// A session shared between the run and the code that reports on it afterwards.
@@ -222,6 +224,7 @@ pub async fn run_headless(
         .ok()
         .map(|guard| guard.session().descriptor.id.as_str().to_owned());
     config.retry_sleep.clone_from(&options.retry_sleep);
+    config.request_options.clone_from(&options.request_options);
     let mut runtime =
         AgentRuntime::new(providers, tools, config).with_cancellation(options.cancellation.clone());
     if let Err(message) = prepare_session(&session, options.system_prompt.as_deref()) {
@@ -279,7 +282,7 @@ mod tests {
     use nyan_coding_agent_core::{BoxFuture, CancellationToken, CoreError};
     use nyan_coding_agent_provider::{
         ModelProvider, ProviderError, ProviderModel, ProviderRegistry, ProviderRequest,
-        ProviderStopReason, ProviderStream, ProviderStreamEvent,
+        ProviderRequestOptions, ProviderStopReason, ProviderStream, ProviderStreamEvent,
     };
     use nyan_coding_agent_tools::{Tool, ToolDefinition, ToolRegistry};
 
@@ -432,6 +435,7 @@ mod tests {
                 system_prompt: None,
                 cancellation: CancellationToken::new(),
                 retry_sleep: None,
+                request_options: ProviderRequestOptions::default(),
             },
             &provider,
             &NoTools,

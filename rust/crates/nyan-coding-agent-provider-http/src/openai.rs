@@ -96,6 +96,18 @@ pub fn build_request_body(request: &ProviderRequest) -> Value {
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(request.tools.iter().map(wire_tool).collect());
     }
+    if let Some(effort) = &request.options.reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    if let Some(retention) = &request.options.prompt_cache_retention {
+        body["prompt_cache_retention"] = json!(retention);
+    }
+    if let Some(tier) = &request.options.service_tier {
+        body["service_tier"] = json!(tier);
+    }
+    if let Some(max_output_tokens) = request.options.max_output_tokens {
+        body["max_completion_tokens"] = json!(max_output_tokens);
+    }
     body
 }
 

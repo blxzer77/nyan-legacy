@@ -12,7 +12,7 @@ use nyan_coding_agent_session::NativeSession;
 
 use nyan_coding_agent_core::{CancellationToken, VERSION};
 use nyan_coding_agent_protocol::{RpcCommandName, SessionEventName};
-use nyan_coding_agent_provider::ProviderModel;
+use nyan_coding_agent_provider::{ProviderModel, ProviderRequestOptions};
 use nyan_coding_agent_tools::builtin::BuiltinTools;
 
 use crate::app_mode::{AppMode, resolve_app_mode};
@@ -138,6 +138,7 @@ enum Plan {
         messages: Vec<String>,
         tools: Vec<&'static str>,
         system_prompt: String,
+        request_options: ProviderRequestOptions,
         session: NativeSession,
     },
 }
@@ -261,6 +262,10 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
     let stdin = (env.read_stdin)();
     let prompts = build_prompts(stdin.as_deref(), &file_text, &parsed.messages);
     let system_prompt = build_prompt(&parsed, &tools, env);
+    let request_options = ProviderRequestOptions {
+        reasoning_effort: parsed.thinking.clone(),
+        ..ProviderRequestOptions::default()
+    };
     let session = match open_session(&parsed, &agent_dir(env), &env.cwd) {
         Ok(session) => session,
         Err(message) => return fail(err, &message),
@@ -272,6 +277,7 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         messages: prompts,
         tools,
         system_prompt,
+        request_options,
         session,
     }
 }
@@ -284,7 +290,7 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
         Some("logout") => return run_logout(&argv[1..], &agent_dir(env), out, err),
         _ => {}
     }
-    let (mode, model, setup, messages, tools, system_prompt, session) =
+    let (mode, model, setup, messages, tools, system_prompt, request_options, session) =
         match plan(argv, env, out, err) {
             Plan::Exit(code) => return code,
             Plan::Run {
@@ -294,8 +300,18 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
                 messages,
                 tools,
                 system_prompt,
+                request_options,
                 session,
-            } => (mode, model, setup, messages, tools, system_prompt, session),
+            } => (
+                mode,
+                model,
+                setup,
+                messages,
+                tools,
+                system_prompt,
+                request_options,
+                session,
+            ),
         };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -338,6 +354,7 @@ pub fn run(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedW
             system_prompt: Some(system_prompt),
             cancellation,
             retry_sleep: Some(interrupt::cancellable_sleep()),
+            request_options,
         },
         &providers,
         &BuiltinTools::only(&tools),

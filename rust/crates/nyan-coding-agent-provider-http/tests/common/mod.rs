@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use nyan_coding_agent_core::{CancellationToken, Message, MessageRole};
 use nyan_coding_agent_provider::{
-    ProviderError, ProviderModel, ProviderRequest, ProviderStream, ProviderStreamEvent, ToolSpec,
+    ProviderError, ProviderModel, ProviderRequest, ProviderRequestOptions, ProviderStream,
+    ProviderStreamEvent, ToolSpec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -103,6 +104,7 @@ pub fn request(cancellation: CancellationToken) -> ProviderRequest {
         }],
         cancellation,
         session_id: None,
+        options: ProviderRequestOptions::default(),
     }
 }
 

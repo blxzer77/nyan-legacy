@@ -5,9 +5,11 @@ use std::time::Duration;
 
 use nyan_coding_agent_core::{CancellationToken, ContentBlock};
 use nyan_coding_agent_provider::{
-    ModelProvider, ProviderError, ProviderStopReason, ProviderStream, ProviderStreamEvent,
+    ModelProvider, ProviderError, ProviderRequestOptions, ProviderStopReason, ProviderStream,
+    ProviderStreamEvent,
 };
 use nyan_coding_agent_provider_http::OpenAiChatProvider;
+use nyan_coding_agent_provider_http::openai::build_request_body;
 use serde_json::json;
 
 mod common;
@@ -30,6 +32,23 @@ fn open(
     provider: &OpenAiChatProvider,
 ) -> Result<Box<dyn ProviderStream>, ProviderError> {
     runtime.block_on(provider.stream(request(CancellationToken::new())))
+}
+
+#[test]
+fn request_options_are_translated_to_chat_controls() {
+    let mut request = request(CancellationToken::new());
+    request.options = ProviderRequestOptions {
+        reasoning_effort: Some("low".to_owned()),
+        prompt_cache_retention: Some("infinite".to_owned()),
+        prompt_cache_key: None,
+        service_tier: Some("flex".to_owned()),
+        max_output_tokens: Some(512),
+    };
+    let body = build_request_body(&request);
+    assert_eq!(body["reasoning_effort"], "low");
+    assert_eq!(body["prompt_cache_retention"], "infinite");
+    assert_eq!(body["service_tier"], "flex");
+    assert_eq!(body["max_completion_tokens"], 512);
 }
 
 #[test]

@@ -31,6 +31,21 @@ pub struct ToolSpec {
     pub parameters_schema: String,
 }
 
+/// Optional controls that providers may translate into their wire-specific request fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProviderRequestOptions {
+    /// Requested reasoning effort, such as `low` or `high`.
+    pub reasoning_effort: Option<String>,
+    /// Prompt-cache retention policy understood by the selected provider.
+    pub prompt_cache_retention: Option<String>,
+    /// Stable key used to group requests into a provider prompt cache.
+    pub prompt_cache_key: Option<String>,
+    /// Provider service tier, when the wire API supports it.
+    pub service_tier: Option<String>,
+    /// Maximum output tokens for APIs that expose an override.
+    pub max_output_tokens: Option<u64>,
+}
+
 /// A provider-neutral request.
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
@@ -44,6 +59,8 @@ pub struct ProviderRequest {
     pub cancellation: CancellationToken,
     /// The conversation's id, for providers that route or cache by conversation.
     pub session_id: Option<String>,
+    /// Optional request controls translated by compatible wire adapters.
+    pub options: ProviderRequestOptions,
 }
 
 /// A provider-requested stream update.
@@ -298,6 +315,7 @@ mod tests {
             tools: Vec::new(),
             cancellation: nyan_coding_agent_core::CancellationToken::new(),
             session_id: None,
+            options: super::ProviderRequestOptions::default(),
         };
         assert_eq!(request.messages[0].text, "hello");
         assert!(!request.cancellation.is_cancelled());

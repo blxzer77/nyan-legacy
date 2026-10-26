@@ -9,7 +9,8 @@ use nyan_coding_agent_core::{
     BoxFuture, CancellationToken, Message, MessageRole, ToolCall, ToolCallId,
 };
 use nyan_coding_agent_provider::{
-    ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStreamEvent,
+    ModelProvider, ProviderError, ProviderRequest, ProviderRequestOptions, ProviderStopReason,
+    ProviderStreamEvent,
 };
 use nyan_coding_agent_provider_http::codex::{build_request_body, resolve_url};
 use nyan_coding_agent_provider_http::{CodexAuthSource, CodexCredentials, OpenAiCodexProvider};
@@ -105,6 +106,24 @@ fn with_session(session: Option<&str>) -> ProviderRequest {
         session_id: session.map(str::to_owned),
         ..request(CancellationToken::new())
     }
+}
+
+#[test]
+fn request_options_are_translated_to_codex_controls() {
+    let mut request = with_session(Some("session"));
+    request.options = ProviderRequestOptions {
+        reasoning_effort: Some("high".to_owned()),
+        prompt_cache_retention: Some("24h".to_owned()),
+        prompt_cache_key: Some("explicit-key".to_owned()),
+        service_tier: Some("priority".to_owned()),
+        max_output_tokens: Some(4096),
+    };
+    let body = build_request_body(&request);
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["prompt_cache_retention"], "24h");
+    assert_eq!(body["prompt_cache_key"], "explicit-key");
+    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(body["max_output_tokens"], 4096);
 }
 
 #[test]

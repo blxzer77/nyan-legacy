@@ -19,8 +19,8 @@ use nyan_coding_agent_core::{
     StopReason, ToolCall, ToolCallId, ToolResult, ToolUpdateSink,
 };
 use nyan_coding_agent_provider::{
-    ProviderError, ProviderModel, ProviderRegistry, ProviderRequest, ProviderStopReason,
-    ProviderStreamEvent, ToolSpec,
+    ProviderError, ProviderModel, ProviderRegistry, ProviderRequest, ProviderRequestOptions,
+    ProviderStopReason, ProviderStreamEvent, ToolSpec,
 };
 use nyan_coding_agent_session::{NativeSession, SessionRecordKind, SessionStoreError};
 use nyan_coding_agent_tools::{ToolError, ToolRegistry};
@@ -269,6 +269,8 @@ pub struct RuntimeConfig {
     pub tool_execution: ToolExecutionMode,
     /// The conversation id sent with every provider request.
     pub session_id: Option<String>,
+    /// Optional provider request controls.
+    pub request_options: ProviderRequestOptions,
 }
 
 impl RuntimeConfig {
@@ -285,6 +287,7 @@ impl RuntimeConfig {
             retry_sleep: None,
             tool_execution: ToolExecutionMode::Parallel,
             session_id: None,
+            request_options: ProviderRequestOptions::default(),
         }
     }
 }
@@ -767,6 +770,21 @@ impl<'a> AgentRuntime<'a> {
         })
     }
 
+    /// Shrinks an explicitly configured output limit for a context-overflow retry.
+    ///
+    /// This retry is not a fresh backoff attempt: it changes the request shape and
+    /// immediately asks the provider again, so it does not consume `max_retries`.
+    fn shrink_output_tokens(&mut self) -> bool {
+        let Some(current) = self.config.request_options.max_output_tokens else {
+            return false;
+        };
+        if current <= 1 {
+            return false;
+        }
+        self.config.request_options.max_output_tokens = Some(current.div_ceil(2));
+        true
+    }
+
     /// The wait before retry number `attempt`: a provider delay overrides the
     /// local backoff, and both are capped by the runtime policy.
     fn retry_delay(&self, attempt: usize, error: &RuntimeError) -> Duration {
@@ -789,7 +807,8 @@ impl<'a> AgentRuntime<'a> {
         sink: &Arc<dyn EventSink>,
     ) -> Result<(Message, ProviderStopReason), RuntimeError> {
         let provider = self.providers.provider(&self.config.model.provider)?;
-        for retry_index in 0..=self.config.max_retries {
+        let mut retry_index = 0;
+        loop {
             self.cancellation.check()?;
             let request = ProviderRequest {
                 model: self.config.model.clone(),
@@ -806,6 +825,7 @@ impl<'a> AgentRuntime<'a> {
                     .collect(),
                 cancellation: self.cancellation.clone(),
                 session_id: self.config.session_id.clone(),
+                options: self.config.request_options.clone(),
             };
             let (failure, retryable) = match provider.stream(request).await {
                 Ok(mut stream) => match self.consume_stream(&mut *stream, &**sink).await {
@@ -830,6 +850,13 @@ impl<'a> AgentRuntime<'a> {
                     (error.into(), retryable)
                 }
             };
+            if matches!(
+                &failure,
+                RuntimeError::Provider(ProviderError::ContextOverflow { .. })
+            ) && self.shrink_output_tokens()
+            {
+                continue;
+            }
             if !retryable || retry_index >= self.config.max_retries {
                 if retry_index > 0 {
                     sink.emit(AgentEvent::RetryEnd {
@@ -848,6 +875,7 @@ impl<'a> AgentRuntime<'a> {
                 delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                 error_message: failure.to_string(),
             });
+            retry_index = attempt;
             if let Some(sleep) = &self.config.retry_sleep {
                 (sleep.0)(delay, self.cancellation.clone()).await;
             }
@@ -860,7 +888,6 @@ impl<'a> AgentRuntime<'a> {
                 return Err(RuntimeError::Core(CoreError::Cancelled));
             }
         }
-        Err(RuntimeError::UnterminatedProviderStream)
     }
 
     /// Adds the assistant message to the transcript and announces it, once.
@@ -2462,6 +2489,40 @@ mod tests {
                 ..
             } if operation == "uncertain-write"
         ));
+    }
+
+    #[test]
+    fn context_overflow_retries_can_shrink_an_explicit_output_limit() {
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::new()),
+                failures: Mutex::new(0),
+            },
+        };
+        let tools = Tools { echo: EchoTool };
+        let mut config = RuntimeConfig::new(
+            ProviderModel {
+                provider: "fake".to_owned(),
+                model: "test".to_owned(),
+            },
+            "/tmp/project",
+        );
+        config.request_options.max_output_tokens = Some(100);
+        let mut runtime = AgentRuntime::new(&providers, &tools, config);
+
+        assert!(runtime.shrink_output_tokens());
+        assert_eq!(runtime.config.request_options.max_output_tokens, Some(50));
+        assert!(runtime.shrink_output_tokens());
+        assert_eq!(runtime.config.request_options.max_output_tokens, Some(25));
+        assert!(runtime.shrink_output_tokens());
+        assert_eq!(runtime.config.request_options.max_output_tokens, Some(13));
+        for _ in 0..4 {
+            assert!(runtime.shrink_output_tokens());
+        }
+        assert_eq!(runtime.config.request_options.max_output_tokens, Some(1));
+        assert!(!runtime.shrink_output_tokens());
+        runtime.config.request_options.max_output_tokens = None;
+        assert!(!runtime.shrink_output_tokens());
     }
 
     #[test]

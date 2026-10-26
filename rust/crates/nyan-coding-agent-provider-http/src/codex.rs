@@ -190,8 +190,22 @@ pub fn build_request_body(request: &ProviderRequest) -> Value {
         "tool_choice": "auto",
         "parallel_tool_calls": true,
     });
-    if let Some(session) = &request.session_id {
+    if let Some(effort) = &request.options.reasoning_effort {
+        body["reasoning"] = json!({"effort": effort});
+    }
+    if let Some(retention) = &request.options.prompt_cache_retention {
+        body["prompt_cache_retention"] = json!(retention);
+    }
+    if let Some(key) = &request.options.prompt_cache_key {
+        body["prompt_cache_key"] = json!(key);
+    } else if let Some(session) = &request.session_id {
         body["prompt_cache_key"] = json!(session);
+    }
+    if let Some(tier) = &request.options.service_tier {
+        body["service_tier"] = json!(tier);
+    }
+    if let Some(max_output_tokens) = request.options.max_output_tokens {
+        body["max_output_tokens"] = json!(max_output_tokens);
     }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
