@@ -242,15 +242,16 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
         Ok(model) => model,
         Err(message) => return fail(err, &message),
     };
-    let setup = match resolve_provider(&model.provider, &model.model, &parsed, env, &agent) {
-        Ok(resolved) => {
-            for note in &resolved.notes {
-                write_to(err, &format!("{note}\n"));
+    let (setup, cost_rates) =
+        match resolve_provider(&model.provider, &model.model, &parsed, env, &agent) {
+            Ok(resolved) => {
+                for note in &resolved.notes {
+                    write_to(err, &format!("{note}\n"));
+                }
+                (resolved.setup, resolved.cost_rates)
             }
-            resolved.setup
-        }
-        Err(message) => return fail(err, &message),
-    };
+            Err(message) => return fail(err, &message),
+        };
     let tools = match select_tools(&parsed) {
         Ok(tools) => tools,
         Err(message) => return fail(err, &message),
@@ -264,6 +265,7 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
     let system_prompt = build_prompt(&parsed, &tools, env);
     let request_options = ProviderRequestOptions {
         reasoning_effort: parsed.thinking.clone(),
+        cost_rates,
         ..ProviderRequestOptions::default()
     };
     let session = match open_session(&parsed, &agent_dir(env), &env.cwd) {

@@ -156,7 +156,7 @@ impl ModelProvider for OpenAiCodexProvider {
                 .start(
                     post,
                     request.cancellation.clone(),
-                    ResponsesStream::default(),
+                    ResponsesStream::with_cost_rates(request.options.cost_rates),
                 )
                 .await
         })

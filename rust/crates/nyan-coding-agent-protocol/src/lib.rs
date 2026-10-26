@@ -395,8 +395,12 @@ fn arguments_json(arguments: &str) -> String {
     }
 }
 
+fn micros_json(value: u64) -> String {
+    format!("{}.{:06}", value / 1_000_000, value % 1_000_000)
+}
+
 fn usage_json(usage: Usage) -> String {
-    format!(
+    let mut out = format!(
         "{{\"input\":{},\"output\":{},\"reasoning\":{},\"cacheRead\":{},\"cacheWrite\":{},\"totalTokens\":{}}}",
         usage.input,
         usage.output,
@@ -404,7 +408,23 @@ fn usage_json(usage: Usage) -> String {
         usage.cache_read,
         usage.cache_write,
         usage.total_tokens
-    )
+    );
+    if let Some(cost) = usage.cost {
+        let cost_json = format!(
+            "{{\"input\":{},\"output\":{},\"cacheRead\":{},\"cacheWrite\":{},\"total\":{}}}",
+            micros_json(cost.input_micros),
+            micros_json(cost.output_micros),
+            micros_json(cost.cache_read_micros),
+            micros_json(cost.cache_write_micros),
+            micros_json(cost.total_micros),
+        );
+        out.pop();
+        out.push(',');
+        out.push_str("\"cost\":");
+        out.push_str(&cost_json);
+        out.push('}');
+    }
+    out
 }
 
 const fn stop_reason_name(reason: StopReason) -> &'static str {
@@ -879,7 +899,9 @@ mod tests {
 
     #[test]
     fn assistant_messages_carry_provider_usage_and_stop_reason() {
-        use nyan_coding_agent_core::{MessageRole, StopReason, ToolCall, ToolCallId, Usage};
+        use nyan_coding_agent_core::{
+            MessageRole, StopReason, ToolCall, ToolCallId, Usage, UsageCost,
+        };
 
         let mut message = Message::text(MessageRole::Assistant, "done");
         message.timestamp_ms = 9;
@@ -890,6 +912,13 @@ mod tests {
             output: 2,
             reasoning: 1,
             cache_read: 1,
+            cost: Some(UsageCost {
+                input_micros: 16,
+                output_micros: 12,
+                cache_read_micros: 2,
+                cache_write_micros: 0,
+                total_micros: 30,
+            }),
             cache_write: 0,
             total_tokens: 12,
         });
@@ -905,7 +934,7 @@ mod tests {
                 "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"},",
                 "{\"type\":\"toolCall\",\"id\":\"c1\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}],",
                 "\"provider\":\"openai\",\"model\":\"gpt-test\",",
-                "\"usage\":{\"input\":10,\"output\":2,\"reasoning\":1,\"cacheRead\":1,\"cacheWrite\":0,\"totalTokens\":12},",
+                "\"usage\":{\"input\":10,\"output\":2,\"reasoning\":1,\"cacheRead\":1,\"cacheWrite\":0,\"totalTokens\":12,\"cost\":{\"input\":0.000016,\"output\":0.000012,\"cacheRead\":0.000002,\"cacheWrite\":0.000000,\"total\":0.000030}},",
                 "\"stopReason\":\"toolUse\",\"timestamp\":9}"
             )
         );

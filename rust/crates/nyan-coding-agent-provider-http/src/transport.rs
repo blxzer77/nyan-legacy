@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use nyan_coding_agent_core::{BoxFuture, CancellationToken, Usage};
+use nyan_coding_agent_core::{BoxFuture, CancellationToken, ModelCostRates, Usage};
 use nyan_coding_agent_provider::{
     ProviderError, ProviderStopReason, ProviderStream, ProviderStreamEvent, ToolCallRequest,
 };
@@ -433,7 +433,12 @@ pub(crate) fn usage_from_counts(
             .saturating_add(output)
             .saturating_add(cache_read)
             .saturating_add(cache_write),
+        cost: None,
     }
+}
+
+pub(crate) fn apply_usage_cost(usage: &mut Usage, rates: Option<ModelCostRates>) {
+    usage.cost = rates.map(|rates| rates.calculate(usage));
 }
 
 async fn send_error(sender: &mpsc::Sender<EventResult>, message: &str, retryable: bool) {

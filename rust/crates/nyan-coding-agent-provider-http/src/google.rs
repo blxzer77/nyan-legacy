@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, ContentBlock, MessageRole, Usage};
+use nyan_coding_agent_core::{BoxFuture, ContentBlock, MessageRole, ModelCostRates, Usage};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ToolCallRequest, ToolSpec,
@@ -17,8 +17,9 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use crate::sse::SseEvent;
-use crate::transport::{Applied, Finished, Post, StreamProtocol, Transport, usage_from_counts};
-
+use crate::transport::{
+    Applied, Finished, Post, StreamProtocol, Transport, apply_usage_cost, usage_from_counts,
+};
 /// A Google Generative AI provider using an API key.
 #[derive(Clone, Debug)]
 pub struct GoogleGenerativeAiProvider {
@@ -143,8 +144,14 @@ impl ModelProvider for GoogleGenerativeAiProvider {
                 )
                 .collect(),
         };
-        self.transport
-            .start(post, request.cancellation.clone(), GoogleStream::default())
+        self.transport.start(
+            post,
+            request.cancellation.clone(),
+            GoogleStream {
+                cost_rates: request.options.cost_rates,
+                ..GoogleStream::default()
+            },
+        )
     }
 }
 
@@ -174,8 +181,14 @@ impl ModelProvider for GoogleVertexProvider {
             bearer,
             headers,
         };
-        self.transport
-            .start(post, request.cancellation.clone(), GoogleStream::default())
+        self.transport.start(
+            post,
+            request.cancellation.clone(),
+            GoogleStream {
+                cost_rates: request.options.cost_rates,
+                ..GoogleStream::default()
+            },
+        )
     }
 }
 
@@ -297,6 +310,7 @@ struct GoogleStream {
     next_call: u64,
     finish_reason: Option<String>,
     usage: Option<Usage>,
+    cost_rates: Option<ModelCostRates>,
     terminal: bool,
 }
 
@@ -338,6 +352,7 @@ impl GoogleStream {
                 .saturating_add(reasoning);
             let mut parsed = usage_from_counts(input, output, cache_read, 0);
             parsed.reasoning = reasoning;
+            apply_usage_cost(&mut parsed, self.cost_rates);
             if let Some(total) = usage.get("totalTokenCount").and_then(Value::as_u64) {
                 parsed.total_tokens = total;
             }

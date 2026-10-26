@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, ContentBlock, MessageRole, Usage};
+use nyan_coding_agent_core::{BoxFuture, ContentBlock, MessageRole, ModelCostRates, Usage};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ProviderStreamEvent, ToolCallRequest, ToolSpec,
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use crate::sse::SseEvent;
-use crate::transport::{Applied, Finished, Post, StreamProtocol, Transport};
+use crate::transport::{Applied, Finished, Post, StreamProtocol, Transport, apply_usage_cost};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -111,7 +111,10 @@ impl ModelProvider for AnthropicMessagesProvider {
         self.transport.start(
             post,
             request.cancellation.clone(),
-            AnthropicStream::default(),
+            AnthropicStream {
+                cost_rates: request.options.cost_rates,
+                ..AnthropicStream::default()
+            },
         )
     }
 }
@@ -273,6 +276,7 @@ struct AnthropicStream {
     thinking: BTreeMap<u64, PendingThinking>,
     terminal: Option<ProviderStopReason>,
     usage: Option<Usage>,
+    cost_rates: Option<ModelCostRates>,
 }
 
 fn stream_error(message: impl Into<String>) -> ProviderError {
@@ -294,7 +298,7 @@ impl AnthropicStream {
             let cache_read = count(usage, "/cache_read_input_tokens");
             let cache_write = count(usage, "/cache_creation_input_tokens");
             let reasoning = count(usage, "/output_tokens_details/thinking_tokens");
-            self.usage = Some(Usage {
+            let mut parsed = Usage {
                 input,
                 output,
                 reasoning,
@@ -304,7 +308,10 @@ impl AnthropicStream {
                     .saturating_add(output)
                     .saturating_add(cache_read)
                     .saturating_add(cache_write),
-            });
+                cost: None,
+            };
+            apply_usage_cost(&mut parsed, self.cost_rates);
+            self.usage = Some(parsed);
         }
     }
 
@@ -476,6 +483,7 @@ impl AnthropicStream {
                 .saturating_add(current.output)
                 .saturating_add(current.cache_read)
                 .saturating_add(current.cache_write);
+            apply_usage_cost(current, self.cost_rates);
         }
         if self.terminal.is_some() {
             Applied::Done

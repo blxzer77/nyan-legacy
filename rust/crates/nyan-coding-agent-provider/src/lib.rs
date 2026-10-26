@@ -1,6 +1,8 @@
 //! Model-provider boundary for the Rust Coding Agent.
 
-use nyan_coding_agent_core::{BoxFuture, CancellationToken, CoreError, Message, ModelRef, Usage};
+use nyan_coding_agent_core::{
+    BoxFuture, CancellationToken, CoreError, Message, ModelCostRates, ModelRef, Usage,
+};
 
 /// A model selected for one request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,6 +46,8 @@ pub struct ProviderRequestOptions {
     pub service_tier: Option<String>,
     /// Maximum output tokens for APIs that expose an override.
     pub max_output_tokens: Option<u64>,
+    /// Catalog prices used to calculate response cost.
+    pub cost_rates: Option<ModelCostRates>,
 }
 
 /// A provider-neutral request.

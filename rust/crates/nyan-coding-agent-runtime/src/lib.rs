@@ -2075,6 +2075,7 @@ mod tests {
             output: 4,
             reasoning: 1,
             cache_read: 2,
+            cost: None,
             cache_write: 0,
             total_tokens: 15,
         };

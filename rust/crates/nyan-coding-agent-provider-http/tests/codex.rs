@@ -117,6 +117,7 @@ fn request_options_are_translated_to_codex_controls() {
         prompt_cache_key: Some("explicit-key".to_owned()),
         service_tier: Some("priority".to_owned()),
         max_output_tokens: Some(4096),
+        cost_rates: None,
     };
     let body = build_request_body(&request);
     assert_eq!(body["reasoning"]["effort"], "high");

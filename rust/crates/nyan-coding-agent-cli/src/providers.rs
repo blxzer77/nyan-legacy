@@ -16,7 +16,7 @@
 use std::path::Path;
 
 use nyan_coding_agent_auth::{ApiKeyCredential, AuthStore, Credential};
-use nyan_coding_agent_core::CoreError;
+use nyan_coding_agent_core::{CoreError, ModelCostRates};
 use nyan_coding_agent_provider::{ModelProvider, ProviderError, ProviderModel, ProviderRegistry};
 use nyan_coding_agent_provider_http::cpa::{Endpoints, resolve_endpoints};
 use nyan_coding_agent_provider_http::{
@@ -268,6 +268,8 @@ fn vertex_setup(
 pub struct Resolved {
     /// The endpoint and credential.
     pub setup: ProviderSetup,
+    /// Catalog pricing for this model, when available.
+    pub cost_rates: Option<ModelCostRates>,
     /// Lines for stderr.
     pub notes: Vec<String>,
 }
@@ -275,6 +277,7 @@ pub struct Resolved {
 fn resolved(setup: ProviderSetup) -> Resolved {
     Resolved {
         setup,
+        cost_rates: None,
         notes: Vec::new(),
     }
 }
@@ -394,6 +397,12 @@ fn catalog_setup(
     };
     Ok(Resolved {
         setup: setup_for_api(entry.api, base_url, api_key, Some(entry.max_tokens))?,
+        cost_rates: ModelCostRates::from_dollars_per_million(
+            entry.cost.input,
+            entry.cost.output,
+            entry.cost.cache_read,
+            entry.cost.cache_write,
+        ),
         notes: loaded.notes,
     })
 }
@@ -440,21 +449,33 @@ fn simple_setup(
         return Err("this Anthropic credential is an OAuth token, which this build does not support yet; use an API key".to_owned());
     }
     let base_url = base_url_for(def, env, store)?;
+    let cached = load(env, agent_dir, Access::CacheOnly).ok();
     let max_tokens = if def.api == Api::AnthropicMessages {
-        load(env, agent_dir, Access::CacheOnly)
-            .ok()
-            .and_then(|loaded| {
-                loaded
-                    .catalog
-                    .find(def.id, model)
-                    .map(|entry| entry.max_tokens)
-            })
+        cached.as_ref().and_then(|loaded| {
+            loaded
+                .catalog
+                .find(def.id, model)
+                .map(|entry| entry.max_tokens)
+        })
     } else {
         None
     };
-    Ok(resolved(setup_for_api(
-        def.api, base_url, api_key, max_tokens,
-    )?))
+    let cost_rates = cached
+        .as_ref()
+        .and_then(|loaded| loaded.catalog.find(def.id, model))
+        .and_then(|entry| {
+            ModelCostRates::from_dollars_per_million(
+                entry.cost.input,
+                entry.cost.output,
+                entry.cost.cache_read,
+                entry.cost.cache_write,
+            )
+        });
+    Ok(Resolved {
+        setup: setup_for_api(def.api, base_url, api_key, max_tokens)?,
+        cost_rates,
+        notes: Vec::new(),
+    })
 }
 
 /// Whether `provider` has a credential this build could use, without making a request.

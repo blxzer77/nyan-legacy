@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, ContentBlock, Message, MessageRole};
+use nyan_coding_agent_core::{BoxFuture, ContentBlock, Message, MessageRole, ModelCostRates};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ToolCallRequest, ToolSpec,
@@ -22,8 +22,9 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use crate::sse::SseEvent;
-use crate::transport::{Applied, Finished, Post, StreamProtocol, Transport, usage_from_counts};
-
+use crate::transport::{
+    Applied, Finished, Post, StreamProtocol, Transport, apply_usage_cost, usage_from_counts,
+};
 /// A provider that speaks the `OpenAI` Responses streaming protocol.
 #[derive(Clone, Debug)]
 pub struct OpenAiResponsesProvider {
@@ -99,7 +100,10 @@ impl ModelProvider for OpenAiResponsesProvider {
         self.transport.start(
             post,
             request.cancellation.clone(),
-            ResponsesStream::default(),
+            ResponsesStream {
+                cost_rates: request.options.cost_rates,
+                ..ResponsesStream::default()
+            },
         )
     }
 }
@@ -238,6 +242,16 @@ pub(crate) struct ResponsesStream {
     calls: BTreeMap<u64, PendingCall>,
     by_item_id: HashMap<String, u64>,
     terminal: Option<Terminal>,
+    cost_rates: Option<ModelCostRates>,
+}
+
+impl ResponsesStream {
+    pub(crate) fn with_cost_rates(cost_rates: Option<ModelCostRates>) -> Self {
+        Self {
+            cost_rates,
+            ..Self::default()
+        }
+    }
 }
 
 fn stream_error(message: impl Into<String>) -> ProviderError {
@@ -343,7 +357,7 @@ impl ResponsesStream {
                     usage: response
                         .get("usage")
                         .filter(|usage| usage.is_object())
-                        .map(parse_usage),
+                        .map(|usage| parse_usage(usage, self.cost_rates)),
                 });
                 Ok(Applied::Done)
             }
@@ -372,7 +386,7 @@ impl ResponsesStream {
     }
 }
 
-fn parse_usage(usage: &Value) -> nyan_coding_agent_core::Usage {
+fn parse_usage(usage: &Value, cost_rates: Option<ModelCostRates>) -> nyan_coding_agent_core::Usage {
     let count = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
     let mut parsed = usage_from_counts(
         count("/input_tokens"),
@@ -385,9 +399,9 @@ fn parse_usage(usage: &Value) -> nyan_coding_agent_core::Usage {
         parsed.total_tokens = reported;
     }
     parsed.reasoning = count("/output_tokens_details/reasoning_tokens");
+    apply_usage_cost(&mut parsed, cost_rates);
     parsed
 }
-
 impl StreamProtocol for ResponsesStream {
     fn apply(&mut self, event: &SseEvent) -> Result<Applied, ProviderError> {
         if event.data == "[DONE]" {

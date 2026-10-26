@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, ContentBlock, Message, MessageRole, Usage};
+use nyan_coding_agent_core::{
+    BoxFuture, ContentBlock, Message, MessageRole, ModelCostRates, Usage,
+};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ToolCallRequest, ToolSpec,
@@ -16,7 +18,9 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use crate::sse::SseEvent;
-use crate::transport::{Applied, Finished, Post, StreamProtocol, Transport, usage_from_counts};
+use crate::transport::{
+    Applied, Finished, Post, StreamProtocol, Transport, apply_usage_cost, usage_from_counts,
+};
 
 /// A provider that speaks the `OpenAI` chat-completions streaming protocol.
 #[derive(Clone, Debug)]
@@ -79,8 +83,14 @@ impl ModelProvider for OpenAiChatProvider {
                 .transport
                 .session_headers(request.session_id.as_deref()),
         };
-        self.transport
-            .start(post, request.cancellation.clone(), Accumulator::default())
+        self.transport.start(
+            post,
+            request.cancellation.clone(),
+            Accumulator {
+                cost_rates: request.options.cost_rates,
+                ..Accumulator::default()
+            },
+        )
     }
 }
 
@@ -211,9 +221,10 @@ struct Accumulator {
     tool_calls: BTreeMap<u64, PendingToolCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
+    cost_rates: Option<ModelCostRates>,
 }
 
-fn parse_usage(value: &Value) -> Usage {
+fn parse_usage(value: &Value, cost_rates: Option<ModelCostRates>) -> Usage {
     let count = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
     let mut parsed = usage_from_counts(
         count("/prompt_tokens"),
@@ -222,6 +233,7 @@ fn parse_usage(value: &Value) -> Usage {
         count("/prompt_tokens_details/cache_write_tokens"),
     );
     parsed.reasoning = count("/completion_tokens_details/reasoning_tokens");
+    apply_usage_cost(&mut parsed, cost_rates);
     parsed
 }
 
@@ -239,7 +251,7 @@ impl Accumulator {
             });
         }
         if let Some(usage) = chunk.get("usage").filter(|usage| usage.is_object()) {
-            self.usage = Some(parse_usage(usage));
+            self.usage = Some(parse_usage(usage, self.cost_rates));
         }
         let Some(choice) = chunk.pointer("/choices/0") else {
             return Ok(None);

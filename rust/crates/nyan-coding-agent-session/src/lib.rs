@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use nyan_coding_agent_core::{
     AgentMode, ContentBlock, CoreError, Message, MessageRole, SessionId, StopReason, ToolCall,
-    ToolCallId, Usage,
+    ToolCallId, Usage, UsageCost,
 };
 
 const RUST_SESSION_HEADER: &[u8] = b"NYANRS01\n1\n";
@@ -278,10 +278,12 @@ const BLOCK_IMAGE: u8 = 2;
 const BLOCK_TOOL_CALL: u8 = 3;
 
 /// Usage record kinds. Kind 1 is the original five token counts; kind 2 adds
-/// reasoning tokens without changing the message codec version.
+/// reasoning tokens and kind 3 adds fixed-point cost, without changing the
+/// message codec version.
 const USAGE_NONE: u8 = 0;
 const USAGE_BASIC: u8 = 1;
 const USAGE_WITH_REASONING: u8 = 2;
+const USAGE_WITH_COST: u8 = 3;
 
 /// Encodes one provider-neutral message into a stable Rust-native payload.
 ///
@@ -342,7 +344,11 @@ pub fn encode_message(message: &Message) -> Result<Vec<u8>, SessionMessageError>
     put_optional_string(&mut bytes, message.model.as_deref())?;
     match message.usage {
         Some(usage) => {
-            bytes.push(USAGE_WITH_REASONING);
+            bytes.push(if usage.cost.is_some() {
+                USAGE_WITH_COST
+            } else {
+                USAGE_WITH_REASONING
+            });
             for value in [
                 usage.input,
                 usage.output,
@@ -352,6 +358,17 @@ pub fn encode_message(message: &Message) -> Result<Vec<u8>, SessionMessageError>
                 usage.total_tokens,
             ] {
                 bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            if let Some(cost) = usage.cost {
+                for value in [
+                    cost.input_micros,
+                    cost.output_micros,
+                    cost.cache_read_micros,
+                    cost.cache_write_micros,
+                    cost.total_micros,
+                ] {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
             }
         }
         None => bytes.push(USAGE_NONE),
@@ -405,6 +422,7 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
             output: cursor.u64()?,
             reasoning: 0,
             cache_read: cursor.u64()?,
+            cost: None,
             cache_write: cursor.u64()?,
             total_tokens: cursor.u64()?,
         }),
@@ -413,8 +431,24 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, SessionMessageError> {
             output: cursor.u64()?,
             reasoning: cursor.u64()?,
             cache_read: cursor.u64()?,
+            cost: None,
             cache_write: cursor.u64()?,
             total_tokens: cursor.u64()?,
+        }),
+        USAGE_WITH_COST => Some(Usage {
+            input: cursor.u64()?,
+            output: cursor.u64()?,
+            reasoning: cursor.u64()?,
+            cache_read: cursor.u64()?,
+            cache_write: cursor.u64()?,
+            total_tokens: cursor.u64()?,
+            cost: Some(UsageCost {
+                input_micros: cursor.u64()?,
+                output_micros: cursor.u64()?,
+                cache_read_micros: cursor.u64()?,
+                cache_write_micros: cursor.u64()?,
+                total_micros: cursor.u64()?,
+            }),
         }),
         value => return Err(SessionMessageError::InvalidFlag { value }),
     };
@@ -1581,7 +1615,7 @@ mod tests {
     };
     use nyan_coding_agent_core::{
         AgentMode, ContentBlock, Message, MessageRole, SessionId, StopReason, ToolCall, ToolCallId,
-        Usage,
+        Usage, UsageCost,
     };
 
     fn test_root(name: &str) -> std::path::PathBuf {
@@ -1731,6 +1765,13 @@ mod tests {
                 output: 20,
                 reasoning: 4,
                 cache_read: 5,
+                cost: Some(UsageCost {
+                    input_micros: 10,
+                    output_micros: 20,
+                    cache_read_micros: 3,
+                    cache_write_micros: 4,
+                    total_micros: 37,
+                }),
                 cache_write: 3,
                 total_tokens: 120,
             }),

@@ -4,7 +4,8 @@
 use std::time::Duration;
 
 use nyan_coding_agent_core::{
-    CancellationToken, ContentBlock, Message, MessageRole, ToolCall, ToolCallId, Usage,
+    CancellationToken, ContentBlock, Message, MessageRole, ModelCostRates, ToolCall, ToolCallId,
+    Usage, UsageCost,
 };
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderModel, ProviderRequest, ProviderRequestOptions,
@@ -74,6 +75,7 @@ fn request_options_are_translated_to_responses_controls() {
         prompt_cache_key: Some("cache-key".to_owned()),
         service_tier: Some("priority".to_owned()),
         max_output_tokens: Some(2048),
+        cost_rates: None,
     };
     let body = build_request_body(&request, "developer");
     assert_eq!(body["reasoning"]["effort"], "high");
@@ -81,6 +83,43 @@ fn request_options_are_translated_to_responses_controls() {
     assert_eq!(body["prompt_cache_key"], "cache-key");
     assert_eq!(body["service_tier"], "priority");
     assert_eq!(body["max_output_tokens"], 2048);
+}
+
+#[test]
+fn response_usage_calculates_catalog_cost_when_rates_are_available() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve(
+        &runtime,
+        "200 OK",
+        frames(&[completed(&json!({
+            "input_tokens": 12,
+            "output_tokens": 3,
+            "total_tokens": 15,
+            "input_tokens_details": {"cached_tokens": 4}
+        }))]),
+        false,
+    );
+    let mut request = request(CancellationToken::new());
+    request.options.cost_rates = ModelCostRates::from_dollars_per_million(2.0, 4.0, 0.5, 1.0);
+    let events = runtime
+        .block_on(provider(&runtime, &server).stream(request))
+        .and_then(|stream| drain(&runtime, stream))
+        .expect("stream");
+    assert!(events.contains(&ProviderStreamEvent::Usage(Usage {
+        input: 8,
+        output: 3,
+        reasoning: 0,
+        cache_read: 4,
+        cache_write: 0,
+        total_tokens: 15,
+        cost: Some(UsageCost {
+            input_micros: 16,
+            output_micros: 12,
+            cache_read_micros: 2,
+            cache_write_micros: 0,
+            total_micros: 30,
+        }),
+    })));
 }
 
 #[test]
@@ -114,6 +153,7 @@ fn text_streams_and_the_request_is_a_stateless_responses_call() {
                 output: 3,
                 reasoning: 1,
                 cache_read: 4,
+                cost: None,
                 cache_write: 0,
                 total_tokens: 15,
             }),
@@ -246,6 +286,7 @@ fn a_function_call_is_assembled_from_argument_deltas_and_ends_in_tool_use() {
                 output: 2,
                 reasoning: 0,
                 cache_read: 0,
+                cost: None,
                 cache_write: 0,
                 total_tokens: 7,
             }),

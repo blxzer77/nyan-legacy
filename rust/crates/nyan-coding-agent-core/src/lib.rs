@@ -151,10 +151,90 @@ pub enum ContentBlock {
     ToolCall(ToolCall),
 }
 
+/// Fixed-point token cost in micro-dollars.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UsageCost {
+    /// Cost of uncached input tokens.
+    pub input_micros: u64,
+    /// Cost of output tokens.
+    pub output_micros: u64,
+    /// Cost of cached input tokens.
+    pub cache_read_micros: u64,
+    /// Cost of cache writes.
+    pub cache_write_micros: u64,
+    /// Sum of the four components.
+    pub total_micros: u64,
+}
+
+/// Per-million-token prices represented as micro-dollars.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelCostRates {
+    /// Input price in dollars per million tokens, converted to micro-dollars.
+    pub input_micros_per_million: u64,
+    /// Output price in dollars per million tokens, converted to micro-dollars.
+    pub output_micros_per_million: u64,
+    /// Cached input price in dollars per million tokens, converted to micro-dollars.
+    pub cache_read_micros_per_million: u64,
+    /// Cache-write price in dollars per million tokens, converted to micro-dollars.
+    pub cache_write_micros_per_million: u64,
+}
+
+impl ModelCostRates {
+    /// Converts catalog prices expressed as dollars per million tokens.
+    #[must_use]
+    pub fn from_dollars_per_million(
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_write: f64,
+    ) -> Option<Self> {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        fn convert(value: f64) -> Option<u64> {
+            if !value.is_finite() || value < 0.0 {
+                return None;
+            }
+            let micros = value * 1_000_000.0;
+            if !micros.is_finite() || micros > u64::MAX as f64 {
+                return None;
+            }
+            Some(micros.round() as u64)
+        }
+        Some(Self {
+            input_micros_per_million: convert(input)?,
+            output_micros_per_million: convert(output)?,
+            cache_read_micros_per_million: convert(cache_read)?,
+            cache_write_micros_per_million: convert(cache_write)?,
+        })
+    }
+
+    /// Calculates a fixed-point cost from token counts.
+    #[must_use]
+    pub fn calculate(self, usage: &Usage) -> UsageCost {
+        fn cost(rate: u64, tokens: u64) -> u64 {
+            rate.saturating_mul(tokens) / 1_000_000
+        }
+        let input_micros = cost(self.input_micros_per_million, usage.input);
+        let output_micros = cost(self.output_micros_per_million, usage.output);
+        let cache_read_micros = cost(self.cache_read_micros_per_million, usage.cache_read);
+        let cache_write_micros = cost(self.cache_write_micros_per_million, usage.cache_write);
+        UsageCost {
+            input_micros,
+            output_micros,
+            cache_read_micros,
+            cache_write_micros,
+            total_micros: input_micros
+                .saturating_add(output_micros)
+                .saturating_add(cache_read_micros)
+                .saturating_add(cache_write_micros),
+        }
+    }
+}
+
 /// Token accounting reported by a provider for one assistant response.
-///
-/// Cost is not carried: it needs per-model pricing, which the Rust model
-/// registry does not have yet.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Usage {
     /// Input tokens.
@@ -169,6 +249,8 @@ pub struct Usage {
     pub cache_write: u64,
     /// Total tokens as reported, or the sum when the provider reports none.
     pub total_tokens: u64,
+    /// Cost at the selected model's catalog price, when rates were available.
+    pub cost: Option<UsageCost>,
 }
 
 /// Why an assistant response ended.
@@ -567,8 +649,8 @@ impl ExecutionContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancellationToken, ContentBlock, CoreError, Message, MessageRole, SessionId, ToolCall,
-        ToolCallId,
+        CancellationToken, ContentBlock, CoreError, Message, MessageRole, ModelCostRates,
+        SessionId, ToolCall, ToolCallId, Usage,
     };
 
     #[test]
@@ -624,6 +706,31 @@ mod tests {
                     signature: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn model_cost_rates_calculate_fixed_point_usage_cost() {
+        let rates =
+            ModelCostRates::from_dollars_per_million(2.0, 4.0, 0.5, 1.0).expect("valid rates");
+        let usage = Usage {
+            input: 8,
+            output: 3,
+            reasoning: 1,
+            cache_read: 4,
+            cache_write: 0,
+            total_tokens: 15,
+            cost: None,
+        };
+        assert_eq!(
+            rates.calculate(&usage),
+            super::UsageCost {
+                input_micros: 16,
+                output_micros: 12,
+                cache_read_micros: 2,
+                cache_write_micros: 0,
+                total_micros: 30,
+            }
         );
     }
 

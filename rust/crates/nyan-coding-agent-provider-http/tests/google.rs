@@ -73,6 +73,7 @@ fn generative_ai_uses_key_query_contents_tools_and_usage() {
             output: 4,
             reasoning: 1,
             cache_read: 4,
+            cost: None,
             cache_write: 0,
             total_tokens: 16
         })

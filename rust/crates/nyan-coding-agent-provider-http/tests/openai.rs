@@ -43,6 +43,7 @@ fn request_options_are_translated_to_chat_controls() {
         prompt_cache_key: None,
         service_tier: Some("flex".to_owned()),
         max_output_tokens: Some(512),
+        cost_rates: None,
     };
     let body = build_request_body(&request);
     assert_eq!(body["reasoning_effort"], "low");
@@ -203,6 +204,7 @@ fn usage_is_reported_before_the_terminal_event() {
                 output: 3,
                 reasoning: 1,
                 cache_read: 4,
+                cost: None,
                 cache_write: 0,
                 total_tokens: 15,
             }),
