@@ -14,7 +14,8 @@
 //! lists only `*.jsonl` files, so the `.session` files here do not disturb it.
 //! The format version is in each file's header, not in the directory name.
 //!
-//! `--resume` (a picker) and `--fork` are not implemented and are refused.
+//! `--resume` (a picker) is not implemented and is refused; `--fork` opens a
+//! new Rust-native session at a user-message entry.
 
 use std::path::{Path, PathBuf};
 
