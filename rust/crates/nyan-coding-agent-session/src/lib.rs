@@ -6,6 +6,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde_json::{Value, json};
+
 use nyan_coding_agent_core::{
     AgentMode, ContentBlock, CoreError, Message, MessageRole, SessionId, StopReason, ToolCall,
     ToolCallId, Usage, UsageCost,
@@ -13,6 +15,7 @@ use nyan_coding_agent_core::{
 
 const RUST_SESSION_HEADER: &[u8] = b"NYANRS01\n1\n";
 const CWD_SIDECAR_FILE: &str = "cwd";
+const EXPORT_VERSION: u64 = 1;
 
 /// Metadata needed to open a Coding Agent session.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +154,8 @@ pub enum SessionCommand {
     GetForkMessages(SessionEntryId),
     /// Return the current display name.
     GetSessionName,
+    /// Return counts and accumulated provider usage.
+    GetSessionStats,
     /// Persist a new display name.
     SetSessionName(String),
 }
@@ -164,8 +169,44 @@ pub enum SessionCommandResult {
     Messages(Vec<Message>),
     /// The current display name, if one exists.
     SessionName(Option<String>),
+    /// Session counts and accumulated provider usage.
+    Stats(SessionStats),
     /// A mutation completed without a value to return.
     Done,
+}
+
+/// Counts and accumulated usage for one session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionStats {
+    /// Session id.
+    pub id: SessionId,
+    /// Recorded working directory.
+    pub cwd: PathBuf,
+    /// Number of journal entries.
+    pub entry_count: usize,
+    /// Number of message entries.
+    pub message_count: usize,
+    /// Accumulated provider usage.
+    pub usage: Usage,
+    /// Current display name.
+    pub name: Option<String>,
+}
+
+/// Read-only information used by session listing and resume pickers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSummary {
+    /// Session id.
+    pub id: SessionId,
+    /// Recorded working directory.
+    pub cwd: PathBuf,
+    /// Number of journal entries.
+    pub entry_count: usize,
+    /// Number of message entries.
+    pub message_count: usize,
+    /// Current display name.
+    pub name: Option<String>,
+    /// Last filesystem modification time.
+    pub modified: std::time::SystemTime,
 }
 
 /// A persisted journal record category.
@@ -213,6 +254,33 @@ impl SessionRecordKind {
             6 => Self::RunFinished,
             7 => Self::SystemPrompt,
             8 => Self::SessionName,
+            _ => return None,
+        })
+    }
+
+    fn export_name(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::UserMessage => "user_message",
+            Self::AssistantMessage => "assistant_message",
+            Self::ToolResult => "tool_result",
+            Self::RunStarted => "run_started",
+            Self::RunFinished => "run_finished",
+            Self::SystemPrompt => "system_prompt",
+            Self::SessionName => "session_name",
+        }
+    }
+
+    fn from_export_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "metadata" => Self::Metadata,
+            "user_message" => Self::UserMessage,
+            "assistant_message" => Self::AssistantMessage,
+            "tool_result" => Self::ToolResult,
+            "run_started" => Self::RunStarted,
+            "run_finished" => Self::RunFinished,
+            "system_prompt" => Self::SystemPrompt,
+            "session_name" => Self::SessionName,
             _ => return None,
         })
     }
@@ -750,6 +818,13 @@ pub enum SessionStoreError {
         /// Diagnostic explaining why the sidecar was rejected.
         message: String,
     },
+    /// An export or import file is invalid.
+    Export {
+        /// Export path.
+        path: PathBuf,
+        /// Codec diagnostic.
+        message: String,
+    },
     /// A journal message payload could not be decoded.
     MessageDecode {
         /// Codec diagnostic.
@@ -776,6 +851,7 @@ impl SessionStoreError {
             Self::CorruptRecord { .. } => "session_corrupt_record",
             Self::IncompleteRun => "session_incomplete_run",
             Self::CwdSidecar { .. } => "session_cwd_sidecar",
+            Self::Export { .. } => "session_export",
             Self::MessageDecode { .. } => "session_message_decode",
             Self::Io { .. } => "session_io",
         }
@@ -810,6 +886,13 @@ impl std::fmt::Display for SessionStoreError {
                 write!(
                     formatter,
                     "session cwd sidecar is invalid ({}): {message}",
+                    path.display()
+                )
+            }
+            Self::Export { path, message } => {
+                write!(
+                    formatter,
+                    "session export is invalid ({}): {message}",
                     path.display()
                 )
             }
@@ -897,6 +980,72 @@ impl FileSessionStore {
         Ok(entries.into_iter().map(|(_, id)| id).collect())
     }
 
+    /// Lists session summaries without taking session locks.
+    ///
+    /// The cwd sidecar and journal are read-only inputs, so a resume picker can
+    /// inspect sessions while another process owns a different session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a sidecar, journal, or message payload is corrupt.
+    pub fn session_summaries(
+        &self,
+        storage_root: Option<&Path>,
+    ) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let root = storage_root.unwrap_or(self.root.as_path());
+        let mut summaries = Vec::new();
+        for id in self.session_ids(Some(root))? {
+            let session_path = root.join(format!("{}.session", encode_session_id(&id)));
+            let sidecar = read_cwd_sidecar(&root.join(CWD_SIDECAR_FILE))?;
+            let mut file = File::open(&session_path).map_err(|error| SessionStoreError::Io {
+                operation: "list session".to_owned(),
+                message: error.to_string(),
+            })?;
+            let records = read_records(&mut file, &session_path)?;
+            let name = records
+                .iter()
+                .rev()
+                .find(|record| record.kind == SessionRecordKind::SessionName)
+                .map(|record| {
+                    String::from_utf8(record.payload.clone()).map_err(|_| SessionStoreError::Io {
+                        operation: "read session name".to_owned(),
+                        message: "session name is not valid UTF-8".to_owned(),
+                    })
+                })
+                .transpose()?;
+            let message_count = records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.kind,
+                        SessionRecordKind::SystemPrompt
+                            | SessionRecordKind::UserMessage
+                            | SessionRecordKind::AssistantMessage
+                            | SessionRecordKind::ToolResult
+                    )
+                })
+                .count();
+            let modified = fs::metadata(&session_path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            summaries.push(SessionSummary {
+                id,
+                cwd: sidecar,
+                entry_count: records.len(),
+                message_count,
+                name,
+                modified,
+            });
+        }
+        summaries.sort_by(|left, right| {
+            right
+                .modified
+                .cmp(&left.modified)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(summaries)
+    }
+
     /// Lists Rust-native session ids in a storage root, sorted by id.
     ///
     /// Missing roots are treated as an empty session directory.
@@ -942,10 +1091,150 @@ impl FileSessionStore {
         ids.sort();
         Ok(ids)
     }
+
+    /// Imports a Rust-native JSONL export into a new session.
+    ///
+    /// The target request supplies the new session id and storage selection;
+    /// the export's source id is retained only as informational header data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an export error for malformed input or a session error when the
+    /// target cannot be opened or populated.
+    pub fn import_jsonl(
+        &self,
+        path: &Path,
+        request: SessionOpenRequest,
+    ) -> Result<NativeSession, SessionStoreError> {
+        let contents = fs::read_to_string(path).map_err(|error| SessionStoreError::Export {
+            path: path.to_owned(),
+            message: format!("could not read file: {error}"),
+        })?;
+        let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
+        let header = lines.next().ok_or_else(|| SessionStoreError::Export {
+            path: path.to_owned(),
+            message: "export is empty".to_owned(),
+        })?;
+        let header =
+            serde_json::from_str::<Value>(header).map_err(|error| SessionStoreError::Export {
+                path: path.to_owned(),
+                message: format!("invalid header JSON: {error}"),
+            })?;
+        if header.get("type").and_then(Value::as_str) != Some("nyan_session_export")
+            || header.get("version").and_then(Value::as_u64) != Some(EXPORT_VERSION)
+        {
+            return Err(SessionStoreError::Export {
+                path: path.to_owned(),
+                message: "unsupported Rust session export header".to_owned(),
+            });
+        }
+        let mut records = Vec::new();
+        for (line_number, line) in lines.enumerate() {
+            let line_number = line_number + 2;
+            let value =
+                serde_json::from_str::<Value>(line).map_err(|error| SessionStoreError::Export {
+                    path: path.to_owned(),
+                    message: format!("invalid JSON on line {line_number}: {error}"),
+                })?;
+            if value.get("type").and_then(Value::as_str) != Some("entry") {
+                return Err(SessionStoreError::Export {
+                    path: path.to_owned(),
+                    message: format!("line {line_number} is not an entry"),
+                });
+            }
+            let kind_name = value.get("kind").and_then(Value::as_str).ok_or_else(|| {
+                SessionStoreError::Export {
+                    path: path.to_owned(),
+                    message: format!("entry on line {line_number} has no kind"),
+                }
+            })?;
+            let kind = SessionRecordKind::from_export_name(kind_name).ok_or_else(|| {
+                SessionStoreError::Export {
+                    path: path.to_owned(),
+                    message: format!("entry on line {line_number} has unknown kind {kind_name}"),
+                }
+            })?;
+            let payload = value
+                .get("payload")
+                .and_then(Value::as_str)
+                .ok_or_else(|| SessionStoreError::Export {
+                    path: path.to_owned(),
+                    message: format!("entry on line {line_number} has no payload"),
+                })?;
+            let payload = hex_decode(payload).map_err(|message| SessionStoreError::Export {
+                path: path.to_owned(),
+                message: format!("line {line_number}: {message}"),
+            })?;
+            records.push(SessionRecord::new(kind, payload));
+        }
+
+        let mut session = NativeSession::open(self, request)?;
+        if !session.get_entries()?.is_empty() {
+            return Err(SessionStoreError::Export {
+                path: path.to_owned(),
+                message: "import target is not empty".to_owned(),
+            });
+        }
+        for record in records {
+            session.append_record(record)?;
+        }
+        Ok(session)
+    }
+
+    /// Imports the legacy TypeScript JSONL message/session format.
+    ///
+    /// Unsupported historical entry kinds are retained as metadata; message
+    /// entries are converted into the Rust-native codec before they are saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an export error for malformed input or a session error when the
+    /// target cannot be opened or populated.
+    pub fn import_legacy_jsonl(
+        &self,
+        path: &Path,
+        request: SessionOpenRequest,
+    ) -> Result<NativeSession, SessionStoreError> {
+        let contents = fs::read_to_string(path).map_err(|error| SessionStoreError::Export {
+            path: path.to_owned(),
+            message: format!("could not read file: {error}"),
+        })?;
+        let records = legacy_records(path, &contents)?;
+        let mut session = NativeSession::open(self, request)?;
+        if !session.get_entries()?.is_empty() {
+            return Err(SessionStoreError::Export {
+                path: path.to_owned(),
+                message: "import target is not empty".to_owned(),
+            });
+        }
+        for record in records {
+            session.append_record(record)?;
+        }
+        Ok(session)
+    }
 }
 
 fn canonical_cwd(cwd: &Path) -> PathBuf {
     fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned())
+}
+
+fn read_cwd_sidecar(sidecar: &Path) -> Result<PathBuf, SessionStoreError> {
+    let contents = fs::read(sidecar).map_err(|error| SessionStoreError::CwdSidecar {
+        path: sidecar.to_owned(),
+        message: format!("could not read sidecar: {error}"),
+    })?;
+    let actual = String::from_utf8(contents).map_err(|_| SessionStoreError::CwdSidecar {
+        path: sidecar.to_owned(),
+        message: "sidecar is not valid UTF-8".to_owned(),
+    })?;
+    let actual = actual.trim_end_matches(['\r', '\n']);
+    if actual.is_empty() {
+        return Err(SessionStoreError::CwdSidecar {
+            path: sidecar.to_owned(),
+            message: "sidecar records an empty cwd".to_owned(),
+        });
+    }
+    Ok(PathBuf::from(actual))
 }
 
 fn ensure_cwd_sidecar(sidecar: &Path, cwd: &Path) -> Result<(), SessionStoreError> {
@@ -1460,11 +1749,142 @@ impl NativeSession {
             SessionCommand::GetSessionName => Ok(SessionCommandResult::SessionName(
                 self.name().map(str::to_owned),
             )),
+            SessionCommand::GetSessionStats => Ok(SessionCommandResult::Stats(self.stats()?)),
             SessionCommand::SetSessionName(name) => {
                 self.set_name(&name)?;
                 Ok(SessionCommandResult::Done)
             }
         }
+    }
+
+    /// Appends an opaque record during import while updating derived state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store or message decode error when the record cannot be committed.
+    pub fn append_record(&mut self, record: SessionRecord) -> Result<u64, SessionStoreError> {
+        if matches!(
+            record.kind,
+            SessionRecordKind::SystemPrompt
+                | SessionRecordKind::UserMessage
+                | SessionRecordKind::AssistantMessage
+                | SessionRecordKind::ToolResult
+        ) {
+            let message = SessionJournal::decode_message_record(&record).map_err(|error| {
+                SessionStoreError::MessageDecode {
+                    message: error.to_string(),
+                }
+            })?;
+            return self.append_message(record.kind, message);
+        }
+        let sequence = if let Some(journal) = &mut self.journal {
+            journal.append(record.clone())?
+        } else {
+            self.messages.len() as u64
+        };
+        match record.kind {
+            SessionRecordKind::RunStarted => self.incomplete_run = true,
+            SessionRecordKind::RunFinished => self.incomplete_run = false,
+            SessionRecordKind::SessionName => {
+                self.name =
+                    Some(
+                        String::from_utf8(record.payload).map_err(|_| SessionStoreError::Io {
+                            operation: "import session name".to_owned(),
+                            message: "session name is not valid UTF-8".to_owned(),
+                        })?,
+                    );
+            }
+            SessionRecordKind::Metadata => {}
+            SessionRecordKind::SystemPrompt
+            | SessionRecordKind::UserMessage
+            | SessionRecordKind::AssistantMessage
+            | SessionRecordKind::ToolResult => unreachable!("message records returned above"),
+        }
+        Ok(sequence)
+    }
+
+    /// Returns counts and accumulated provider usage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store or message decode error when entries cannot be read.
+    pub fn stats(&mut self) -> Result<SessionStats, SessionStoreError> {
+        let entries = self.get_entries()?;
+        let mut usage = Usage::default();
+        for message in &self.messages {
+            if let Some(message_usage) = message.usage {
+                add_usage(&mut usage, message_usage);
+            }
+        }
+        Ok(SessionStats {
+            id: self.opened.descriptor.id.clone(),
+            cwd: self.opened.descriptor.cwd.clone(),
+            entry_count: entries.len(),
+            message_count: self.messages.len(),
+            usage,
+            name: self.name.clone(),
+        })
+    }
+
+    /// Writes a self-contained Rust-native JSONL export.
+    ///
+    /// The export preserves opaque journal payloads and can be imported with
+    /// [`FileSessionStore::import_jsonl`]. It is not the legacy TypeScript
+    /// JSONL format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an export or filesystem error when the projection cannot be
+    /// encoded or the destination cannot be replaced atomically.
+    pub fn export_jsonl(&mut self, path: &Path) -> Result<(), SessionStoreError> {
+        let entries = self.get_entries()?;
+        let header = json!({
+            "type": "nyan_session_export",
+            "version": EXPORT_VERSION,
+            "id": self.opened.descriptor.id.as_str(),
+            "cwd": canonical_cwd(&self.opened.descriptor.cwd),
+            "name": self.name,
+        });
+        let mut bytes = serde_json::to_vec(&header).map_err(|error| SessionStoreError::Export {
+            path: path.to_owned(),
+            message: error.to_string(),
+        })?;
+        bytes.push(b'\n');
+        for entry in entries {
+            let payload = if entry.payload.is_empty() {
+                entry
+                    .message
+                    .as_ref()
+                    .map(encode_message)
+                    .transpose()
+                    .map_err(|error| SessionStoreError::Export {
+                        path: path.to_owned(),
+                        message: error.to_string(),
+                    })?
+                    .unwrap_or_default()
+            } else {
+                entry.payload
+            };
+            let value = json!({
+                "type": "entry",
+                "id": entry.id.as_str(),
+                "parentId": entry.parent_id.as_ref().map(SessionEntryId::as_str),
+                "sequence": entry.sequence,
+                "kind": entry.kind.export_name(),
+                "payload": hex_encode(&payload),
+            });
+            let line = serde_json::to_vec(&value).map_err(|error| SessionStoreError::Export {
+                path: path.to_owned(),
+                message: error.to_string(),
+            })?;
+            bytes.extend_from_slice(&line);
+            bytes.push(b'\n');
+        }
+        nyan_coding_agent_fs::write_atomic(path, &bytes, nyan_coding_agent_fs::FileMode::Preserve)
+            .map_err(|error| SessionStoreError::Export {
+                path: path.to_owned(),
+                message: error.to_string(),
+            })
     }
 
     /// Returns the linear entry projection used by session APIs.
@@ -1713,6 +2133,315 @@ fn normalize_system_messages(messages: &mut Vec<Message>) {
     messages.insert(0, system);
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err("payload hex has an odd length".to_owned());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| format!("payload contains invalid hex at byte {index}"))
+        })
+        .collect()
+}
+
+fn legacy_content(value: &Value) -> Result<Vec<ContentBlock>, String> {
+    let content = value.get("content").unwrap_or(&Value::Null);
+    if let Some(text) = content.as_str() {
+        return Ok(vec![ContentBlock::Text {
+            text: text.to_owned(),
+            signature: None,
+        }]);
+    }
+    content
+        .as_array()
+        .ok_or_else(|| "message content is neither text nor an array".to_owned())?
+        .iter()
+        .map(|block| {
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "content block has no type".to_owned())?;
+            match block_type {
+                "text" => Ok(ContentBlock::Text {
+                    text: block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    signature: block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                }),
+                "thinking" => Ok(ContentBlock::Thinking {
+                    text: block
+                        .get("thinking")
+                        .or_else(|| block.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    signature: block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    redacted: false,
+                }),
+                "redacted_thinking" => Ok(ContentBlock::Thinking {
+                    text: block
+                        .get("data")
+                        .or_else(|| block.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    signature: None,
+                    redacted: true,
+                }),
+                "image" => Ok(ContentBlock::Image {
+                    data: block
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    mime_type: block
+                        .get("mimeType")
+                        .or_else(|| block.get("mime_type"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/octet-stream")
+                        .to_owned(),
+                }),
+                "toolCall" | "tool_call" => {
+                    let id = ToolCallId::new(
+                        block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "tool call has no id".to_owned())?,
+                    )
+                    .map_err(|_| "tool call id is invalid".to_owned())?;
+                    Ok(ContentBlock::ToolCall(ToolCall {
+                        id,
+                        name: block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        arguments: block.get("arguments").map_or_else(
+                            || "{}".to_owned(),
+                            |value| {
+                                value
+                                    .as_str()
+                                    .map_or_else(|| value.to_string(), str::to_owned)
+                            },
+                        ),
+                    }))
+                }
+                other => Err(format!("unsupported content block type {other}")),
+            }
+        })
+        .collect()
+}
+
+fn legacy_usage(value: &Value) -> Option<Usage> {
+    let usage = value.get("usage")?;
+    Some(Usage {
+        input: usage
+            .get("input")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        output: usage
+            .get("output")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        reasoning: usage
+            .get("reasoning")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        cache_read: usage
+            .get("cacheRead")
+            .or_else(|| usage.get("cache_read"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        cache_write: usage
+            .get("cacheWrite")
+            .or_else(|| usage.get("cache_write"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        total_tokens: usage
+            .get("totalTokens")
+            .or_else(|| usage.get("total_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        cost: None,
+    })
+}
+
+fn legacy_stop_reason(value: &Value) -> Result<Option<StopReason>, String> {
+    match value.get("stopReason").and_then(Value::as_str) {
+        None => Ok(None),
+        Some("stop" | "end_turn") => Ok(Some(StopReason::Stop)),
+        Some("length" | "max_tokens") => Ok(Some(StopReason::Length)),
+        Some("toolUse" | "tool_use") => Ok(Some(StopReason::ToolUse)),
+        Some("aborted") => Ok(Some(StopReason::Aborted)),
+        Some("error") => Ok(Some(StopReason::Error)),
+        Some(other) => Err(format!("unsupported stop reason {other}")),
+    }
+}
+
+fn legacy_message(value: &Value) -> Result<Message, String> {
+    let role = match value.get("role").and_then(Value::as_str) {
+        Some("system") => MessageRole::System,
+        Some("user") => MessageRole::User,
+        Some("assistant") => MessageRole::Assistant,
+        Some("toolResult" | "tool") => MessageRole::Tool,
+        Some(other) => return Err(format!("unsupported message role {other}")),
+        None => return Err("message has no role".to_owned()),
+    };
+    let content = legacy_content(value)?;
+    let text = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_calls = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect();
+    let tool_call_id = value
+        .get("toolCallId")
+        .or_else(|| value.get("tool_call_id"))
+        .and_then(Value::as_str)
+        .map(|value| {
+            ToolCallId::new(value.to_owned()).map_err(|_| "tool call id is invalid".to_owned())
+        })
+        .transpose()?;
+    let usage = legacy_usage(value);
+    let stop_reason = legacy_stop_reason(value)?;
+    Ok(Message {
+        role,
+        content,
+        text,
+        tool_calls,
+        tool_call_id,
+        tool_name: value
+            .get("toolName")
+            .or_else(|| value.get("tool_name"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        is_error: value
+            .get("isError")
+            .or_else(|| value.get("is_error"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        timestamp_ms: value
+            .get("timestamp")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        provider: value
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        usage,
+        stop_reason,
+        error_message: value
+            .get("errorMessage")
+            .or_else(|| value.get("error_message"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn legacy_records(path: &Path, contents: &str) -> Result<Vec<SessionRecord>, SessionStoreError> {
+    let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
+    let header = lines.next().ok_or_else(|| SessionStoreError::Export {
+        path: path.to_owned(),
+        message: "legacy JSONL is empty".to_owned(),
+    })?;
+    let header =
+        serde_json::from_str::<Value>(header).map_err(|error| SessionStoreError::Export {
+            path: path.to_owned(),
+            message: format!("invalid legacy header JSON: {error}"),
+        })?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return Err(SessionStoreError::Export {
+            path: path.to_owned(),
+            message: "legacy JSONL has no session header".to_owned(),
+        });
+    }
+    let mut records = Vec::new();
+    for (line_number, line) in lines.enumerate() {
+        let line_number = line_number + 2;
+        let value =
+            serde_json::from_str::<Value>(line).map_err(|error| SessionStoreError::Export {
+                path: path.to_owned(),
+                message: format!("invalid JSON on line {line_number}: {error}"),
+            })?;
+        match value.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let message = legacy_message(value.get("message").ok_or_else(|| {
+                    SessionStoreError::Export {
+                        path: path.to_owned(),
+                        message: format!("message entry on line {line_number} has no message"),
+                    }
+                })?)
+                .map_err(|message| SessionStoreError::Export {
+                    path: path.to_owned(),
+                    message: format!("line {line_number}: {message}"),
+                })?;
+                records.push(SessionRecord::new(
+                    record_kind_for_message(&message),
+                    encode_message(&message).map_err(|error| SessionStoreError::Export {
+                        path: path.to_owned(),
+                        message: format!("line {line_number}: {error}"),
+                    })?,
+                ));
+            }
+            Some("session_info") => {
+                if let Some(name) = value.get("name").and_then(Value::as_str) {
+                    records.push(SessionRecord::new(
+                        SessionRecordKind::SessionName,
+                        name.as_bytes().to_vec(),
+                    ));
+                }
+            }
+            Some("session") => {}
+            Some(_) => records.push(SessionRecord::new(
+                SessionRecordKind::Metadata,
+                serde_json::to_vec(&value).map_err(|error| SessionStoreError::Export {
+                    path: path.to_owned(),
+                    message: format!("line {line_number}: {error}"),
+                })?,
+            )),
+            None => {
+                return Err(SessionStoreError::Export {
+                    path: path.to_owned(),
+                    message: format!("line {line_number} has no type"),
+                });
+            }
+        }
+    }
+    Ok(records)
+}
+
 fn record_kind_for_message(message: &Message) -> SessionRecordKind {
     match message.role {
         MessageRole::System => SessionRecordKind::SystemPrompt,
@@ -1720,6 +2449,31 @@ fn record_kind_for_message(message: &Message) -> SessionRecordKind {
         MessageRole::Assistant => SessionRecordKind::AssistantMessage,
         MessageRole::Tool => SessionRecordKind::ToolResult,
     }
+}
+
+fn add_usage(total: &mut Usage, usage: Usage) {
+    total.input = total.input.saturating_add(usage.input);
+    total.output = total.output.saturating_add(usage.output);
+    total.reasoning = total.reasoning.saturating_add(usage.reasoning);
+    total.cache_read = total.cache_read.saturating_add(usage.cache_read);
+    total.cache_write = total.cache_write.saturating_add(usage.cache_write);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    total.cost = match (total.cost, usage.cost) {
+        (Some(mut left), Some(right)) => {
+            left.input_micros = left.input_micros.saturating_add(right.input_micros);
+            left.output_micros = left.output_micros.saturating_add(right.output_micros);
+            left.cache_read_micros = left
+                .cache_read_micros
+                .saturating_add(right.cache_read_micros);
+            left.cache_write_micros = left
+                .cache_write_micros
+                .saturating_add(right.cache_write_micros);
+            left.total_micros = left.total_micros.saturating_add(right.total_micros);
+            Some(left)
+        }
+        (None, Some(right)) => Some(right),
+        (left, None) => left,
+    };
 }
 
 fn read_records(file: &mut File, path: &Path) -> Result<Vec<SessionRecord>, SessionStoreError> {
@@ -1779,6 +2533,7 @@ fn read_records(file: &mut File, path: &Path) -> Result<Vec<SessionRecord>, Sess
 mod tests {
     use std::fs;
     use std::io::Write as _;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -2099,6 +2854,15 @@ mod tests {
                 .expect("command name"),
             SessionCommandResult::SessionName(Some("checkpoint".to_owned()))
         );
+        let SessionCommandResult::Stats(stats) = session
+            .execute(SessionCommand::GetSessionStats)
+            .expect("command stats")
+        else {
+            panic!("stats command returned the wrong result");
+        };
+        assert_eq!(stats.entry_count, 3);
+        assert_eq!(stats.message_count, 2);
+        assert_eq!(stats.usage, Usage::default());
         assert_eq!(
             session
                 .execute(SessionCommand::SetSessionName("renamed".to_owned()))
@@ -2232,6 +2996,67 @@ mod tests {
     }
 
     #[test]
+    fn export_and_import_round_trip_entries_and_metadata() {
+        let root = test_root("export-import");
+        let export = root.join("session.jsonl");
+        let store = FileSessionStore::new(&root);
+        let mut source = NativeSession::open(&store, request_for(&root, "source")).expect("source");
+        source
+            .append_message(
+                SessionRecordKind::UserMessage,
+                Message::text(MessageRole::User, "hello"),
+            )
+            .expect("user");
+        let mut assistant = Message::text(MessageRole::Assistant, "world");
+        assistant.usage = Some(Usage {
+            input: 3,
+            output: 2,
+            total_tokens: 5,
+            ..Usage::default()
+        });
+        source
+            .append_message(SessionRecordKind::AssistantMessage, assistant)
+            .expect("assistant");
+        source.set_name("saved").expect("name");
+        source.export_jsonl(&export).expect("export");
+        drop(source);
+
+        let imported = store
+            .import_jsonl(&export, request_for(&root, "imported"))
+            .expect("import");
+        assert_eq!(imported.name(), Some("saved"));
+        assert_eq!(imported.messages().len(), 2);
+        assert_eq!(imported.messages()[1].usage.unwrap().total_tokens, 5);
+        drop(imported);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn legacy_jsonl_import_converts_messages_and_keeps_session_info() {
+        let root = test_root("legacy-import");
+        let legacy = root.join("legacy.jsonl");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            &legacy,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"legacy\",\"cwd\":\"/tmp/project\"}\n",
+                "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":1}}\n",
+                "{\"type\":\"session_info\",\"id\":\"a2\",\"parentId\":\"a1\",\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"name\":\"legacy\"}\n"
+            ),
+        )
+        .expect("legacy file");
+        let store = FileSessionStore::new(&root);
+        let imported = store
+            .import_legacy_jsonl(&legacy, request_for(&root, "imported"))
+            .expect("legacy import");
+        assert_eq!(imported.messages().len(), 1);
+        assert_eq!(imported.messages()[0].text, "hello");
+        assert_eq!(imported.name(), Some("legacy"));
+        drop(imported);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
     fn the_session_name_persists_and_the_last_one_wins() {
         let root = test_root("name");
         let store = FileSessionStore::new(&root);
@@ -2262,6 +3087,15 @@ mod tests {
             .map(|id| id.as_str().to_owned())
             .collect();
         assert_eq!(ids, ["new", "mid", "old"]);
+        let summaries = store.session_summaries(Some(&root)).expect("summaries");
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "mid", "old"]
+        );
+        assert_eq!(summaries[0].cwd, PathBuf::from("/tmp/project"));
         fs::remove_dir_all(root).expect("remove test root");
     }
 

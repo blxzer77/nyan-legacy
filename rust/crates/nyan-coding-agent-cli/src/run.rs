@@ -22,7 +22,7 @@ use crate::initial_message::{build_prompts, read_file_arguments};
 use crate::interrupt;
 use crate::login::{run_list_models, run_login, run_logout};
 use crate::providers::{ProviderSetup, build_provider, resolve_model, resolve_provider};
-use crate::session_setup::open_session;
+use crate::session_setup::{export_session, open_session};
 use crate::system_prompt::{
     PromptOptions, build_system_prompt, load_project_context_files, text_or_file,
 };
@@ -187,6 +187,23 @@ fn fail(err: &SharedWriter, message: &str) -> Plan {
     Plan::Exit(1)
 }
 
+fn export_plan(parsed: &Args, env: &Environment, out: &SharedWriter, err: &SharedWriter) -> Plan {
+    let Some(input) = parsed.export.as_deref() else {
+        return Plan::Exit(1);
+    };
+    if parsed.messages.len() > 1 {
+        return fail(err, "--export accepts at most one output path");
+    }
+    let output = parsed.messages.first().map(String::as_str);
+    match export_session(input, output, &agent_dir(env), &env.cwd) {
+        Ok(path) => {
+            write_to(out, &format!("Exported session to {}\n", path.display()));
+            Plan::Exit(0)
+        }
+        Err(message) => fail(err, &message),
+    }
+}
+
 fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWriter) -> Plan {
     let parsed = parse_args(argv);
     let mut failed = false;
@@ -209,6 +226,10 @@ fn plan(argv: &[String], env: &Environment, out: &SharedWriter, err: &SharedWrit
     if parsed.help || (argv.is_empty() && env.stdin_is_tty) {
         write_to(out, &help_text());
         return Plan::Exit(0);
+    }
+
+    if parsed.export.is_some() {
+        return export_plan(&parsed, env, out, err);
     }
 
     if let Some(list) = &parsed.list_models {

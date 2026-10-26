@@ -98,6 +98,39 @@ fn describe(error: &SessionStoreError, id: &SessionId) -> String {
     }
 }
 
+/// Exports a named session without loading a provider.
+///
+/// # Errors
+///
+/// Returns a user-facing message when the session cannot be opened or the
+/// destination cannot be written.
+pub fn export_session(
+    input: &str,
+    output: Option<&str>,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    let args = Args {
+        session: Some(input.to_owned()),
+        ..Args::default()
+    };
+    let mut session = open_session(&args, agent_dir, cwd)?;
+    let output = output.map_or_else(|| cwd.join(format!("{input}.session.jsonl")), PathBuf::from);
+    let output = if output.is_absolute() {
+        output
+    } else {
+        cwd.join(output)
+    };
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create export directory: {error}"))?;
+    }
+    session
+        .export_jsonl(&output)
+        .map_err(|error| format!("could not export session: {error}"))?;
+    Ok(output)
+}
+
 /// Opens the session this invocation should use.
 ///
 /// # Errors
@@ -213,7 +246,7 @@ mod tests {
     use nyan_coding_agent_core::{Message, MessageRole};
     use nyan_coding_agent_session::SessionRecordKind;
 
-    use super::{cwd_hash, cwd_identity, open_session};
+    use super::{cwd_hash, cwd_identity, export_session, open_session};
     use crate::args::parse_args;
 
     fn temp(name: &str) -> PathBuf {
@@ -383,6 +416,25 @@ mod tests {
         let expected_name = format!("fork {entry}");
         assert_eq!(fork.name(), Some(expected_name.as_str()));
         drop(fork);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_writes_a_session_without_loading_a_provider() {
+        let root = temp("export");
+        let agent = root.join("agent");
+        let cwd = root.join("project");
+        let mut source = open(&["--session-id", "source"], &agent, &cwd).expect("source");
+        say(&mut source, "hello");
+        drop(source);
+        let output =
+            export_session("source", Some("out/session.jsonl"), &agent, &cwd).expect("export");
+        assert_eq!(output, cwd.join("out/session.jsonl"));
+        assert!(
+            std::fs::read_to_string(output)
+                .expect("export file")
+                .contains("nyan_session_export")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
