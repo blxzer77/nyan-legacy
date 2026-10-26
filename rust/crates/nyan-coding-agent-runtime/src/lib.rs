@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::path::PathBuf;
@@ -78,6 +78,13 @@ pub enum AgentEvent {
         succeeded: bool,
         /// Why the retries stopped, when they failed.
         final_error: Option<String>,
+    },
+    /// Queued steering and follow-up messages changed.
+    QueueUpdate {
+        /// Messages waiting to be inserted before the next provider request.
+        steering: Vec<Message>,
+        /// Messages waiting until the current agent turn settles.
+        follow_up: Vec<Message>,
     },
     /// A tool call has begun.
     ToolExecutionStart {
@@ -219,6 +226,124 @@ pub enum ToolExecutionMode {
     Parallel,
 }
 
+/// How queued messages are consumed when the runtime reaches a safe turn boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueMode {
+    /// Consume one queued message and leave the rest for the next turn.
+    OneAtATime,
+    /// Consume every queued message in one turn boundary.
+    All,
+}
+
+/// A read-only snapshot of the steering and follow-up queues.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueueSnapshot {
+    /// Messages inserted before the next provider request.
+    pub steering: Vec<Message>,
+    /// Messages submitted after the current agent turn settles.
+    pub follow_up: Vec<Message>,
+}
+
+#[derive(Debug, Default)]
+struct QueueState {
+    steering: Mutex<VecDeque<Message>>,
+    follow_up: Mutex<VecDeque<Message>>,
+}
+
+impl QueueState {
+    fn snapshot(&self) -> QueueSnapshot {
+        QueueSnapshot {
+            steering: self
+                .steering
+                .lock()
+                .expect("steering queue lock")
+                .iter()
+                .cloned()
+                .collect(),
+            follow_up: self
+                .follow_up
+                .lock()
+                .expect("follow-up queue lock")
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn push_steering(&self, message: Message) {
+        self.steering
+            .lock()
+            .expect("steering queue lock")
+            .push_back(message);
+    }
+
+    fn push_follow_up(&self, message: Message) {
+        self.follow_up
+            .lock()
+            .expect("follow-up queue lock")
+            .push_back(message);
+    }
+
+    fn take_steering(&self, mode: QueueMode) -> Vec<Message> {
+        take_queue(&self.steering, mode)
+    }
+
+    fn take_follow_up(&self, mode: QueueMode) -> Vec<Message> {
+        take_queue(&self.follow_up, mode)
+    }
+
+    fn clear(&self) -> QueueSnapshot {
+        let snapshot = self.snapshot();
+        self.steering.lock().expect("steering queue lock").clear();
+        self.follow_up.lock().expect("follow-up queue lock").clear();
+        snapshot
+    }
+}
+
+fn take_queue(queue: &Mutex<VecDeque<Message>>, mode: QueueMode) -> Vec<Message> {
+    let mut queue = queue.lock().expect("message queue lock");
+    match mode {
+        QueueMode::OneAtATime => queue.pop_front().into_iter().collect(),
+        QueueMode::All => queue.drain(..).collect(),
+    }
+}
+
+/// Control handle for queues and cancellation owned by an agent runtime.
+#[derive(Clone, Debug)]
+pub struct AgentControl {
+    queues: Arc<QueueState>,
+    cancellation: CancellationToken,
+}
+
+impl AgentControl {
+    /// Queues a message to be inserted before the next provider request.
+    pub fn steer(&self, message: Message) {
+        self.queues.push_steering(message);
+    }
+
+    /// Queues a message to be submitted after the current turn settles.
+    pub fn follow_up(&self, message: Message) {
+        self.queues.push_follow_up(message);
+    }
+
+    /// Returns the current queue contents without removing them.
+    #[must_use]
+    pub fn snapshot(&self) -> QueueSnapshot {
+        self.queues.snapshot()
+    }
+
+    /// Clears both queues and returns what was removed.
+    #[must_use]
+    pub fn clear_queue(&self) -> QueueSnapshot {
+        self.queues.clear()
+    }
+
+    /// Requests cancellation of the owning runtime.
+    pub fn abort(&self) {
+        self.cancellation.cancel();
+    }
+}
+
 /// Waits for a duration, returning early when the token is cancelled.
 ///
 /// The runtime does not choose an executor, so whoever builds it supplies the timer.
@@ -267,6 +392,10 @@ pub struct RuntimeConfig {
     pub retry_sleep: Option<RetrySleep>,
     /// Tool scheduling policy.
     pub tool_execution: ToolExecutionMode,
+    /// Steering queue consumption policy.
+    pub steering_mode: QueueMode,
+    /// Follow-up queue consumption policy.
+    pub follow_up_mode: QueueMode,
     /// The conversation id sent with every provider request.
     pub session_id: Option<String>,
     /// Optional provider request controls.
@@ -286,6 +415,8 @@ impl RuntimeConfig {
             retry_max_delay: Duration::from_secs(60),
             retry_sleep: None,
             tool_execution: ToolExecutionMode::Parallel,
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
             session_id: None,
             request_options: ProviderRequestOptions::default(),
         }
@@ -652,6 +783,7 @@ pub struct AgentRuntime<'a> {
     config: RuntimeConfig,
     context: AgentContext,
     cancellation: CancellationToken,
+    queues: Arc<QueueState>,
 }
 
 impl std::fmt::Debug for AgentRuntime<'_> {
@@ -679,6 +811,7 @@ impl<'a> AgentRuntime<'a> {
             config,
             context: AgentContext::default(),
             cancellation: CancellationToken::new(),
+            queues: Arc::new(QueueState::default()),
         }
     }
 
@@ -698,6 +831,15 @@ impl<'a> AgentRuntime<'a> {
     #[must_use]
     pub fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// Returns a control handle for steering, follow-up, queue clearing, and abort.
+    #[must_use]
+    pub fn control(&self) -> AgentControl {
+        AgentControl {
+            queues: Arc::clone(&self.queues),
+            cancellation: self.cancellation.clone(),
+        }
     }
 
     /// Returns the current transcript.
@@ -747,6 +889,11 @@ impl<'a> AgentRuntime<'a> {
                     message: assistant,
                     tool_results: Vec::new(),
                 });
+                if self.append_queued_messages(self.config.steering_mode, false, &sink)
+                    || self.append_queued_messages(self.config.follow_up_mode, true, &sink)
+                {
+                    continue;
+                }
                 return Ok(match reason {
                     ProviderStopReason::Aborted => AgentOutcome::Aborted,
                     ProviderStopReason::Error { message } => AgentOutcome::Failed {
@@ -764,10 +911,44 @@ impl<'a> AgentRuntime<'a> {
                 message: assistant,
                 tool_results,
             });
+            self.append_queued_messages(self.config.steering_mode, false, &sink);
         }
         Err(RuntimeError::TurnLimit {
             max_turns: self.config.max_turns,
         })
+    }
+
+    fn emit_queue_update(&self, sink: &dyn EventSink) {
+        let snapshot = self.queues.snapshot();
+        sink.emit(AgentEvent::QueueUpdate {
+            steering: snapshot.steering,
+            follow_up: snapshot.follow_up,
+        });
+    }
+
+    fn append_queued_messages(
+        &mut self,
+        mode: QueueMode,
+        follow_up: bool,
+        sink: &Arc<dyn EventSink>,
+    ) -> bool {
+        let messages = if follow_up {
+            self.queues.take_follow_up(mode)
+        } else {
+            self.queues.take_steering(mode)
+        };
+        if messages.is_empty() {
+            return false;
+        }
+        for message in messages {
+            self.context.messages.push(message.clone());
+            sink.emit(AgentEvent::MessageStart {
+                message: message.clone(),
+            });
+            sink.emit(AgentEvent::MessageEnd { message });
+        }
+        self.emit_queue_update(&**sink);
+        true
     }
 
     /// Shrinks an explicitly configured output limit for a context-overflow retry.
@@ -1841,11 +2022,18 @@ mod tests {
                 "/tmp/project",
             ),
         );
+        let control = runtime.control();
+        control.steer(Message::text(MessageRole::User, "steer me"));
         let (result, events) =
             run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
 
         assert_eq!(result.outcome, AgentOutcome::Completed);
-        assert_eq!(result.messages.len(), 4);
+        assert_eq!(result.messages.len(), 5);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::QueueUpdate { steering, follow_up }
+                if steering.is_empty() && follow_up.is_empty()
+        )));
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::MessageUpdate { message, .. } if message.text == "use tool"

@@ -687,6 +687,25 @@ pub fn event_to_jsonl(event: &AgentEvent) -> String {
                 .finish()
         }
         AgentEvent::RetryStart { .. } | AgentEvent::RetryEnd { .. } => retry_event_jsonl(event),
+        AgentEvent::QueueUpdate {
+            steering,
+            follow_up,
+        } => {
+            let steering = steering
+                .iter()
+                .map(encode_message)
+                .collect::<Vec<_>>()
+                .join(",");
+            let follow_up = follow_up
+                .iter()
+                .map(encode_message)
+                .collect::<Vec<_>>()
+                .join(",");
+            JsonlRecord::new("queue_update")
+                .raw("steering", &format!("[{steering}]"))
+                .raw("followUp", &format!("[{follow_up}]"))
+                .finish()
+        }
         AgentEvent::ToolExecutionStart { .. }
         | AgentEvent::ToolExecutionUpdate { .. }
         | AgentEvent::ToolExecutionEnd { .. } => tool_event_jsonl(event),
@@ -1005,6 +1024,21 @@ mod tests {
             !ended.contains("\"message\""),
             "wire updates omit the cumulative message"
         );
+    }
+
+    #[test]
+    fn queue_updates_encode_pending_messages() {
+        use nyan_coding_agent_core::MessageRole;
+        use nyan_coding_agent_runtime::AgentEvent;
+
+        let record = event_to_jsonl(&AgentEvent::QueueUpdate {
+            steering: vec![Message::text(MessageRole::User, "steer")],
+            follow_up: vec![Message::text(MessageRole::User, "later")],
+        });
+        assert!(record.starts_with("{\"type\":\"queue_update\",\"steering\":[{"));
+        assert!(record.contains("\"content\":\"steer\""));
+        assert!(record.contains("\"followUp\":[{"));
+        assert!(record.contains("\"content\":\"later\""));
     }
 
     #[test]
