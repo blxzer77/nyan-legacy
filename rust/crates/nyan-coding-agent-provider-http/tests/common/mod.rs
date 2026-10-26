@@ -72,9 +72,16 @@ pub fn serve_with_headers(
             }
         }
         *sink.lock().expect("captured lock") = String::from_utf8_lossy(&received).into_owned();
-        let head = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\n{extra_headers}connection: close\r\n\r\n"
-        );
+        let content_type = if extra_headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+        {
+            ""
+        } else {
+            "content-type: text/event-stream\r\n"
+        };
+        let head =
+            format!("HTTP/1.1 {status}\r\n{content_type}{extra_headers}connection: close\r\n\r\n");
         let _ = socket.write_all(head.as_bytes()).await;
         for (delay, bytes) in chunks {
             tokio::time::sleep(Duration::from_millis(delay)).await;

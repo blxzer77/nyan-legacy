@@ -13,7 +13,7 @@ use nyan_coding_agent_provider_http::openai::build_request_body;
 use serde_json::json;
 
 mod common;
-use common::{Server, drain, request, serve, sse};
+use common::{Server, drain, request, serve, serve_with_headers, sse};
 use tokio::runtime::Runtime;
 
 fn provider(runtime: &Runtime, server: &Server) -> OpenAiChatProvider {
@@ -50,6 +50,35 @@ fn request_options_are_translated_to_chat_controls() {
     assert_eq!(body["prompt_cache_retention"], "infinite");
     assert_eq!(body["service_tier"], "flex");
     assert_eq!(body["max_completion_tokens"], 512);
+}
+
+#[test]
+fn a_non_streaming_json_response_is_consumed_as_a_fallback() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve_with_headers(
+        &runtime,
+        "200 OK",
+        "content-type: application/json\r\n",
+        vec![(
+            0,
+            br#"{"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#.to_vec(),
+        )],
+        false,
+    );
+    let events = drain(
+        &runtime,
+        open(&runtime, &provider(&runtime, &server)).expect("stream"),
+    )
+    .expect("events");
+    assert!(events.contains(&ProviderStreamEvent::TextDelta {
+        text: "answer".to_owned()
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(ProviderStreamEvent::Finished {
+            reason: ProviderStopReason::Stop
+        })
+    ));
 }
 
 #[test]

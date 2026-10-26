@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio::runtime::Runtime;
 
 mod common;
-use common::{Server, drain, request, serve};
+use common::{Server, drain, request, serve, serve_with_headers};
 
 fn sse(value: serde_json::Value) -> Vec<u8> {
     let text = value.to_string();
@@ -28,6 +28,34 @@ fn gemini_provider(runtime: &Runtime, server: &Server) -> GoogleGenerativeAiProv
     )
     .expect("provider")
     .with_idle_timeout(Duration::from_secs(5))
+}
+
+#[test]
+fn a_non_streaming_json_response_is_consumed_as_a_fallback() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve_with_headers(
+        &runtime,
+        "200 OK",
+        "content-type: application/json\r\n",
+        vec![(
+            0,
+            br#"{"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#.to_vec(),
+        )],
+        false,
+    );
+    let events = runtime
+        .block_on(gemini_provider(&runtime, &server).stream(request(CancellationToken::new())))
+        .and_then(|stream| drain(&runtime, stream))
+        .expect("events");
+    assert!(events.contains(&ProviderStreamEvent::TextDelta {
+        text: "answer".to_owned()
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(ProviderStreamEvent::Finished {
+            reason: ProviderStopReason::Stop
+        })
+    ));
 }
 
 #[test]

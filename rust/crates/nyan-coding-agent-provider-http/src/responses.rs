@@ -224,6 +224,7 @@ fn wire_input_part(block: &ContentBlock) -> Option<Value> {
     }
 }
 
+#[derive(Default)]
 struct PendingCall {
     call_id: String,
     name: String,
@@ -402,7 +403,67 @@ fn parse_usage(usage: &Value, cost_rates: Option<ModelCostRates>) -> nyan_coding
     apply_usage_cost(&mut parsed, cost_rates);
     parsed
 }
+impl ResponsesStream {
+    fn apply_non_streaming(&mut self, value: &Value) -> Applied {
+        let usage = value
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .map(|usage| parse_usage(usage, self.cost_rates));
+        let status = text_of(value, "/status").map(str::to_owned);
+        let incomplete_reason = text_of(value, "/incomplete_details/reason").map(str::to_owned);
+        let mut text = String::new();
+        if let Some(output) = value.get("output").and_then(Value::as_array) {
+            for (index, item) in output.iter().enumerate() {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("message") => {
+                        if let Some(content) = item.get("content").and_then(Value::as_array) {
+                            for part in content {
+                                if let Some(value) = part.get("text").and_then(Value::as_str) {
+                                    text.push_str(value);
+                                }
+                            }
+                        }
+                    }
+                    Some("function_call") => {
+                        let call = self.calls.entry(index as u64).or_default();
+                        item.get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .clone_into(&mut call.call_id);
+                        item.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .clone_into(&mut call.name);
+                        item.get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}")
+                            .clone_into(&mut call.arguments);
+                        call.done = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.terminal = Some(Terminal {
+            status,
+            incomplete_reason,
+            usage,
+        });
+        if text.is_empty() {
+            Applied::Nothing
+        } else {
+            Applied::Text(text)
+        }
+    }
+}
+
 impl StreamProtocol for ResponsesStream {
+    fn apply_json(&mut self, body: &str) -> Result<Applied, ProviderError> {
+        let value = serde_json::from_str::<Value>(body)
+            .map_err(|_| stream_error("the provider returned non-stream JSON that is not valid"))?;
+        Ok(self.apply_non_streaming(&value))
+    }
+
     fn apply(&mut self, event: &SseEvent) -> Result<Applied, ProviderError> {
         if event.data == "[DONE]" {
             return Ok(Applied::Nothing);

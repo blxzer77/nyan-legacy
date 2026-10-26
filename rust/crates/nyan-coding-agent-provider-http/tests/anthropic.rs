@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio::runtime::Runtime;
 
 mod common;
-use common::{Server, drain, request, serve};
+use common::{Server, drain, request, serve, serve_with_headers};
 
 fn event(kind: &str, value: serde_json::Value) -> Vec<u8> {
     let body = value.to_string();
@@ -86,6 +86,34 @@ fn text_server(runtime: &Runtime) -> Server {
         ],
         false,
     )
+}
+
+#[test]
+fn a_non_streaming_json_response_is_consumed_as_a_fallback() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve_with_headers(
+        &runtime,
+        "200 OK",
+        "content-type: application/json\r\n",
+        vec![(
+            0,
+            br#"{"type":"message","content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#.to_vec(),
+        )],
+        false,
+    );
+    let events = runtime
+        .block_on(provider(&runtime, &server).stream(request(CancellationToken::new())))
+        .and_then(|stream| drain(&runtime, stream))
+        .expect("events");
+    assert!(events.contains(&ProviderStreamEvent::TextDelta {
+        text: "answer".to_owned()
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(ProviderStreamEvent::Finished {
+            reason: ProviderStopReason::Stop
+        })
+    ));
 }
 
 #[test]

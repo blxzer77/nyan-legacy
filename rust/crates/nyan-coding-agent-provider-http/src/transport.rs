@@ -48,6 +48,14 @@ pub(crate) trait StreamProtocol: Send + 'static {
     /// Applies one decoded SSE event.
     fn apply(&mut self, event: &SseEvent) -> Result<Applied, ProviderError>;
 
+    /// Applies a complete non-streaming JSON response.
+    fn apply_json(&mut self, body: &str) -> Result<Applied, ProviderError> {
+        self.apply(&SseEvent {
+            event: None,
+            data: body.to_owned(),
+        })
+    }
+
     /// Whether a terminal event was seen, even if the stream then closed without
     /// the protocol's end marker.
     fn is_terminal(&self) -> bool;
@@ -450,6 +458,7 @@ async fn send_error(sender: &mpsc::Sender<EventResult>, message: &str, retryable
         .await;
 }
 
+#[allow(clippy::too_many_lines)] // The JSON and SSE paths share one owned stream state machine.
 async fn pump<P: StreamProtocol>(
     mut response: reqwest::Response,
     sender: mpsc::Sender<EventResult>,
@@ -457,60 +466,97 @@ async fn pump<P: StreamProtocol>(
     idle_timeout: Duration,
     mut protocol: P,
 ) {
-    let mut decoder = SseDecoder::new();
-    let mut idle = Duration::ZERO;
+    let is_json = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"));
     let mut done = false;
-    'read: loop {
-        if cancellation.is_cancelled() {
-            let _ = sender.send(Err(ProviderError::Cancelled)).await;
-            return;
-        }
-        let chunk = match tokio::time::timeout(CANCELLATION_POLL, response.chunk()).await {
-            Err(_) => {
-                idle += CANCELLATION_POLL;
-                if idle >= idle_timeout {
-                    send_error(&sender, "the response stream went silent", true).await;
-                    return;
-                }
-                continue;
-            }
-            Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => {
-                send_error(
-                    &sender,
-                    &format!("the response stream failed: {error}"),
-                    true,
-                )
-                .await;
+    if is_json {
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                send_error(&sender, &format!("the response body failed: {error}"), true).await;
                 return;
             }
         };
-        idle = Duration::ZERO;
-        for event in decoder.push(&chunk) {
-            match protocol.apply(&event) {
-                Ok(Applied::Nothing) => {}
-                Ok(Applied::Text(text)) => {
-                    if sender
-                        .send(Ok(ProviderStreamEvent::TextDelta { text }))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Ok(Applied::Event(event)) => {
-                    if sender.send(Ok(event)).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(Applied::Done) => {
-                    done = true;
-                    break 'read;
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(error)).await;
+        match protocol.apply_json(&body) {
+            Ok(Applied::Nothing) => {}
+            Ok(Applied::Text(text)) => {
+                if sender
+                    .send(Ok(ProviderStreamEvent::TextDelta { text }))
+                    .await
+                    .is_err()
+                {
                     return;
+                }
+            }
+            Ok(Applied::Event(event)) => {
+                if sender.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(Applied::Done) => done = true,
+            Err(error) => {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+        }
+    } else {
+        let mut decoder = SseDecoder::new();
+        let mut idle = Duration::ZERO;
+        'read: loop {
+            if cancellation.is_cancelled() {
+                let _ = sender.send(Err(ProviderError::Cancelled)).await;
+                return;
+            }
+            let chunk = match tokio::time::timeout(CANCELLATION_POLL, response.chunk()).await {
+                Err(_) => {
+                    idle += CANCELLATION_POLL;
+                    if idle >= idle_timeout {
+                        send_error(&sender, "the response stream went silent", true).await;
+                        return;
+                    }
+                    continue;
+                }
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => {
+                    send_error(
+                        &sender,
+                        &format!("the response stream failed: {error}"),
+                        true,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            idle = Duration::ZERO;
+            for event in decoder.push(&chunk) {
+                match protocol.apply(&event) {
+                    Ok(Applied::Nothing) => {}
+                    Ok(Applied::Text(text)) => {
+                        if sender
+                            .send(Ok(ProviderStreamEvent::TextDelta { text }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Applied::Event(event)) => {
+                        if sender.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Applied::Done) => {
+                        done = true;
+                        break 'read;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
                 }
             }
         }

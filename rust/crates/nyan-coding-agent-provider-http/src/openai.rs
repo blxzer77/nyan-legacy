@@ -286,7 +286,56 @@ impl Accumulator {
     }
 }
 
+impl Accumulator {
+    fn apply_non_streaming(&mut self, value: &Value) -> Applied {
+        if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+            self.usage = Some(parse_usage(usage, self.cost_rates));
+        }
+        let choice = value.pointer("/choices/0").unwrap_or(&Value::Null);
+        let message = choice.get("message").unwrap_or(&Value::Null);
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for (index, call) in calls.iter().enumerate() {
+                let pending = self.tool_calls.entry(index as u64).or_default();
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    id.clone_into(&mut pending.id);
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    name.clone_into(&mut pending.name);
+                }
+                if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
+                {
+                    arguments.clone_into(&mut pending.arguments);
+                }
+            }
+        }
+        self.finish_reason = Some(
+            choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or(if self.tool_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                })
+                .to_owned(),
+        );
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map_or(Applied::Nothing, |text| Applied::Text(text.to_owned()))
+    }
+}
+
 impl StreamProtocol for Accumulator {
+    fn apply_json(&mut self, body: &str) -> Result<Applied, ProviderError> {
+        let value = serde_json::from_str::<Value>(body).map_err(|_| ProviderError::Stream {
+            message: "the provider returned non-stream JSON that is not valid".to_owned(),
+            retryable: false,
+        })?;
+        Ok(self.apply_non_streaming(&value))
+    }
+
     fn apply(&mut self, event: &SseEvent) -> Result<Applied, ProviderError> {
         if event.data == "[DONE]" {
             return Ok(Applied::Done);

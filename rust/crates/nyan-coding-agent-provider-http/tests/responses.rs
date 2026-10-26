@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
 mod common;
-use common::{Server, drain, request, serve};
+use common::{Server, drain, request, serve, serve_with_headers};
 
 /// One SSE frame in the Responses format: an `event:` line and a JSON body whose
 /// `type` repeats it.
@@ -120,6 +120,34 @@ fn response_usage_calculates_catalog_cost_when_rates_are_available() {
             total_micros: 30,
         }),
     })));
+}
+
+#[test]
+fn a_non_streaming_json_response_is_consumed_as_a_fallback() {
+    let runtime = Runtime::new().expect("runtime");
+    let server = serve_with_headers(
+        &runtime,
+        "200 OK",
+        "content-type: application/json\r\n",
+        vec![(
+            0,
+            br#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"answer"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#.to_vec(),
+        )],
+        false,
+    );
+    let events = runtime
+        .block_on(provider(&runtime, &server).stream(request(CancellationToken::new())))
+        .and_then(|stream| drain(&runtime, stream))
+        .expect("events");
+    assert!(events.contains(&ProviderStreamEvent::TextDelta {
+        text: "answer".to_owned()
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(ProviderStreamEvent::Finished {
+            reason: ProviderStopReason::Stop
+        })
+    ));
 }
 
 #[test]

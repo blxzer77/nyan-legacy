@@ -539,7 +539,92 @@ impl AnthropicStream {
         }
     }
 }
+impl AnthropicStream {
+    fn apply_non_streaming(&mut self, value: &Value) -> Applied {
+        let usage = value.get("usage").unwrap_or(&Value::Null);
+        let input = count(usage, "/input_tokens");
+        let output = count(usage, "/output_tokens");
+        let cache_read = count(usage, "/cache_read_input_tokens");
+        let cache_write = count(usage, "/cache_creation_input_tokens");
+        let reasoning = count(usage, "/output_tokens_details/thinking_tokens");
+        let mut parsed = Usage {
+            input,
+            output,
+            reasoning,
+            cache_read,
+            cache_write,
+            total_tokens: input
+                .saturating_add(output)
+                .saturating_add(cache_read)
+                .saturating_add(cache_write),
+            cost: None,
+        };
+        apply_usage_cost(&mut parsed, self.cost_rates);
+        if value.get("usage").is_some() {
+            self.usage = Some(parsed);
+        }
+        let mut text = String::new();
+        if let Some(content) = value.get("content").and_then(Value::as_array) {
+            for (index, block) in content.iter().enumerate() {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => text.push_str(
+                        block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                    Some("tool_use") => {
+                        let tool = self.tools.entry(index as u64).or_default();
+                        block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .clone_into(&mut tool.id);
+                        block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .clone_into(&mut tool.name);
+                        tool.arguments = block
+                            .get("input")
+                            .map_or_else(|| "{}".to_owned(), Value::to_string);
+                        tool.done = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.terminal = Some(
+            match value.get("stop_reason").and_then(Value::as_str).unwrap_or(
+                if self.tools.is_empty() {
+                    "end_turn"
+                } else {
+                    "tool_use"
+                },
+            ) {
+                "tool_use" => ProviderStopReason::ToolUse,
+                "max_tokens" => ProviderStopReason::Length,
+                "end_turn" | "stop_sequence" => ProviderStopReason::Stop,
+                other => ProviderStopReason::Error {
+                    message: format!("Anthropic stopped with: {other}"),
+                },
+            },
+        );
+        if text.is_empty() {
+            Applied::Nothing
+        } else {
+            Applied::Text(text)
+        }
+    }
+}
+
 impl StreamProtocol for AnthropicStream {
+    fn apply_json(&mut self, body: &str) -> Result<Applied, ProviderError> {
+        let value = serde_json::from_str::<Value>(body)
+            .map_err(|_| stream_error("the Anthropic response is not valid JSON"))?;
+        Ok(self.apply_non_streaming(&value))
+    }
+
     fn apply(&mut self, event: &SseEvent) -> Result<Applied, ProviderError> {
         if event.data == "[DONE]" {
             return Ok(Applied::Done);
