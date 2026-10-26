@@ -254,6 +254,27 @@ pub enum QueueMode {
 pub const DEFAULT_THINKING_LEVELS: [&str; 7] =
     ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// Policy for automatic context compaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionPolicy {
+    /// Maximum estimated context tokens before compaction is requested.
+    pub context_window: u64,
+    /// Tokens reserved for the next provider response.
+    pub reserve_tokens: u64,
+    /// Number of latest messages retained after compaction.
+    pub keep_recent_messages: usize,
+}
+
+/// Provider-neutral owner of summary generation.
+pub trait ContextCompactor: Send + Sync {
+    /// Generates a summary for the supplied context snapshot.
+    fn summarize(
+        &self,
+        messages: Vec<Message>,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<Result<String, String>>;
+}
+
 #[derive(Clone, Debug)]
 struct ThinkingLevelState {
     available: Vec<String>,
@@ -523,6 +544,8 @@ pub struct RuntimeConfig {
     pub follow_up_mode: QueueMode,
     /// Thinking levels available to runtime control.
     pub thinking_levels: Vec<String>,
+    /// Automatic compaction policy, when configured by the host.
+    pub compaction: Option<CompactionPolicy>,
     /// The conversation id sent with every provider request.
     pub session_id: Option<String>,
     /// Optional provider request controls.
@@ -548,6 +571,7 @@ impl RuntimeConfig {
                 .iter()
                 .map(|level| (*level).to_owned())
                 .collect(),
+            compaction: None,
             session_id: None,
             request_options: ProviderRequestOptions::default(),
         }
@@ -573,6 +597,11 @@ pub enum RuntimeError {
     /// A hook blocked or failed a lifecycle transition.
     Hook {
         /// Hook diagnostic.
+        message: String,
+    },
+    /// Context compaction could not complete.
+    Compaction {
+        /// Compaction diagnostic.
         message: String,
     },
     /// A tool effect started but its final outcome is unknown.
@@ -639,6 +668,7 @@ impl RuntimeError {
             },
             Self::Tool(_) => "tool",
             Self::Hook { .. } => "hook",
+            Self::Compaction { .. } => "compaction",
             Self::UnknownOutcome { .. } => "unknown_outcome",
             Self::TurnLimit { .. } => "turn_limit",
             Self::UnterminatedProviderStream => "stream",
@@ -660,6 +690,9 @@ impl Display for RuntimeError {
             Self::Provider(error) => error.fmt(formatter),
             Self::Tool(error) => error.fmt(formatter),
             Self::Hook { message } => write!(formatter, "runtime hook failed: {message}"),
+            Self::Compaction { message } => {
+                write!(formatter, "runtime compaction failed: {message}")
+            }
             Self::UnknownOutcome { operation, message } => {
                 write!(
                     formatter,
@@ -951,6 +984,7 @@ pub struct AgentRuntime<'a> {
     queues: Arc<QueueState>,
     thinking: Arc<Mutex<ThinkingLevelState>>,
     hooks: Option<Arc<dyn RuntimeHooks>>,
+    compactor: Option<Arc<dyn ContextCompactor>>,
 }
 
 impl std::fmt::Debug for AgentRuntime<'_> {
@@ -985,6 +1019,7 @@ impl<'a> AgentRuntime<'a> {
             queues: Arc::new(QueueState::default()),
             thinking,
             hooks: None,
+            compactor: None,
         }
     }
 
@@ -992,6 +1027,13 @@ impl<'a> AgentRuntime<'a> {
     #[must_use]
     pub fn with_hooks(mut self, hooks: Arc<dyn RuntimeHooks>) -> Self {
         self.hooks = Some(hooks);
+        self
+    }
+
+    /// Installs a summary generator for automatic compaction.
+    #[must_use]
+    pub fn with_compactor(mut self, compactor: Arc<dyn ContextCompactor>) -> Self {
+        self.compactor = Some(compactor);
         self
     }
 
@@ -1213,6 +1255,55 @@ impl<'a> AgentRuntime<'a> {
         true
     }
 
+    fn estimate_context_tokens(messages: &[Message]) -> u64 {
+        messages
+            .iter()
+            .map(|message| {
+                let content = message
+                    .content
+                    .iter()
+                    .map(|block| match block {
+                        ContentBlock::Text { text, .. } | ContentBlock::Thinking { text, .. } => {
+                            text.len()
+                        }
+                        ContentBlock::Image { data, mime_type } => data.len() + mime_type.len(),
+                        ContentBlock::ToolCall(call) => call.name.len() + call.arguments.len(),
+                    })
+                    .sum::<usize>()
+                    + message.text.len();
+                u64::try_from(content.div_ceil(4).saturating_add(1)).unwrap_or(u64::MAX)
+            })
+            .sum()
+    }
+
+    async fn maybe_compact(
+        &mut self,
+        sink: &dyn EventSink,
+        force: bool,
+    ) -> Result<bool, RuntimeError> {
+        let Some(policy) = self.config.compaction.clone() else {
+            return Ok(false);
+        };
+        let Some(compactor) = self.compactor.clone() else {
+            return Ok(false);
+        };
+        let estimated = Self::estimate_context_tokens(&self.context.messages);
+        if !force && estimated.saturating_add(policy.reserve_tokens) < policy.context_window {
+            return Ok(false);
+        }
+        let keep = policy.keep_recent_messages.min(self.context.messages.len());
+        if keep == self.context.messages.len() {
+            return Ok(false);
+        }
+        let retain_from = self.context.messages.len().saturating_sub(keep);
+        let summary = (compactor
+            .summarize(self.context.messages.clone(), self.cancellation.clone())
+            .await)
+            .map_err(|message| RuntimeError::Compaction { message })?;
+        self.compact_with_summary(&summary, retain_from, sink)?;
+        Ok(true)
+    }
+
     /// Shrinks an explicitly configured output limit for a context-overflow retry.
     ///
     /// This retry is not a fresh backoff attempt: it changes the request shape and
@@ -1252,6 +1343,7 @@ impl<'a> AgentRuntime<'a> {
         let provider = self.providers.provider(&self.config.model.provider)?;
         let mut retry_index = 0;
         loop {
+            self.maybe_compact(&**sink, false).await?;
             self.cancellation.check()?;
             let mut options = self.config.request_options.clone();
             options
@@ -1297,6 +1389,13 @@ impl<'a> AgentRuntime<'a> {
                     (error.into(), retryable)
                 }
             };
+            if matches!(
+                &failure,
+                RuntimeError::Provider(ProviderError::ContextOverflow { .. })
+            ) && self.maybe_compact(&**sink, true).await?
+            {
+                continue;
+            }
             if matches!(
                 &failure,
                 RuntimeError::Provider(ProviderError::ContextOverflow { .. })
@@ -1980,8 +2079,8 @@ mod tests {
     use std::thread;
 
     use super::{
-        AgentContext, AgentEvent, AgentOutcome, AgentRuntime, AssistantEvent, EventSink,
-        RuntimeConfig, RuntimeError, RuntimeHooks, ToolExecutionMode,
+        AgentContext, AgentEvent, AgentOutcome, AgentRuntime, AssistantEvent, ContextCompactor,
+        EventSink, RuntimeConfig, RuntimeError, RuntimeHooks, ToolExecutionMode,
     };
     use nyan_coding_agent_core::{BoxFuture, ExecutionContext, Message, MessageRole, ToolResult};
     use nyan_coding_agent_provider::{
@@ -2186,6 +2285,18 @@ mod tests {
         }
     }
 
+    struct FixedCompactor;
+
+    impl ContextCompactor for FixedCompactor {
+        fn summarize(
+            &self,
+            _messages: Vec<Message>,
+            _cancellation: nyan_coding_agent_core::CancellationToken,
+        ) -> BoxFuture<Result<String, String>> {
+            Box::pin(async { Ok("automatic summary".to_owned()) })
+        }
+    }
+
     struct BlockingHooks;
 
     impl RuntimeHooks for BlockingHooks {
@@ -2356,6 +2467,55 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { .. }))
+        );
+    }
+
+    #[test]
+    fn automatic_compaction_uses_the_configured_summary_owner() {
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::from([vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: "answer".to_owned(),
+                    },
+                    ProviderStreamEvent::Finished {
+                        reason: ProviderStopReason::Stop,
+                    },
+                ]])),
+                failures: Mutex::new(0),
+            },
+        };
+        let tools = Tools { echo: EchoTool };
+        let mut config = RuntimeConfig::new(
+            ProviderModel {
+                provider: "fake".to_owned(),
+                model: "test".to_owned(),
+            },
+            "/tmp/project",
+        );
+        config.compaction = Some(super::CompactionPolicy {
+            context_window: 1,
+            reserve_tokens: 0,
+            keep_recent_messages: 0,
+        });
+        let mut runtime =
+            AgentRuntime::new(&providers, &tools, config).with_compactor(Arc::new(FixedCompactor));
+        let (result, events) = run_with_events(
+            &mut runtime,
+            Message::text(MessageRole::User, "a long prompt that needs compaction"),
+        );
+        assert_eq!(result.outcome, AgentOutcome::Completed);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionEnd { .. }))
+        );
+        assert!(
+            runtime
+                .context()
+                .messages
+                .iter()
+                .any(|message| message.text.contains("automatic summary"))
         );
     }
 
