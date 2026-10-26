@@ -908,6 +908,7 @@ name = "nyan-coding-agent-session"
 version = "0.1.0"
 dependencies = [
  "nyan-coding-agent-core",
+ "nyan-coding-agent-fs",
 ]
 
 [[package]]

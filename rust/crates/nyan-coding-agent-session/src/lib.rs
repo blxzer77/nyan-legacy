@@ -12,6 +12,7 @@ use nyan_coding_agent_core::{
 };
 
 const RUST_SESSION_HEADER: &[u8] = b"NYANRS01\n1\n";
+const CWD_SIDECAR_FILE: &str = "cwd";
 
 /// Metadata needed to open a Coding Agent session.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -707,6 +708,13 @@ pub enum SessionStoreError {
     },
     /// The session's previous run never finished, so its outcome is unknown.
     IncompleteRun,
+    /// The cwd sidecar is missing, malformed, or disagrees with the requested cwd.
+    CwdSidecar {
+        /// Sidecar path.
+        path: PathBuf,
+        /// Diagnostic explaining why the sidecar was rejected.
+        message: String,
+    },
     /// A journal message payload could not be decoded.
     MessageDecode {
         /// Codec diagnostic.
@@ -732,6 +740,7 @@ impl SessionStoreError {
             Self::UnsupportedVersion { .. } => "session_unsupported_version",
             Self::CorruptRecord { .. } => "session_corrupt_record",
             Self::IncompleteRun => "session_incomplete_run",
+            Self::CwdSidecar { .. } => "session_cwd_sidecar",
             Self::MessageDecode { .. } => "session_message_decode",
             Self::Io { .. } => "session_io",
         }
@@ -762,6 +771,13 @@ impl std::fmt::Display for SessionStoreError {
             }
             Self::IncompleteRun => formatter
                 .write_str("the session's previous run did not finish, so its outcome is unknown"),
+            Self::CwdSidecar { path, message } => {
+                write!(
+                    formatter,
+                    "session cwd sidecar is invalid ({}): {message}",
+                    path.display()
+                )
+            }
             Self::MessageDecode { message } => {
                 write!(formatter, "session message decode failed: {message}")
             }
@@ -800,7 +816,10 @@ impl FileSessionStore {
         Self { root: root.into() }
     }
 
-    fn paths(&self, request: &SessionOpenRequest) -> Result<(PathBuf, PathBuf), SessionStoreError> {
+    fn paths(
+        &self,
+        request: &SessionOpenRequest,
+    ) -> Result<(PathBuf, PathBuf, PathBuf), SessionStoreError> {
         let root = request
             .storage_root
             .as_deref()
@@ -812,6 +831,7 @@ impl FileSessionStore {
         Ok((
             root.join(format!("{safe_id}.session")),
             root.join(format!("{safe_id}.lock")),
+            root.join(CWD_SIDECAR_FILE),
         ))
     }
 }
@@ -889,6 +909,59 @@ impl FileSessionStore {
     }
 }
 
+fn canonical_cwd(cwd: &Path) -> PathBuf {
+    fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned())
+}
+
+fn ensure_cwd_sidecar(sidecar: &Path, cwd: &Path) -> Result<(), SessionStoreError> {
+    let expected_cwd = canonical_cwd(cwd);
+    let expected_text = format!("{}\n", expected_cwd.display());
+    match fs::read(sidecar) {
+        Ok(contents) => {
+            let actual =
+                String::from_utf8(contents).map_err(|_| SessionStoreError::CwdSidecar {
+                    path: sidecar.to_owned(),
+                    message: "sidecar is not valid UTF-8".to_owned(),
+                })?;
+            let actual = actual.trim_end_matches(['\r', '\n']);
+            if actual.is_empty() {
+                return Err(SessionStoreError::CwdSidecar {
+                    path: sidecar.to_owned(),
+                    message: "sidecar records an empty cwd".to_owned(),
+                });
+            }
+            if actual != expected_cwd.to_string_lossy() {
+                return Err(SessionStoreError::CwdSidecar {
+                    path: sidecar.to_owned(),
+                    message: format!(
+                        "records {}, but this run selected {}",
+                        actual,
+                        expected_cwd.display()
+                    ),
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            nyan_coding_agent_fs::write_atomic(
+                sidecar,
+                expected_text.as_bytes(),
+                nyan_coding_agent_fs::FileMode::Exactly(0o600),
+            )
+            .map_err(|error| SessionStoreError::CwdSidecar {
+                path: sidecar.to_owned(),
+                message: format!("could not create sidecar: {error}"),
+            })?;
+        }
+        Err(error) => {
+            return Err(SessionStoreError::CwdSidecar {
+                path: sidecar.to_owned(),
+                message: format!("could not read sidecar: {error}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn encode_session_id(id: &SessionId) -> String {
     id.as_str()
         .as_bytes()
@@ -930,7 +1003,7 @@ impl SessionStore for FileSessionStore {
             });
         }
 
-        let (session_path, lock_path) = self.paths(&request)?;
+        let (session_path, lock_path, cwd_sidecar_path) = self.paths(&request)?;
         let root = session_path.parent().ok_or_else(|| SessionStoreError::Io {
             operation: "resolve root".to_owned(),
             message: session_path.display().to_string(),
@@ -965,6 +1038,7 @@ impl SessionStore for FileSessionStore {
             }
         }
         let lease = Arc::new(SessionLease { _file: lock_file });
+        ensure_cwd_sidecar(&cwd_sidecar_path, &request.descriptor.cwd)?;
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -1674,6 +1748,48 @@ mod tests {
         let reopened = store.open(request(&root)).expect("reopen session");
         assert_eq!(reopened.path(), Some(path.as_path()));
         drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn persistent_session_records_and_validates_the_cwd_sidecar() {
+        let root = test_root("cwd-sidecar");
+        let cwd = root.join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let store = FileSessionStore::new(&root);
+        let request = SessionOpenRequest {
+            descriptor: SessionDescriptor::persistent(
+                SessionId::new("sidecar").expect("session id"),
+                &cwd,
+            ),
+            mode: AgentMode::Print,
+            storage_root: Some(root.clone()),
+        };
+        let opened = store.open(request.clone()).expect("open session");
+        let expected = format!(
+            "{}\n",
+            fs::canonicalize(&cwd).expect("canonical cwd").display()
+        );
+        assert_eq!(
+            fs::read(root.join("cwd")).expect("sidecar"),
+            expected.as_bytes()
+        );
+        drop(opened);
+        let reopened = store.open(request).expect("reopen sidecar");
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn a_bad_cwd_sidecar_is_reported_instead_of_switching_directories() {
+        let root = test_root("bad-cwd-sidecar");
+        let store = FileSessionStore::new(&root);
+        let opened = store.open(request(&root)).expect("open session");
+        drop(opened);
+        fs::write(root.join("cwd"), b"/somewhere-else\n").expect("bad sidecar");
+        let error = store.open(request(&root)).expect_err("sidecar mismatch");
+        assert_eq!(error.code(), "session_cwd_sidecar");
+        assert!(error.to_string().contains("somewhere-else"));
         fs::remove_dir_all(root).expect("remove test root");
     }
 

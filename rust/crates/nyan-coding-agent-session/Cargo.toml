@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 nyan-coding-agent-core = { path = "../nyan-coding-agent-core" }
+nyan-coding-agent-fs = { path = "../nyan-coding-agent-fs" }
 
 [lints]
 workspace = true
