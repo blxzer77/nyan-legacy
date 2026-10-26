@@ -560,6 +560,11 @@ pub enum RuntimeError {
     Provider(ProviderError),
     /// A tool failed.
     Tool(ToolError),
+    /// A hook blocked or failed a lifecycle transition.
+    Hook {
+        /// Hook diagnostic.
+        message: String,
+    },
     /// A tool effect started but its final outcome is unknown.
     UnknownOutcome {
         /// The operation whose outcome is not known.
@@ -623,6 +628,7 @@ impl RuntimeError {
                 ProviderError::Cancelled => "cancelled",
             },
             Self::Tool(_) => "tool",
+            Self::Hook { .. } => "hook",
             Self::UnknownOutcome { .. } => "unknown_outcome",
             Self::TurnLimit { .. } => "turn_limit",
             Self::UnterminatedProviderStream => "stream",
@@ -643,6 +649,7 @@ impl Display for RuntimeError {
             Self::Core(error) => error.fmt(formatter),
             Self::Provider(error) => error.fmt(formatter),
             Self::Tool(error) => error.fmt(formatter),
+            Self::Hook { message } => write!(formatter, "runtime hook failed: {message}"),
             Self::UnknownOutcome { operation, message } => {
                 write!(
                     formatter,
@@ -682,6 +689,33 @@ impl From<ToolError> for RuntimeError {
             other => Self::Tool(other),
         }
     }
+}
+
+/// Synchronous lifecycle hooks owned by the runtime host.
+///
+/// A failing before-hook is fail-safe: it blocks the action and produces a
+/// model-visible error result instead of running the external effect.
+pub trait RuntimeHooks: Send + Sync {
+    /// Runs before the agent emits its start event.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic to block the run before it starts.
+    fn before_agent_start(&self, _prompt: &Message) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Runs before a tool starts. Returning an error blocks that tool call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic that becomes a model-visible tool error.
+    fn before_tool_call(&self, _call: &ToolCall) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Runs after a tool result was committed to the transcript.
+    fn after_tool_call(&self, _call: &ToolCall, _result: &Message) {}
 }
 
 /// Consumer of runtime events.
@@ -906,6 +940,7 @@ pub struct AgentRuntime<'a> {
     cancellation: CancellationToken,
     queues: Arc<QueueState>,
     thinking: Arc<Mutex<ThinkingLevelState>>,
+    hooks: Option<Arc<dyn RuntimeHooks>>,
 }
 
 impl std::fmt::Debug for AgentRuntime<'_> {
@@ -939,7 +974,15 @@ impl<'a> AgentRuntime<'a> {
             cancellation: CancellationToken::new(),
             queues: Arc::new(QueueState::default()),
             thinking,
+            hooks: None,
         }
+    }
+
+    /// Installs lifecycle hooks owned by the runtime host.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<dyn RuntimeHooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 
     /// Replaces the initial transcript before the first run.
@@ -980,6 +1023,19 @@ impl<'a> AgentRuntime<'a> {
     pub async fn run(&mut self, prompt: Message, sink: Arc<dyn EventSink>) -> AgentRunResult {
         let run_start = self.context.messages.len();
         self.context.messages.push(prompt.clone());
+        if let Some(hooks) = &self.hooks
+            && let Err(message) = hooks.before_agent_start(&prompt)
+        {
+            let outcome = self.finish_failure(&RuntimeError::Hook { message }, &*sink);
+            sink.emit(AgentEvent::AgentEnd {
+                outcome: outcome.clone(),
+                messages: self.context.messages[run_start..].to_vec(),
+            });
+            return AgentRunResult {
+                messages: self.context.messages.clone(),
+                outcome,
+            };
+        }
         sink.emit(AgentEvent::AgentStart);
         sink.emit(AgentEvent::MessageStart {
             message: prompt.clone(),
@@ -1518,6 +1574,9 @@ impl<'a> AgentRuntime<'a> {
         assistant: &Message,
         sink: &Arc<dyn EventSink>,
     ) -> Result<Vec<Message>, RuntimeError> {
+        if self.hooks.is_some() {
+            return self.execute_tools_sequential(assistant, sink).await;
+        }
         match self.config.tool_execution {
             ToolExecutionMode::Sequential => self.execute_tools_sequential(assistant, sink).await,
             ToolExecutionMode::Parallel => self.execute_tools_parallel(assistant, sink).await,
@@ -1532,6 +1591,10 @@ impl<'a> AgentRuntime<'a> {
         let mut results = Vec::with_capacity(assistant.tool_calls.len());
         for call in &assistant.tool_calls {
             self.cancellation.check()?;
+            if let Some(result) = self.blocked_tool_result(call, &**sink) {
+                results.push(result);
+                continue;
+            }
             sink.emit(AgentEvent::ToolExecutionStart {
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -1604,6 +1667,9 @@ impl<'a> AgentRuntime<'a> {
             };
             let result = Message::tool_result(call.id.clone(), &call.name, text, is_error);
             self.emit_tool_result(call, result.clone(), &**sink, ran_for);
+            if let Some(hooks) = self.hooks.clone() {
+                hooks.after_tool_call(call, &result);
+            }
             results.push(result);
             if self.cancellation.is_cancelled() {
                 return Err(RuntimeError::Core(CoreError::Cancelled));
@@ -1740,6 +1806,26 @@ impl<'a> AgentRuntime<'a> {
         }
     }
 
+    fn blocked_tool_result(&mut self, call: &ToolCall, sink: &dyn EventSink) -> Option<Message> {
+        let message = self
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.before_tool_call(call).err())?;
+        sink.emit(AgentEvent::ToolExecutionStart {
+            call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        });
+        let result = Message::tool_result(
+            call.id.clone(),
+            &call.name,
+            format!("tool blocked by hook: {message}"),
+            true,
+        );
+        self.emit_tool_result(call, result.clone(), sink, None);
+        Some(result)
+    }
+
     fn emit_tool_result(
         &mut self,
         call: &ToolCall,
@@ -1828,7 +1914,7 @@ mod tests {
 
     use super::{
         AgentEvent, AgentOutcome, AgentRuntime, AssistantEvent, EventSink, RuntimeConfig,
-        RuntimeError, ToolExecutionMode,
+        RuntimeError, RuntimeHooks, ToolExecutionMode,
     };
     use nyan_coding_agent_core::{BoxFuture, ExecutionContext, Message, MessageRole, ToolResult};
     use nyan_coding_agent_provider::{
@@ -2033,6 +2119,14 @@ mod tests {
         }
     }
 
+    struct BlockingHooks;
+
+    impl RuntimeHooks for BlockingHooks {
+        fn before_tool_call(&self, _call: &nyan_coding_agent_core::ToolCall) -> Result<(), String> {
+            Err("policy denied the tool".to_owned())
+        }
+    }
+
     struct Tools {
         echo: EchoTool,
     }
@@ -2196,6 +2290,55 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { .. }))
         );
+    }
+
+    #[test]
+    fn a_before_tool_hook_blocks_the_effect_as_a_model_error() {
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::from([
+                    vec![
+                        ProviderStreamEvent::ToolCall(
+                            nyan_coding_agent_provider::ToolCallRequest {
+                                id: "blocked-1".to_owned(),
+                                name: "echo".to_owned(),
+                                arguments: "hello".to_owned(),
+                            },
+                        ),
+                        ProviderStreamEvent::Finished {
+                            reason: ProviderStopReason::ToolUse,
+                        },
+                    ],
+                    vec![
+                        ProviderStreamEvent::TextDelta {
+                            text: "blocked safely".to_owned(),
+                        },
+                        ProviderStreamEvent::Finished {
+                            reason: ProviderStopReason::Stop,
+                        },
+                    ],
+                ])),
+                failures: Mutex::new(0),
+            },
+        };
+        let tools = Tools { echo: EchoTool };
+        let mut runtime = AgentRuntime::new(
+            &providers,
+            &tools,
+            RuntimeConfig::new(
+                ProviderModel {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                },
+                "/tmp/project",
+            ),
+        )
+        .with_hooks(Arc::new(BlockingHooks));
+        let (result, _) = run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
+        assert_eq!(result.outcome, AgentOutcome::Completed);
+        assert!(result.messages.iter().any(|message| {
+            message.role == MessageRole::Tool && message.text.contains("policy denied")
+        }));
     }
 
     fn persistent_root(name: &str) -> std::path::PathBuf {
