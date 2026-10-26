@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 
 use nyan_coding_agent_core::{AgentMode, SessionId};
 use nyan_coding_agent_session::{
-    FileSessionStore, NativeSession, SessionDescriptor, SessionOpenRequest, SessionStoreError,
+    FileSessionStore, NativeSession, SessionDescriptor, SessionEntryId, SessionOpenRequest,
+    SessionStoreError,
 };
 
 use crate::args::{Args, normalize_session_name};
@@ -61,9 +62,11 @@ fn cwd_hash(cwd: &Path) -> String {
 /// Rejects flag combinations the TypeScript CLI rejects.
 fn check_flags(args: &Args) -> Result<(), String> {
     let names_a_session = args.session.is_some() || args.session_id.is_some();
-    if args.no_session && (names_a_session || args.continue_session || args.resume) {
+    if args.no_session
+        && (names_a_session || args.continue_session || args.resume || args.fork.is_some())
+    {
         return Err(
-            "--no-session cannot be combined with --session, --session-id, --continue, or --resume"
+            "--no-session cannot be combined with --session, --session-id, --continue, --resume, or --fork"
                 .to_owned(),
         );
     }
@@ -73,8 +76,8 @@ fn check_flags(args: &Args) -> Result<(), String> {
             "--session-id cannot be combined with --session, --continue, or --resume".to_owned(),
         );
     }
-    if args.fork.is_some() {
-        return Err("--fork is not supported by the Rust preview yet".to_owned());
+    if args.fork.is_some() && (args.continue_session || args.resume) {
+        return Err("--fork cannot be combined with --continue or --resume".to_owned());
     }
     if args.resume {
         return Err(
@@ -155,9 +158,12 @@ pub fn open_session(args: &Args, agent_dir: &Path, cwd: &Path) -> Result<NativeS
                 }
             }
         }
-    } else if args.continue_session {
+    } else if args.continue_session || args.fork.is_some() {
         match known.first() {
             Some(newest) => newest.clone(),
+            None if args.fork.is_some() => {
+                return Err(format!("no session to fork in {}", root.display()));
+            }
             None => SessionId::new(new_session_id()).map_err(|error| error.to_string())?,
         }
     } else {
@@ -167,10 +173,32 @@ pub fn open_session(args: &Args, agent_dir: &Path, cwd: &Path) -> Result<NativeS
     let request = SessionOpenRequest {
         descriptor: SessionDescriptor::persistent(id.clone(), cwd),
         mode: AgentMode::Print,
-        storage_root: Some(root),
+        storage_root: Some(root.clone()),
     };
     let mut session =
         NativeSession::open(&store, request).map_err(|error| describe(&error, &id))?;
+    if let Some(entry) = &args.fork {
+        let entry_id = SessionEntryId::parse(entry).ok_or_else(|| {
+            format!(
+                "invalid fork entry id \"{entry}\"; Rust-native entry ids are 16 hexadecimal characters"
+            )
+        })?;
+        let target_id = SessionId::new(new_session_id()).map_err(|error| error.to_string())?;
+        let target_request = SessionOpenRequest {
+            descriptor: SessionDescriptor::persistent(target_id, cwd),
+            mode: AgentMode::Print,
+            storage_root: Some(root),
+        };
+        let mut fork = session
+            .fork_at(&store, target_request, &entry_id)
+            .map_err(|error| format!("could not fork session at {entry}: {error}"))?;
+        let fork_name = name
+            .as_deref()
+            .map_or_else(|| format!("fork {entry}"), str::to_owned);
+        fork.set_name(&fork_name)
+            .map_err(|error| error.to_string())?;
+        return Ok(fork);
+    }
     if let Some(name) = &name {
         session.set_name(name).map_err(|error| error.to_string())?;
     }
@@ -332,6 +360,32 @@ mod tests {
     }
 
     #[test]
+    fn fork_opens_a_new_session_at_a_user_entry() {
+        let root = temp("fork");
+        let agent = root.join("agent");
+        let cwd = root.join("project");
+        let mut source = open(&["--session-id", "source"], &agent, &cwd).expect("source");
+        say(&mut source, "first");
+        source
+            .append_message(
+                SessionRecordKind::AssistantMessage,
+                Message::text(MessageRole::Assistant, "answer"),
+            )
+            .expect("assistant");
+        let entry = source.get_entries().expect("entries")[0].id.to_string();
+        drop(source);
+
+        let fork = open(&["--session-id", "source", "--fork", &entry], &agent, &cwd).expect("fork");
+        assert_ne!(id_of(&fork), "source");
+        assert_eq!(fork.messages().len(), 1);
+        assert_eq!(fork.messages()[0].text, "first");
+        let expected_name = format!("fork {entry}");
+        assert_eq!(fork.name(), Some(expected_name.as_str()));
+        drop(fork);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn session_dir_moves_the_store() {
         let root = temp("dir");
         let custom = root.join("custom");
@@ -382,7 +436,7 @@ mod tests {
                 &["--session-id", "a", "--continue"][..],
                 "--session-id cannot be combined",
             ),
-            (&["--fork", "e1"][..], "--fork is not supported"),
+            (&["--fork", "e1"][..], "no session to fork"),
             (
                 &["--resume"][..],
                 "--resume needs the interactive session picker",

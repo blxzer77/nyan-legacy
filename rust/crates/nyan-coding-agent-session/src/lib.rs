@@ -103,6 +103,13 @@ impl SessionEntryId {
         Self(format!("{sequence:016x}"))
     }
 
+    /// Parses a stable Rust-native entry id.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        (value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| Self(value.to_owned()))
+    }
+
     /// Returns the stable entry id.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -1613,6 +1620,41 @@ impl NativeSession {
         Ok(sequence)
     }
 
+    /// Creates a new session at a user-message entry.
+    ///
+    /// The target request supplies the new session id and storage selection.
+    /// The source session remains unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a selection, lock, codec, or filesystem error when the entry is
+    /// missing, is not a user message, or the fork cannot be completed.
+    pub fn fork_at(
+        &mut self,
+        store: &FileSessionStore,
+        request: SessionOpenRequest,
+        entry_id: &SessionEntryId,
+    ) -> Result<Self, SessionStoreError> {
+        let entries = self.get_entries()?;
+        let Some(selected) = entries.iter().position(|entry| entry.id == *entry_id) else {
+            return Err(SessionStoreError::Io {
+                operation: "fork session".to_owned(),
+                message: format!("entry {entry_id} does not exist"),
+            });
+        };
+        if entries[selected].kind != SessionRecordKind::UserMessage {
+            return Err(SessionStoreError::Io {
+                operation: "fork session".to_owned(),
+                message: format!("entry {entry_id} is not a user message"),
+            });
+        }
+        let message_count = entries[..=selected]
+            .iter()
+            .filter(|entry| entry.message.is_some())
+            .count();
+        self.fork_into(store, request, message_count)
+    }
+
     /// Creates a new session containing the first `message_count` messages.
     ///
     /// The target request supplies the new session id and storage selection.
@@ -2280,6 +2322,17 @@ mod tests {
                 Message::text(MessageRole::Assistant, "two"),
             )
             .expect("append two");
+        let entries = source.get_entries().expect("source entries");
+        assert_eq!(
+            SessionEntryId::parse(entries[0].id.as_str()),
+            Some(entries[0].id.clone())
+        );
+        let forked_at = source
+            .fork_at(&store, request_for(&root, "forked-at"), &entries[0].id)
+            .expect("fork at entry");
+        assert_eq!(forked_at.messages().len(), 1);
+        assert_eq!(forked_at.messages()[0].text, "one");
+        drop(forked_at);
         let fork = source
             .fork_into(&store, request_for(&root, "forked"), 1)
             .expect("fork session");
