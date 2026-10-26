@@ -133,6 +133,34 @@ pub struct SessionEntry {
     pub message: Option<Message>,
 }
 
+/// A front-end-neutral command against the active session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionCommand {
+    /// Return every entry in journal order.
+    GetEntries,
+    /// Return the current tree projection.
+    GetTree,
+    /// Return provider messages through the selected entry.
+    GetForkMessages(SessionEntryId),
+    /// Return the current display name.
+    GetSessionName,
+    /// Persist a new display name.
+    SetSessionName(String),
+}
+
+/// Result of a [`SessionCommand`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionCommandResult {
+    /// Entries returned by `GetEntries` or `GetTree`.
+    Entries(Vec<SessionEntry>),
+    /// Provider messages returned by `GetForkMessages`.
+    Messages(Vec<Message>),
+    /// The current display name, if one exists.
+    SessionName(Option<String>),
+    /// A mutation completed without a value to return.
+    Done,
+}
+
 /// A persisted journal record category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionRecordKind {
@@ -1403,6 +1431,35 @@ impl NativeSession {
         &self.messages
     }
 
+    /// Executes a front-end-neutral session command.
+    ///
+    /// The command boundary keeps print mode, JSON mode, RPC, and a future UI
+    /// from depending on journal framing or storage paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store or message decode error when the requested projection
+    /// cannot be read or the name cannot be persisted.
+    pub fn execute(
+        &mut self,
+        command: SessionCommand,
+    ) -> Result<SessionCommandResult, SessionStoreError> {
+        match command {
+            SessionCommand::GetEntries => Ok(SessionCommandResult::Entries(self.get_entries()?)),
+            SessionCommand::GetTree => Ok(SessionCommandResult::Entries(self.get_tree()?)),
+            SessionCommand::GetForkMessages(entry_id) => Ok(SessionCommandResult::Messages(
+                self.get_fork_messages(&entry_id)?,
+            )),
+            SessionCommand::GetSessionName => Ok(SessionCommandResult::SessionName(
+                self.name().map(str::to_owned),
+            )),
+            SessionCommand::SetSessionName(name) => {
+                self.set_name(&name)?;
+                Ok(SessionCommandResult::Done)
+            }
+        }
+    }
+
     /// Returns the linear entry projection used by session APIs.
     ///
     /// Ephemeral sessions synthesize entries from their in-memory messages.
@@ -1683,9 +1740,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        FileSessionStore, NativeSession, SessionDescriptor, SessionEntryId, SessionFormat,
-        SessionJournal, SessionOpenRequest, SessionRecord, SessionRecordKind, SessionStore,
-        SessionStoreError, decode_message, encode_message,
+        FileSessionStore, NativeSession, SessionCommand, SessionCommandResult, SessionDescriptor,
+        SessionEntryId, SessionFormat, SessionJournal, SessionOpenRequest, SessionRecord,
+        SessionRecordKind, SessionStore, SessionStoreError, decode_message, encode_message,
     };
     use nyan_coding_agent_core::{
         AgentMode, ContentBlock, Message, MessageRole, SessionId, StopReason, ToolCall, ToolCallId,
@@ -1982,9 +2039,37 @@ mod tests {
         );
         assert_eq!(entries[2].kind, SessionRecordKind::SessionName);
         assert_eq!(session.get_tree().expect("tree"), entries);
+        assert_eq!(
+            session
+                .execute(SessionCommand::GetEntries)
+                .expect("command entries"),
+            SessionCommandResult::Entries(entries.clone())
+        );
+        assert_eq!(
+            session
+                .execute(SessionCommand::GetTree)
+                .expect("command tree"),
+            SessionCommandResult::Entries(entries.clone())
+        );
+        assert_eq!(
+            session
+                .execute(SessionCommand::GetSessionName)
+                .expect("command name"),
+            SessionCommandResult::SessionName(Some("checkpoint".to_owned()))
+        );
+        assert_eq!(
+            session
+                .execute(SessionCommand::SetSessionName("renamed".to_owned()))
+                .expect("command rename"),
+            SessionCommandResult::Done
+        );
+        assert_eq!(session.name(), Some("renamed"));
         let fork = session
-            .get_fork_messages(&entries[1].id)
-            .expect("fork messages");
+            .execute(SessionCommand::GetForkMessages(entries[1].id.clone()))
+            .expect("command fork messages");
+        let SessionCommandResult::Messages(fork) = fork else {
+            panic!("fork command returned the wrong result");
+        };
         assert_eq!(
             fork.iter()
                 .map(|message| message.text.as_str())
