@@ -84,6 +84,16 @@ pub enum AgentEvent {
         /// Newly selected level.
         level: String,
     },
+    /// Context compaction has started.
+    CompactionStart {
+        /// Number of messages before compaction.
+        message_count: usize,
+    },
+    /// Context compaction has completed.
+    CompactionEnd {
+        /// Number of messages after compaction.
+        message_count: usize,
+    },
     /// Queued steering and follow-up messages changed.
     QueueUpdate {
         /// Messages waiting to be inserted before the next provider request.
@@ -988,6 +998,63 @@ impl<'a> AgentRuntime<'a> {
     /// Replaces the initial transcript before the first run.
     pub fn set_context(&mut self, context: AgentContext) {
         self.context = context;
+    }
+
+    /// Compacts the current context using a caller-provided summary.
+    ///
+    /// The latest system message before `retain_from` is retained, then the
+    /// summary and the selected suffix are sent to the next provider request.
+    /// Summary generation is intentionally owned by the caller so provider
+    /// admission, retry, and persistence policy remain explicit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state error when the summary is blank or the retained
+    /// index is outside the current context.
+    pub fn compact_with_summary(
+        &mut self,
+        summary: &str,
+        retain_from: usize,
+        sink: &dyn EventSink,
+    ) -> Result<(), RuntimeError> {
+        if summary.trim().is_empty() {
+            return Err(RuntimeError::Core(CoreError::InvalidState {
+                message: "compaction summary is empty".to_owned(),
+            }));
+        }
+        if retain_from > self.context.messages.len() {
+            return Err(RuntimeError::Core(CoreError::InvalidState {
+                message: format!(
+                    "compaction retain index {retain_from} exceeds {} messages",
+                    self.context.messages.len()
+                ),
+            }));
+        }
+        let before = self.context.messages.len();
+        sink.emit(AgentEvent::CompactionStart {
+            message_count: before,
+        });
+        let system = self.context.messages[..retain_from]
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::System)
+            .cloned();
+        let mut messages = Vec::with_capacity(before - retain_from + 2);
+        if let Some(system) = system {
+            messages.push(system);
+        }
+        messages.push(Message::text(
+            MessageRole::System,
+            format!(
+                "The conversation history before this point was compacted into the following summary:\n\n{summary}"
+            ),
+        ));
+        messages.extend(self.context.messages[retain_from..].iter().cloned());
+        self.context.messages = messages;
+        sink.emit(AgentEvent::CompactionEnd {
+            message_count: self.context.messages.len(),
+        });
+        Ok(())
     }
 
     /// Replaces the cancellation token, so the process can cancel the run from a signal handler.
@@ -1913,8 +1980,8 @@ mod tests {
     use std::thread;
 
     use super::{
-        AgentEvent, AgentOutcome, AgentRuntime, AssistantEvent, EventSink, RuntimeConfig,
-        RuntimeError, RuntimeHooks, ToolExecutionMode,
+        AgentContext, AgentEvent, AgentOutcome, AgentRuntime, AssistantEvent, EventSink,
+        RuntimeConfig, RuntimeError, RuntimeHooks, ToolExecutionMode,
     };
     use nyan_coding_agent_core::{BoxFuture, ExecutionContext, Message, MessageRole, ToolResult};
     use nyan_coding_agent_provider::{
@@ -2339,6 +2406,51 @@ mod tests {
         assert!(result.messages.iter().any(|message| {
             message.role == MessageRole::Tool && message.text.contains("policy denied")
         }));
+    }
+
+    #[test]
+    fn compaction_keeps_the_system_prompt_summary_and_retained_suffix() {
+        let providers = Providers {
+            provider: FakeProvider {
+                responses: Mutex::new(VecDeque::new()),
+                failures: Mutex::new(0),
+            },
+        };
+        let tools = Tools { echo: EchoTool };
+        let mut runtime = AgentRuntime::new(
+            &providers,
+            &tools,
+            RuntimeConfig::new(
+                ProviderModel {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                },
+                "/tmp/project",
+            ),
+        );
+        runtime.set_context(AgentContext {
+            messages: vec![
+                Message::text(MessageRole::System, "system"),
+                Message::text(MessageRole::User, "old"),
+                Message::text(MessageRole::Assistant, "keep"),
+                Message::text(MessageRole::User, "latest"),
+            ],
+        });
+        let events = EventLog::default();
+        runtime
+            .compact_with_summary("old context", 2, &events)
+            .expect("compact");
+        assert_eq!(runtime.context().messages.len(), 4);
+        assert_eq!(runtime.context().messages[0].text, "system");
+        assert!(runtime.context().messages[1].text.contains("old context"));
+        assert_eq!(runtime.context().messages[2].text, "keep");
+        assert_eq!(runtime.context().messages[3].text, "latest");
+        assert!(
+            events
+                .snapshot()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionEnd { message_count: 4 }))
+        );
     }
 
     fn persistent_root(name: &str) -> std::path::PathBuf {

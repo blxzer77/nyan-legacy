@@ -690,6 +690,12 @@ pub fn event_to_jsonl(event: &AgentEvent) -> String {
         AgentEvent::ThinkingLevelChanged { level } => JsonlRecord::new("thinking_level_changed")
             .string("thinkingLevel", level)
             .finish(),
+        AgentEvent::CompactionStart { message_count } => JsonlRecord::new("compaction_start")
+            .raw("messageCount", &message_count.to_string())
+            .finish(),
+        AgentEvent::CompactionEnd { message_count } => JsonlRecord::new("compaction_end")
+            .raw("messageCount", &message_count.to_string())
+            .finish(),
         AgentEvent::QueueUpdate {
             steering,
             follow_up,
@@ -1026,6 +1032,20 @@ mod tests {
         assert!(
             !ended.contains("\"message\""),
             "wire updates omit the cumulative message"
+        );
+    }
+
+    #[test]
+    fn compaction_events_encode_message_counts() {
+        use nyan_coding_agent_runtime::AgentEvent;
+
+        assert_eq!(
+            event_to_jsonl(&AgentEvent::CompactionStart { message_count: 8 }),
+            "{\"type\":\"compaction_start\",\"messageCount\":8}\n"
+        );
+        assert_eq!(
+            event_to_jsonl(&AgentEvent::CompactionEnd { message_count: 3 }),
+            "{\"type\":\"compaction_end\",\"messageCount\":3}\n"
         );
     }
 
