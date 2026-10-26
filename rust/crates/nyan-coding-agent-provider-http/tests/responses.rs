@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use nyan_coding_agent_core::{
-    CancellationToken, Message, MessageRole, ToolCall, ToolCallId, Usage,
+    CancellationToken, ContentBlock, Message, MessageRole, ToolCall, ToolCallId, Usage,
 };
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderModel, ProviderRequest, ProviderStopReason,
@@ -156,6 +156,11 @@ fn history_is_sent_as_responses_items_with_the_system_prompt_first() {
     });
     let mut result = Message::text(MessageRole::Tool, "x");
     result.tool_call_id = Some(ToolCallId::new("call_9").expect("id"));
+    let mut user = Message::text(MessageRole::User, "run echo");
+    user.content.push(ContentBlock::Image {
+        data: "aGVsbG8=".to_owned(),
+        mime_type: "image/png".to_owned(),
+    });
     let request = ProviderRequest {
         model: ProviderModel {
             provider: "loopback".to_owned(),
@@ -163,7 +168,7 @@ fn history_is_sent_as_responses_items_with_the_system_prompt_first() {
         },
         messages: vec![
             Message::text(MessageRole::System, "be brief"),
-            Message::text(MessageRole::User, "run echo"),
+            user,
             assistant,
             result,
         ],
@@ -180,7 +185,10 @@ fn history_is_sent_as_responses_items_with_the_system_prompt_first() {
         body["input"],
         json!([
             {"role": "developer", "content": "be brief"},
-            {"role": "user", "content": [{"type": "input_text", "text": "run echo"}]},
+            {"role": "user", "content": [
+                {"type": "input_text", "text": "run echo"},
+                {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}
+            ]},
             {"type": "message", "role": "assistant", "status": "completed",
              "content": [{"type": "output_text", "text": "checking", "annotations": []}]},
             {"type": "function_call", "call_id": "call_9", "name": "echo", "arguments": "{\"text\":\"x\"}"},

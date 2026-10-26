@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use nyan_coding_agent_core::{BoxFuture, Message, MessageRole};
+use nyan_coding_agent_core::{BoxFuture, ContentBlock, Message, MessageRole};
 use nyan_coding_agent_provider::{
     ModelProvider, ProviderError, ProviderRequest, ProviderStopReason, ProviderStream,
     ToolCallRequest, ToolSpec,
@@ -137,26 +137,37 @@ pub(crate) fn wire_tool(tool: &ToolSpec) -> Value {
 }
 
 pub(crate) fn push_input_items(input: &mut Vec<Value>, message: &Message, instruction_role: &str) {
+    let blocks = message.model_content();
     match message.role {
         MessageRole::System => {
-            if !message.text.is_empty() {
-                input.push(json!({"role": instruction_role, "content": message.text}));
+            let text = text_content(&blocks);
+            if !text.is_empty() {
+                input.push(json!({"role": instruction_role, "content": text}));
             }
         }
-        MessageRole::User => input.push(json!({
-            "role": "user",
-            "content": [{"type": "input_text", "text": message.text}],
-        })),
+        MessageRole::User => {
+            let content = blocks
+                .iter()
+                .filter_map(wire_input_part)
+                .collect::<Vec<_>>();
+            if !content.is_empty() {
+                input.push(json!({"role": "user", "content": content}));
+            }
+        }
         MessageRole::Assistant => {
-            if !message.text.is_empty() {
+            let text = text_content(&blocks);
+            if !text.is_empty() {
                 input.push(json!({
                     "type": "message",
                     "role": "assistant",
                     "status": "completed",
-                    "content": [{"type": "output_text", "text": message.text, "annotations": []}],
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
                 }));
             }
-            for call in &message.tool_calls {
+            for call in blocks.iter().filter_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call),
+                _ => None,
+            }) {
                 input.push(json!({
                     "type": "function_call",
                     "call_id": call.id.as_str(),
@@ -168,8 +179,29 @@ pub(crate) fn push_input_items(input: &mut Vec<Value>, message: &Message, instru
         MessageRole::Tool => input.push(json!({
             "type": "function_call_output",
             "call_id": message.tool_call_id.as_ref().map_or("", |id| id.as_str()),
-            "output": message.text,
+            "output": message.text_content(),
         })),
+    }
+}
+
+fn text_content(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn wire_input_part(block: &ContentBlock) -> Option<Value> {
+    match block {
+        ContentBlock::Text { text, .. } => Some(json!({"type": "input_text", "text": text})),
+        ContentBlock::Image { data, mime_type } => Some(json!({
+            "type": "input_image",
+            "image_url": format!("data:{mime_type};base64,{data}"),
+        })),
+        ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) => None,
     }
 }
 
