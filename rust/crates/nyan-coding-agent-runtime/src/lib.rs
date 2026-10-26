@@ -79,6 +79,11 @@ pub enum AgentEvent {
         /// Why the retries stopped, when they failed.
         final_error: Option<String>,
     },
+    /// Thinking level changed through runtime control.
+    ThinkingLevelChanged {
+        /// Newly selected level.
+        level: String,
+    },
     /// Queued steering and follow-up messages changed.
     QueueUpdate {
         /// Messages waiting to be inserted before the next provider request.
@@ -235,6 +240,61 @@ pub enum QueueMode {
     All,
 }
 
+/// Thinking levels accepted by the neutral runtime control surface.
+pub const DEFAULT_THINKING_LEVELS: [&str; 7] =
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+#[derive(Clone, Debug)]
+struct ThinkingLevelState {
+    available: Vec<String>,
+    current: Option<String>,
+    pending_event: Option<String>,
+}
+
+impl ThinkingLevelState {
+    fn new(available: &[String], current: Option<String>) -> Self {
+        let available = if available.is_empty() {
+            DEFAULT_THINKING_LEVELS
+                .iter()
+                .map(|level| (*level).to_owned())
+                .collect()
+        } else {
+            available.to_vec()
+        };
+        let current = current.filter(|level| available.iter().any(|item| item == level));
+        Self {
+            available,
+            current,
+            pending_event: None,
+        }
+    }
+
+    fn set(&mut self, level: &str) -> Result<(), String> {
+        if !self.available.iter().any(|item| item == level) {
+            return Err(format!(
+                "thinking level {level:?} is not available; choose one of: {}",
+                self.available.join(", ")
+            ));
+        }
+        self.current = Some(level.to_owned());
+        self.pending_event = Some(level.to_owned());
+        Ok(())
+    }
+
+    fn cycle(&mut self) -> String {
+        let current = self
+            .current
+            .as_deref()
+            .and_then(|level| self.available.iter().position(|item| item == level))
+            .unwrap_or(0);
+        let next = (current + 1) % self.available.len();
+        let level = self.available[next].clone();
+        self.current = Some(level.clone());
+        self.pending_event = Some(level.clone());
+        level
+    }
+}
+
 /// A read-only snapshot of the steering and follow-up queues.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueueSnapshot {
@@ -312,6 +372,7 @@ fn take_queue(queue: &Mutex<VecDeque<Message>>, mode: QueueMode) -> Vec<Message>
 #[derive(Clone, Debug)]
 pub struct AgentControl {
     queues: Arc<QueueState>,
+    thinking: Arc<Mutex<ThinkingLevelState>>,
     cancellation: CancellationToken,
 }
 
@@ -336,6 +397,60 @@ impl AgentControl {
     #[must_use]
     pub fn clear_queue(&self) -> QueueSnapshot {
         self.queues.clear()
+    }
+
+    /// Returns the available thinking levels.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared thinking-level state is poisoned.
+    #[must_use]
+    pub fn available_thinking_levels(&self) -> Vec<String> {
+        self.thinking
+            .lock()
+            .expect("thinking level lock")
+            .available
+            .clone()
+    }
+
+    /// Returns the selected thinking level, or `None` when no level was requested.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared thinking-level state is poisoned.
+    #[must_use]
+    pub fn thinking_level(&self) -> Option<String> {
+        self.thinking
+            .lock()
+            .expect("thinking level lock")
+            .current
+            .clone()
+    }
+
+    /// Selects a thinking level for the next provider request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the level is not available.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared thinking-level state is poisoned.
+    pub fn set_thinking_level(&self, level: &str) -> Result<(), String> {
+        self.thinking
+            .lock()
+            .expect("thinking level lock")
+            .set(level)
+    }
+
+    /// Cycles to the next available thinking level.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared thinking-level state is poisoned.
+    #[must_use]
+    pub fn cycle_thinking_level(&self) -> String {
+        self.thinking.lock().expect("thinking level lock").cycle()
     }
 
     /// Requests cancellation of the owning runtime.
@@ -396,6 +511,8 @@ pub struct RuntimeConfig {
     pub steering_mode: QueueMode,
     /// Follow-up queue consumption policy.
     pub follow_up_mode: QueueMode,
+    /// Thinking levels available to runtime control.
+    pub thinking_levels: Vec<String>,
     /// The conversation id sent with every provider request.
     pub session_id: Option<String>,
     /// Optional provider request controls.
@@ -417,6 +534,10 @@ impl RuntimeConfig {
             tool_execution: ToolExecutionMode::Parallel,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
+            thinking_levels: DEFAULT_THINKING_LEVELS
+                .iter()
+                .map(|level| (*level).to_owned())
+                .collect(),
             session_id: None,
             request_options: ProviderRequestOptions::default(),
         }
@@ -784,6 +905,7 @@ pub struct AgentRuntime<'a> {
     context: AgentContext,
     cancellation: CancellationToken,
     queues: Arc<QueueState>,
+    thinking: Arc<Mutex<ThinkingLevelState>>,
 }
 
 impl std::fmt::Debug for AgentRuntime<'_> {
@@ -805,6 +927,10 @@ impl<'a> AgentRuntime<'a> {
         tools: &'a dyn ToolRegistry,
         config: RuntimeConfig,
     ) -> Self {
+        let thinking = Arc::new(Mutex::new(ThinkingLevelState::new(
+            &config.thinking_levels,
+            config.request_options.reasoning_effort.clone(),
+        )));
         Self {
             providers,
             tools,
@@ -812,6 +938,7 @@ impl<'a> AgentRuntime<'a> {
             context: AgentContext::default(),
             cancellation: CancellationToken::new(),
             queues: Arc::new(QueueState::default()),
+            thinking,
         }
     }
 
@@ -838,6 +965,7 @@ impl<'a> AgentRuntime<'a> {
     pub fn control(&self) -> AgentControl {
         AgentControl {
             queues: Arc::clone(&self.queues),
+            thinking: Arc::clone(&self.thinking),
             cancellation: self.cancellation.clone(),
         }
     }
@@ -874,6 +1002,9 @@ impl<'a> AgentRuntime<'a> {
 
     async fn run_turns(&mut self, sink: Arc<dyn EventSink>) -> Result<AgentOutcome, RuntimeError> {
         for turn in 0..self.config.max_turns {
+            if let Some(level) = self.take_thinking_event() {
+                sink.emit(AgentEvent::ThinkingLevelChanged { level });
+            }
             if self.cancellation.is_cancelled() {
                 return Ok(self.finish_aborted(&*sink));
             }
@@ -916,6 +1047,14 @@ impl<'a> AgentRuntime<'a> {
         Err(RuntimeError::TurnLimit {
             max_turns: self.config.max_turns,
         })
+    }
+
+    fn take_thinking_event(&self) -> Option<String> {
+        self.thinking
+            .lock()
+            .expect("thinking level lock")
+            .pending_event
+            .take()
     }
 
     fn emit_queue_update(&self, sink: &dyn EventSink) {
@@ -991,6 +1130,10 @@ impl<'a> AgentRuntime<'a> {
         let mut retry_index = 0;
         loop {
             self.cancellation.check()?;
+            let mut options = self.config.request_options.clone();
+            options
+                .reasoning_effort
+                .clone_from(&self.thinking.lock().expect("thinking level lock").current);
             let request = ProviderRequest {
                 model: self.config.model.clone(),
                 messages: self.context.messages.clone(),
@@ -1006,7 +1149,7 @@ impl<'a> AgentRuntime<'a> {
                     .collect(),
                 cancellation: self.cancellation.clone(),
                 session_id: self.config.session_id.clone(),
-                options: self.config.request_options.clone(),
+                options,
             };
             let (failure, retryable) = match provider.stream(request).await {
                 Ok(mut stream) => match self.consume_stream(&mut *stream, &**sink).await {
@@ -2023,12 +2166,17 @@ mod tests {
             ),
         );
         let control = runtime.control();
+        control.set_thinking_level("high").expect("thinking level");
         control.steer(Message::text(MessageRole::User, "steer me"));
         let (result, events) =
             run_with_events(&mut runtime, Message::text(MessageRole::User, "start"));
 
         assert_eq!(result.outcome, AgentOutcome::Completed);
         assert_eq!(result.messages.len(), 5);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ThinkingLevelChanged { level } if level == "high"
+        )));
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::QueueUpdate { steering, follow_up }

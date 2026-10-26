@@ -687,6 +687,9 @@ pub fn event_to_jsonl(event: &AgentEvent) -> String {
                 .finish()
         }
         AgentEvent::RetryStart { .. } | AgentEvent::RetryEnd { .. } => retry_event_jsonl(event),
+        AgentEvent::ThinkingLevelChanged { level } => JsonlRecord::new("thinking_level_changed")
+            .string("thinkingLevel", level)
+            .finish(),
         AgentEvent::QueueUpdate {
             steering,
             follow_up,
@@ -1023,6 +1026,18 @@ mod tests {
         assert!(
             !ended.contains("\"message\""),
             "wire updates omit the cumulative message"
+        );
+    }
+
+    #[test]
+    fn thinking_level_changes_encode_the_selected_level() {
+        use nyan_coding_agent_runtime::AgentEvent;
+
+        assert_eq!(
+            event_to_jsonl(&AgentEvent::ThinkingLevelChanged {
+                level: "high".to_owned(),
+            }),
+            "{\"type\":\"thinking_level_changed\",\"thinkingLevel\":\"high\"}\n"
         );
     }
 
