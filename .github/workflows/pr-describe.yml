@@ -3,7 +3,7 @@ name: PR summary
 # PR-Agent `/describe` only: one structured summary of the change as a sticky comment. No review, no code suggestions —
 # the deep review is `ocr-review.yml`, and two agents writing findings into the same pull request would just be noise.
 #
-# Why self-hosted: the model call goes through the gateway on the tailnet, which a GitHub-hosted runner cannot reach.
+# Why self-hosted: the model call goes through the gateway on the EasyTier mesh, which a GitHub-hosted runner cannot reach.
 # That is also why the fork guard below is not optional — this job runs on a host whose user holds sudo.
 #
 # `PUBLISH_DESCRIPTION_AS_COMMENT`: PR-Agent's default for `describe` is to rewrite the pull request description. We ask
@@ -28,8 +28,9 @@ permissions:
   pull-requests: write
 
 env:
-  # The fast tier: this job is a summary, not a review. Override with a repository variable if the address changes.
-  GATEWAY_URL: ${{ vars.GATEWAY_URL || 'https://nyan-dev-02.tail6334e5.ts.net:8449/v1' }}
+  # The fast tier: this job is a summary, not a review. The value is the OpenAI base, including `/v1`; the job
+  # passes it through as OPENAI__API_BASE and does not append a path. Override with the GATEWAY_URL repository variable.
+  GATEWAY_URL: ${{ vars.GATEWAY_URL || 'http://10.144.0.3:8449/v1' }}
   PR_AGENT_IMAGE: codiumai/pr-agent:latest
 
 jobs:

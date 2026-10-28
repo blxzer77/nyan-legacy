@@ -10,7 +10,7 @@ set -uo pipefail
 
 EMBED_URL="${EMBED_URL:-http://127.0.0.1:8090}"
 RERANK_URL="${RERANK_URL:-http://127.0.0.1:8091}"
-QDRANT_URL="${QDRANT_URL:-http://100.80.19.12:6333}"
+QDRANT_URL="${QDRANT_URL:-http://10.144.0.3:6333}"
 QDRANT_KEY_FILE="${QDRANT_KEY_FILE:-$HOME/retrieval/keys/qdrant-api-key}"
 EMBED_API="${EMBED_API:-llama}"
 EXPECTED_DIM="${EXPECTED_DIM:-1536}"
