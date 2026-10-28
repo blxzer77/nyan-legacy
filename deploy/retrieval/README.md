@@ -125,7 +125,7 @@ Deferred until an eval set shows the 0.6B is insufficient.
   `127.0.0.1:5433`. The role owns an empty database and sees no langfuse tables.
   Credentials: `/opt/stacks/retrieval/keys/coord-db.env` (0600).
 - **Langfuse API** at `http://10.144.0.3:50007/langfuse-api/` (nginx location
-  proxying `/api/public/`); the browser UI stays on Tailscale Serve :8448. Verified
+  proxying `/api/public/`). The browser UI is `http://10.144.0.3:8448`. Verified
   with `GET /langfuse-api/health` (200) and an authenticated
   `GET /langfuse-api/projects` returning project `nyan`. Keys for the client are in
   `/opt/stacks/retrieval/keys/langfuse.env` (0600, `pk-lf-nyan-local` /
